@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <imm.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <winsqlite/winsqlite3.h>
@@ -562,6 +563,39 @@ void StartVisibilityTimer() {
     if (g_state.launcherWindow != nullptr) {
         SetTimer(g_state.launcherWindow, kVisibilityTimerId, kVisibilityTimerIntervalMs, nullptr);
     }
+}
+
+HKL GetEnglishKeyboardLayout() {
+    HKL englishLayout = LoadKeyboardLayoutW(L"00000409", KLF_ACTIVATE | KLF_SUBSTITUTE_OK);
+    if (englishLayout == nullptr) {
+        englishLayout = LoadKeyboardLayoutW(L"00000409", KLF_SUBSTITUTE_OK);
+    }
+    return englishLayout;
+}
+
+void SetEnglishImeForWindow(HWND window) {
+    const HKL englishLayout = GetEnglishKeyboardLayout();
+    if (englishLayout != nullptr) {
+        ActivateKeyboardLayout(englishLayout, 0);
+        if (window != nullptr) {
+            SendMessageW(window, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(englishLayout));
+        }
+        if (g_state.launcherWindow != nullptr && g_state.launcherWindow != window) {
+            SendMessageW(g_state.launcherWindow, WM_INPUTLANGCHANGEREQUEST, 0, reinterpret_cast<LPARAM>(englishLayout));
+        }
+    }
+
+    if (window == nullptr) {
+        return;
+    }
+
+    HIMC inputContext = ImmGetContext(window);
+    if (inputContext == nullptr) {
+        return;
+    }
+
+    ImmSetOpenStatus(inputContext, FALSE);
+    ImmReleaseContext(window, inputContext);
 }
 
 void EnsureDefaultHotkey() {
@@ -1234,6 +1268,7 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     const LaunchItem& item = g_state.items[index];
+    SetEnglishImeForWindow(g_state.searchEdit);
     std::wstring commandLine = ExpandEnvironmentVariables(item.commandLine);
     std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(item.workingDirectory);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
@@ -1296,6 +1331,9 @@ void MoveSelection(int delta) {
 }
 
 LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_SETFOCUS) {
+        SetEnglishImeForWindow(window);
+    }
     if (message == WM_KEYDOWN) {
         if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && wParam == 'Q') {
             PostQuitMessage(0);
@@ -1363,6 +1401,7 @@ void ShowLauncher() {
     ShowWindow(g_state.launcherWindow, SW_SHOW);
     SetForegroundWindow(g_state.launcherWindow);
     SetFocus(g_state.searchEdit);
+    SetEnglishImeForWindow(g_state.searchEdit);
     SendMessageW(g_state.searchEdit, EM_SETSEL, 0, -1);
     StartVisibilityTimer();
 }
