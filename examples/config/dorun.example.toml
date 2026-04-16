@@ -1,5 +1,6 @@
 # DoRun config example.
-# Copy this file to dorun.toml and adjust the values as needed.
+# Copy this file to DoRun.toml and place it next to DoRun.exe,
+# or under %APPDATA%\DoRun\DoRun.toml.
 
 # Launcher hotkey:
 # 1 = MOD_ALT

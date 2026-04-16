@@ -37,7 +37,8 @@
 *.exp
 
 # Local configuration overrides
-command.conf
+Config.ini
+dorun.ini
 *.local.toml
 
 # OS / editor

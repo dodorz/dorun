@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <array>
@@ -58,8 +59,9 @@ AppState g_state {};
 constexpr wchar_t kHostClassName[] = L"DoRun.HostWindow";
 constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
 constexpr wchar_t kConfigClassName[] = L"DoRun.ConfigWindow";
-constexpr wchar_t kTomlFileName[] = L"dorun.toml";
-constexpr wchar_t kCommandFileName[] = L"command.conf";
+constexpr wchar_t kAppDirectoryName[] = L"DoRun";
+constexpr wchar_t kTomlFileName[] = L"DoRun.toml";
+constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr size_t kVisibleItemCount = 8;
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
@@ -105,6 +107,63 @@ std::wstring GetModuleDirectory() {
 
 std::wstring GetConfigPath(const wchar_t* fileName) {
     return (std::filesystem::path(GetModuleDirectory()) / fileName).wstring();
+}
+
+std::wstring GetAppDataDirectory() {
+    PWSTR path = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &path);
+    if (FAILED(result) || path == nullptr) {
+        if (path != nullptr) {
+            CoTaskMemFree(path);
+        }
+        return L"";
+    }
+
+    const std::filesystem::path appDataPath(path);
+    CoTaskMemFree(path);
+    return (appDataPath / kAppDirectoryName).wstring();
+}
+
+std::wstring FindConfigPath(const wchar_t* fileName) {
+    const std::filesystem::path modulePath = std::filesystem::path(GetModuleDirectory()) / fileName;
+    std::error_code error;
+    if (std::filesystem::exists(modulePath, error)) {
+        return modulePath.wstring();
+    }
+
+    const std::wstring appDataDirectory = GetAppDataDirectory();
+    if (appDataDirectory.empty()) {
+        return modulePath.wstring();
+    }
+
+    const std::filesystem::path appDataPath = std::filesystem::path(appDataDirectory) / fileName;
+    error.clear();
+    if (std::filesystem::exists(appDataPath, error)) {
+        return appDataPath.wstring();
+    }
+
+    return modulePath.wstring();
+}
+
+std::wstring GetWritableConfigPath(const wchar_t* fileName) {
+    const std::filesystem::path modulePath = std::filesystem::path(GetModuleDirectory()) / fileName;
+    std::error_code error;
+    if (std::filesystem::exists(modulePath, error)) {
+        return modulePath.wstring();
+    }
+
+    const std::wstring appDataDirectory = GetAppDataDirectory();
+    if (appDataDirectory.empty()) {
+        return modulePath.wstring();
+    }
+
+    const std::filesystem::path appDataPath = std::filesystem::path(appDataDirectory);
+    std::filesystem::create_directories(appDataPath, error);
+    if (error) {
+        return modulePath.wstring();
+    }
+
+    return (appDataPath / fileName).wstring();
 }
 
 std::wstring LoadUtf8TextFile(const std::wstring& path) {
@@ -235,7 +294,7 @@ void EnsureDefaultHotkey() {
 void LoadHotkeyConfig() {
     EnsureDefaultHotkey();
 
-    const std::wstring tomlPath = GetConfigPath(kTomlFileName);
+    const std::wstring tomlPath = FindConfigPath(kTomlFileName);
     const std::wstring content = LoadUtf8TextFile(tomlPath);
     if (content.empty()) {
         return;
@@ -253,7 +312,7 @@ void LoadHotkeyConfig() {
 }
 
 void SaveHotkeyConfig() {
-    const std::wstring tomlPath = GetConfigPath(kTomlFileName);
+    const std::wstring tomlPath = GetWritableConfigPath(kTomlFileName);
     std::wstring content = LoadUtf8TextFile(tomlPath);
     const std::wstring modifiersLine = L"HOTKEY_MODIFIERS = " + std::to_wstring(g_state.hotkey.modifiers);
     const std::wstring vkLine = L"HOTKEY_VK = " + std::to_wstring(g_state.hotkey.vk);
@@ -350,7 +409,7 @@ void EnsureDefaultDirectories() {
 
 void LoadScanDirectories() {
     g_state.scanDirectories.clear();
-    const std::wstring content = LoadUtf8TextFile(GetConfigPath(kTomlFileName));
+    const std::wstring content = LoadUtf8TextFile(FindConfigPath(kTomlFileName));
     if (content.empty()) {
         EnsureDefaultDirectories();
         return;
@@ -393,7 +452,7 @@ std::wstring StripOuterQuotes(std::wstring value) {
 }
 
 void LoadCommandItems() {
-    std::wifstream stream(GetConfigPath(kCommandFileName));
+    std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
         return;
     }

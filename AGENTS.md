@@ -8,8 +8,8 @@
 
 - Keep example configuration files under `examples\config\`.
 - The project must provide and maintain at least these example files:
-  - `examples\config\dorun.example.toml`
-  - `examples\config\command.example.conf`
+  - `examples\config\DoRun.example.toml`
+  - `examples\config\Command.example.conf`
 - When adding or changing configuration fields, commands, hotkey behavior, or file formats, you MUST update the corresponding example files in the same task.
 - Example files should stay directly usable after copy/rename, with comments and representative values.
 

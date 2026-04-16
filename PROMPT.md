@@ -3,7 +3,7 @@
 # 核心功能需求
 
 1. **技术栈**：使用C/C++语言，Win32 API开发，MS VS build Tools编译，尽量不引入额外依赖。但要尽可能支持Windows高分屏等新特性
-2. **全局热键**：可自定义热键，默认Alt+Enter唤起启动器窗口（全局）；Ctrl+Q退出程序（启动器窗口中）。配置对话框中提供自定义
+2. **全局热键**：可自定义热键，默认Alt+Space唤起启动器窗口（全局）；Ctrl+Q退出程序（启动器窗口中）。配置对话框中提供自定义
 3. **应用搜索**：支持搜索自定义目录下的可执行文件（默认包括$PATHEXT中的全部扩展名）和快捷方式（.lnk）
 4. **自定义命令**：支持配置自定义命令及其执行参数
 5. **键盘导航**：
@@ -15,7 +15,7 @@
 
 # 配置文件格式
 
-## dorun.toml - 扫描目录配置
+## DoRun.toml - 扫描目录配置
 
 ```
 DIR = [
@@ -26,7 +26,9 @@ DIR = [
 
 程序会扫描该目录下的所有 .exe 和 .lnk 文件。
 
-## command.conf - 自定义命令配置
+程序优先从可执行文件同目录读取 `DoRun.toml`，若不存在则回退到 `%APPDATA%\DoRun\DoRun.toml`。
+
+## Command.conf - 自定义命令配置
 
 格式：`命令名:命令行:运行路径:窗口状态:进程优先级`
 
@@ -52,6 +54,8 @@ edt:C:\Tool\Notepad3.exe
 cmd:"cmd.exe /s /k C:/Tool/Scoop/apps/clink/current/clink_x64.exe inject --quiet"
 calc:"C:\Program Files\Calculator\calc.exe"::1:32
 ```
+
+程序优先从可执行文件同目录读取 `Command.conf`，若不存在则回退到 `%APPDATA%\DoRun\Command.conf`。
 
 # 实现要点
 
