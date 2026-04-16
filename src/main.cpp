@@ -189,6 +189,26 @@ bool SaveUtf8TextFile(const std::wstring& path, const std::wstring& content) {
     return stream.good();
 }
 
+std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
+    if (text.empty()) {
+        return L"";
+    }
+
+    const DWORD required = ExpandEnvironmentStringsW(std::wstring(text).c_str(), nullptr, 0);
+    if (required == 0) {
+        return std::wstring(text);
+    }
+
+    std::wstring expanded(static_cast<size_t>(required), L'\0');
+    const DWORD written = ExpandEnvironmentStringsW(std::wstring(text).c_str(), expanded.data(), required);
+    if (written == 0) {
+        return std::wstring(text);
+    }
+
+    expanded.resize(wcsnlen_s(expanded.c_str(), expanded.size()));
+    return expanded;
+}
+
 void ApplyFont(HWND window) {
     if (window != nullptr && g_state.uiFont != nullptr) {
         SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(g_state.uiFont), TRUE);
@@ -429,19 +449,97 @@ std::vector<std::wstring> SplitCommandFields(std::wstring_view line) {
     std::vector<std::wstring> fields;
     std::wstring current;
     bool inQuotes = false;
-    for (const wchar_t ch : line) {
+    bool escaped = false;
+    auto isEscapableChar = [](wchar_t ch) {
+        return ch == L'\\' || ch == L':' || ch == L'"' || ch == L';' || ch == L'#';
+    };
+    auto isSchemeName = [](std::wstring_view value) {
+        return !value.empty() && std::all_of(value.begin(), value.end(), [](wchar_t ch) { return iswalpha(ch) != 0; });
+    };
+
+    for (size_t index = 0; index < line.size(); ++index) {
+        const wchar_t ch = line[index];
+        if (escaped) {
+            if (isEscapableChar(ch)) {
+                current.push_back(ch);
+            } else {
+                current.push_back(L'\\');
+                current.push_back(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        if (ch == L'\\') {
+            escaped = true;
+            continue;
+        }
         if (ch == L'"') {
             inQuotes = !inQuotes;
             current.push_back(ch);
         } else if (ch == L':' && !inQuotes) {
+            const bool isDriveLetter = !fields.empty() && current.size() == 1 && iswalpha(current[0]) != 0 &&
+                index + 1 < line.size() && (line[index + 1] == L'\\' || line[index + 1] == L'/');
+            const bool isUriScheme = !fields.empty() && isSchemeName(current) &&
+                ((index + 2 < line.size() && line[index + 1] == L'/' && line[index + 2] == L'/') ||
+                 (current == L"shell"));
+            if (isDriveLetter || isUriScheme) {
+                current.push_back(ch);
+                continue;
+            }
             fields.push_back(Trim(current));
             current.clear();
         } else {
             current.push_back(ch);
         }
     }
+    if (escaped) {
+        current.push_back(L'\\');
+    }
     fields.push_back(Trim(current));
     return fields;
+}
+
+bool IsCommandCommentLine(std::wstring_view line) {
+    if (line.empty()) {
+        return true;
+    }
+    if (line.front() == L'"') {
+        return false;
+    }
+    if (line.size() >= 2 && line.front() == L'\\' && (line[1] == L';' || line[1] == L'#')) {
+        return false;
+    }
+    return line.front() == L'#' || line.front() == L';';
+}
+
+std::wstring UnescapeCommandField(std::wstring_view text) {
+    std::wstring value;
+    value.reserve(text.size());
+    bool escaped = false;
+    auto isEscapableChar = [](wchar_t ch) {
+        return ch == L'\\' || ch == L':' || ch == L'"' || ch == L';' || ch == L'#';
+    };
+    for (const wchar_t ch : text) {
+        if (escaped) {
+            if (isEscapableChar(ch)) {
+                value.push_back(ch);
+            } else {
+                value.push_back(L'\\');
+                value.push_back(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        if (ch == L'\\') {
+            escaped = true;
+            continue;
+        }
+        value.push_back(ch);
+    }
+    if (escaped) {
+        value.push_back(L'\\');
+    }
+    return value;
 }
 
 std::wstring StripOuterQuotes(std::wstring value) {
@@ -461,7 +559,7 @@ void LoadCommandItems() {
     std::wstring line;
     while (std::getline(stream, line)) {
         line = Trim(line);
-        if (line.empty() || line.front() == L'#' || line.front() == L';') {
+        if (IsCommandCommentLine(line)) {
             continue;
         }
 
@@ -471,10 +569,10 @@ void LoadCommandItems() {
         }
 
         LaunchItem item {};
-        item.name = fields[0];
-        item.commandLine = StripOuterQuotes(fields[1]);
+        item.name = UnescapeCommandField(StripOuterQuotes(fields[0]));
+        item.commandLine = UnescapeCommandField(StripOuterQuotes(fields[1]));
         if (fields.size() > 2) {
-            item.workingDirectory = StripOuterQuotes(fields[2]);
+            item.workingDirectory = UnescapeCommandField(StripOuterQuotes(fields[2]));
         }
         if (fields.size() > 3 && !fields[3].empty()) {
             item.showCommand = _wtoi(fields[3].c_str());
@@ -573,7 +671,8 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     const LaunchItem& item = g_state.items[index];
-    std::wstring commandLine = item.commandLine;
+    std::wstring commandLine = ExpandEnvironmentVariables(item.commandLine);
+    std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(item.workingDirectory);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
@@ -583,11 +682,11 @@ bool LaunchItemByIndex(size_t index) {
     startupInfo.wShowWindow = static_cast<WORD>(item.showCommand);
 
     PROCESS_INFORMATION processInfo {};
-    const wchar_t* workingDirectory = item.workingDirectory.empty() ? nullptr : item.workingDirectory.c_str();
+    const wchar_t* workingDirectory = workingDirectoryBuffer.empty() ? nullptr : workingDirectoryBuffer.c_str();
     const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | item.priorityClass;
     const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
     if (ok == FALSE) {
-        const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", item.commandLine.c_str(), nullptr, workingDirectory, item.showCommand);
+        const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", commandLine.c_str(), nullptr, workingDirectory, item.showCommand);
         if (reinterpret_cast<INT_PTR>(result) <= 32) {
             return false;
         }

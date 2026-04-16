@@ -19,8 +19,7 @@
 MAJOR.MINOR.PATCH.BUILD
 ```
 - 每次提交: BUILD自动+1
-- 重大重构或用户指定版本号
-- feat/refactor/重大fix: 递增PATCH+1
+- MAJOR、MINOR、PATCH的变化用户显式指定
 
 ## Git Commit
 
