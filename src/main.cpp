@@ -61,6 +61,8 @@ constexpr wchar_t kConfigClassName[] = L"DoRun.ConfigWindow";
 constexpr wchar_t kTomlFileName[] = L"dorun.toml";
 constexpr wchar_t kCommandFileName[] = L"command.conf";
 constexpr size_t kVisibleItemCount = 8;
+constexpr UINT_PTR kVisibilityTimerId = 1;
+constexpr UINT kVisibilityTimerIntervalMs = 100;
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
@@ -181,7 +183,24 @@ void LayoutConfig(HWND window) {
 }
 
 void HideLauncher() {
+    if (g_state.launcherWindow != nullptr) {
+        KillTimer(g_state.launcherWindow, kVisibilityTimerId);
+    }
     ShowWindow(g_state.launcherWindow, SW_HIDE);
+}
+
+bool IsChildOrSameWindow(HWND parent, HWND candidate) {
+    return parent != nullptr && candidate != nullptr && (parent == candidate || IsChild(parent, candidate) != FALSE);
+}
+
+bool IsLauncherRelatedWindow(HWND window) {
+    return IsChildOrSameWindow(g_state.launcherWindow, window) || IsChildOrSameWindow(g_state.configWindow, window);
+}
+
+void StartVisibilityTimer() {
+    if (g_state.launcherWindow != nullptr) {
+        SetTimer(g_state.launcherWindow, kVisibilityTimerId, kVisibilityTimerIntervalMs, nullptr);
+    }
 }
 
 std::optional<UINT> ParseTomlUInt(const std::wstring& content, std::wstring_view key) {
@@ -618,10 +637,11 @@ void ShowLauncher() {
     ReloadItems();
     RebuildResultList();
     LayoutLauncher();
-    ShowWindow(g_state.launcherWindow, SW_SHOWNOACTIVATE);
+    ShowWindow(g_state.launcherWindow, SW_SHOW);
     SetForegroundWindow(g_state.launcherWindow);
     SetFocus(g_state.searchEdit);
     SendMessageW(g_state.searchEdit, EM_SETSEL, 0, -1);
+    StartVisibilityTimer();
 }
 
 void ShowConfigWindow() {
@@ -720,6 +740,15 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         if (LOWORD(wParam) == IDC_CONFIG && HIWORD(wParam) == BN_CLICKED) {
             ShowConfigWindow();
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == kVisibilityTimerId) {
+            const HWND foregroundWindow = GetForegroundWindow();
+            if (foregroundWindow != nullptr && !IsLauncherRelatedWindow(foregroundWindow)) {
+                HideLauncher();
+            }
             return 0;
         }
         break;
