@@ -2,17 +2,21 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <winsqlite/winsqlite3.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <locale>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -26,12 +30,37 @@ struct HotkeyConfig {
     UINT vk = VK_SPACE;
 };
 
+struct HistoryConfig {
+    bool enabled = true;
+    std::wstring databasePath;
+    double rankSumLimit = 5000.0;
+    double decayFactor = 0.9;
+    double pruneBelow = 1.0;
+    int maxRows = 5000;
+    bool recencyEnabled = true;
+    bool fuzzyEnabled = true;
+};
+
+struct HistoryInfo {
+    double rank = 0.0;
+    int runCount = 0;
+    std::wstring lastRunUtc;
+};
+
+enum class ItemSourceKind : int {
+    ScannedFile = 0,
+    CommandConf = 1,
+    Synthetic = 2,
+};
+
 struct LaunchItem {
     std::wstring name;
     std::wstring commandLine;
     std::wstring workingDirectory;
     int showCommand = SW_SHOWNORMAL;
     DWORD priorityClass = NORMAL_PRIORITY_CLASS;
+    ItemSourceKind sourceKind = ItemSourceKind::ScannedFile;
+    std::wstring itemKey;
 };
 
 struct AppState {
@@ -52,6 +81,8 @@ struct AppState {
     std::vector<std::wstring> scanDirectories;
     std::unordered_set<std::wstring> executableExtensions;
     std::vector<LaunchItem> items;
+    HistoryConfig historyConfig {};
+    std::unordered_map<std::wstring, HistoryInfo> historyByKey;
 };
 
 AppState g_state {};
@@ -112,6 +143,21 @@ std::wstring GetConfigPath(const wchar_t* fileName) {
 std::wstring GetAppDataDirectory() {
     PWSTR path = nullptr;
     const HRESULT result = SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &path);
+    if (FAILED(result) || path == nullptr) {
+        if (path != nullptr) {
+            CoTaskMemFree(path);
+        }
+        return L"";
+    }
+
+    const std::filesystem::path appDataPath(path);
+    CoTaskMemFree(path);
+    return (appDataPath / kAppDirectoryName).wstring();
+}
+
+std::wstring GetLocalAppDataDirectory() {
+    PWSTR path = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &path);
     if (FAILED(result) || path == nullptr) {
         if (path != nullptr) {
             CoTaskMemFree(path);
@@ -189,6 +235,62 @@ bool SaveUtf8TextFile(const std::wstring& path, const std::wstring& content) {
     return stream.good();
 }
 
+std::optional<std::wstring> ParseTomlRawValue(const std::wstring& content, std::wstring_view key) {
+    const std::wstring pattern = std::wstring(key) + L" =";
+    const size_t keyPos = content.find(pattern);
+    if (keyPos == std::wstring::npos) {
+        return std::nullopt;
+    }
+
+    size_t valueStart = keyPos + pattern.size();
+    while (valueStart < content.size() && iswspace(content[valueStart]) != 0) {
+        ++valueStart;
+    }
+
+    size_t valueEnd = valueStart;
+    while (valueEnd < content.size() && content[valueEnd] != L'\r' && content[valueEnd] != L'\n') {
+        ++valueEnd;
+    }
+
+    return Trim(content.substr(valueStart, valueEnd - valueStart));
+}
+
+std::optional<UINT> ParseTomlUInt(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+    if (!rawValue || rawValue->empty()) {
+        return std::nullopt;
+    }
+    return static_cast<UINT>(_wtoi(rawValue->c_str()));
+}
+
+std::optional<int> ParseTomlInt(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+    if (!rawValue || rawValue->empty()) {
+        return std::nullopt;
+    }
+    return _wtoi(rawValue->c_str());
+}
+
+std::optional<double> ParseTomlDouble(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+    if (!rawValue || rawValue->empty()) {
+        return std::nullopt;
+    }
+    return _wtof(rawValue->c_str());
+}
+
+std::optional<std::wstring> ParseTomlString(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+    if (!rawValue) {
+        return std::nullopt;
+    }
+    std::wstring value = *rawValue;
+    if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
+        value = value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
 std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
     if (text.empty()) {
         return L"";
@@ -207,6 +309,186 @@ std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
 
     expanded.resize(wcsnlen_s(expanded.c_str(), expanded.size()));
     return expanded;
+}
+
+std::wstring NormalizeHistoryField(std::wstring_view text) {
+    return Lowercase(Trim(text));
+}
+
+std::wstring BuildItemKey(ItemSourceKind sourceKind, std::wstring_view commandLine, std::wstring_view workingDirectory) {
+    return std::to_wstring(static_cast<int>(sourceKind)) + L"\n" +
+        NormalizeHistoryField(commandLine) + L"\n" +
+        NormalizeHistoryField(workingDirectory);
+}
+
+std::wstring GetDefaultHistoryDatabasePath() {
+    const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
+    if (localAppDataDirectory.empty()) {
+        return (std::filesystem::path(GetModuleDirectory()) / L"history.db").wstring();
+    }
+    return (std::filesystem::path(localAppDataDirectory) / L"history.db").wstring();
+}
+
+std::wstring GetHistoryDatabasePath() {
+    if (!g_state.historyConfig.databasePath.empty()) {
+        return ExpandEnvironmentVariables(g_state.historyConfig.databasePath);
+    }
+    return GetDefaultHistoryDatabasePath();
+}
+
+bool IsSubsequenceMatch(std::wstring_view text, std::wstring_view query) {
+    if (query.empty()) {
+        return true;
+    }
+
+    size_t queryIndex = 0;
+    for (const wchar_t ch : text) {
+        if (towlower(ch) == towlower(query[queryIndex])) {
+            ++queryIndex;
+            if (queryIndex == query.size()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::vector<std::wstring> SplitQueryTokens(std::wstring_view query) {
+    std::vector<std::wstring> tokens;
+    std::wstringstream stream { std::wstring(query) };
+    std::wstring token;
+    while (stream >> token) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+int GetMatchScoreForText(std::wstring_view haystack, std::wstring_view needle, int exactScore, int prefixScore, int substringScore, int subsequenceScore) {
+    if (needle.empty()) {
+        return 1;
+    }
+
+    const std::wstring normalizedHaystack = Lowercase(haystack);
+    const std::wstring normalizedNeedle = Lowercase(needle);
+    if (normalizedHaystack == normalizedNeedle) {
+        return exactScore;
+    }
+    if (normalizedHaystack.starts_with(normalizedNeedle)) {
+        return prefixScore;
+    }
+    if (normalizedHaystack.find(normalizedNeedle) != std::wstring::npos) {
+        return substringScore;
+    }
+    if (g_state.historyConfig.fuzzyEnabled && IsSubsequenceMatch(normalizedHaystack, normalizedNeedle)) {
+        return subsequenceScore;
+    }
+    return -1;
+}
+
+int ComputeMatchScore(const LaunchItem& item, std::wstring_view query) {
+    if (query.empty()) {
+        return 1;
+    }
+
+    const std::vector<std::wstring> tokens = SplitQueryTokens(query);
+    if (tokens.empty()) {
+        return 1;
+    }
+
+    int score = 0;
+    for (const std::wstring& token : tokens) {
+        const int nameScore = GetMatchScoreForText(item.name, token, 100, 90, 75, 60);
+        const std::filesystem::path commandPath(item.commandLine);
+        const std::wstring commandBaseName = commandPath.stem().wstring();
+        const int commandBaseScore = GetMatchScoreForText(commandBaseName, token, 55, 55, 50, 45);
+        const int commandScore = GetMatchScoreForText(item.commandLine, token, 40, 40, 40, 25);
+        const int bestScore = std::max({nameScore, commandBaseScore, commandScore});
+        if (bestScore < 0) {
+            return -1;
+        }
+        score += bestScore;
+    }
+
+    return score;
+}
+
+std::wstring GetCurrentUtcTimestamp() {
+    SYSTEMTIME utcNow {};
+    GetSystemTime(&utcNow);
+
+    wchar_t buffer[32] {};
+    swprintf_s(
+        buffer,
+        L"%04u-%02u-%02uT%02u:%02u:%02uZ",
+        utcNow.wYear,
+        utcNow.wMonth,
+        utcNow.wDay,
+        utcNow.wHour,
+        utcNow.wMinute,
+        utcNow.wSecond);
+    return buffer;
+}
+
+ULONGLONG SystemTimeToUnixLikeTicks(const SYSTEMTIME& systemTime) {
+    FILETIME fileTime {};
+    if (SystemTimeToFileTime(&systemTime, &fileTime) == FALSE) {
+        return 0;
+    }
+
+    ULARGE_INTEGER value {};
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
+std::optional<SYSTEMTIME> ParseUtcTimestamp(std::wstring_view value) {
+    SYSTEMTIME timestamp {};
+    if (swscanf_s(
+            std::wstring(value).c_str(),
+            L"%hu-%hu-%huT%hu:%hu:%huZ",
+            &timestamp.wYear,
+            &timestamp.wMonth,
+            &timestamp.wDay,
+            &timestamp.wHour,
+            &timestamp.wMinute,
+            &timestamp.wSecond) != 6) {
+        return std::nullopt;
+    }
+    return timestamp;
+}
+
+int ComputeRecencyBonus(const std::wstring& lastRunUtc) {
+    if (!g_state.historyConfig.recencyEnabled || lastRunUtc.empty()) {
+        return 0;
+    }
+
+    const std::optional<SYSTEMTIME> lastRun = ParseUtcTimestamp(lastRunUtc);
+    if (!lastRun) {
+        return 0;
+    }
+
+    SYSTEMTIME nowUtc {};
+    GetSystemTime(&nowUtc);
+    const ULONGLONG nowTicks = SystemTimeToUnixLikeTicks(nowUtc);
+    const ULONGLONG lastRunTicks = SystemTimeToUnixLikeTicks(*lastRun);
+    if (nowTicks <= lastRunTicks) {
+        return 30;
+    }
+
+    const double hoursSinceLastRun = static_cast<double>(nowTicks - lastRunTicks) / 10000000.0 / 3600.0;
+    if (hoursSinceLastRun <= 24.0) {
+        return 30;
+    }
+    if (hoursSinceLastRun <= 24.0 * 7.0) {
+        return 20;
+    }
+    if (hoursSinceLastRun <= 24.0 * 30.0) {
+        return 10;
+    }
+    if (hoursSinceLastRun <= 24.0 * 90.0) {
+        return 5;
+    }
+    return 0;
 }
 
 void ApplyFont(HWND window) {
@@ -282,30 +564,6 @@ void StartVisibilityTimer() {
     }
 }
 
-std::optional<UINT> ParseTomlUInt(const std::wstring& content, std::wstring_view key) {
-    const std::wstring pattern = std::wstring(key) + L" =";
-    const size_t keyPos = content.find(pattern);
-    if (keyPos == std::wstring::npos) {
-        return std::nullopt;
-    }
-
-    size_t valueStart = keyPos + pattern.size();
-    while (valueStart < content.size() && iswspace(content[valueStart]) != 0) {
-        ++valueStart;
-    }
-
-    size_t valueEnd = valueStart;
-    while (valueEnd < content.size() && iswdigit(content[valueEnd]) != 0) {
-        ++valueEnd;
-    }
-
-    if (valueEnd == valueStart) {
-        return std::nullopt;
-    }
-
-    return static_cast<UINT>(_wtoi(content.substr(valueStart, valueEnd - valueStart).c_str()));
-}
-
 void EnsureDefaultHotkey() {
     g_state.hotkey.modifiers = MOD_ALT;
     g_state.hotkey.vk = VK_SPACE;
@@ -328,6 +586,41 @@ void LoadHotkeyConfig() {
     }
     if (g_state.hotkey.vk == 0U) {
         g_state.hotkey.vk = VK_SPACE;
+    }
+}
+
+void LoadHistoryConfig() {
+    g_state.historyConfig = HistoryConfig {};
+
+    const std::wstring tomlPath = FindConfigPath(kTomlFileName);
+    const std::wstring content = LoadUtf8TextFile(tomlPath);
+    if (content.empty()) {
+        return;
+    }
+
+    if (const std::optional<UINT> enabled = ParseTomlUInt(content, L"HISTORY_ENABLED")) {
+        g_state.historyConfig.enabled = *enabled != 0U;
+    }
+    if (const std::optional<std::wstring> databasePath = ParseTomlString(content, L"HISTORY_DB_PATH")) {
+        g_state.historyConfig.databasePath = *databasePath;
+    }
+    if (const std::optional<double> rankSumLimit = ParseTomlDouble(content, L"HISTORY_RANK_SUM_LIMIT")) {
+        g_state.historyConfig.rankSumLimit = std::max(1.0, *rankSumLimit);
+    }
+    if (const std::optional<double> decayFactor = ParseTomlDouble(content, L"HISTORY_DECAY_FACTOR")) {
+        g_state.historyConfig.decayFactor = std::clamp(*decayFactor, 0.01, 0.999);
+    }
+    if (const std::optional<double> pruneBelow = ParseTomlDouble(content, L"HISTORY_PRUNE_BELOW")) {
+        g_state.historyConfig.pruneBelow = std::max(0.0, *pruneBelow);
+    }
+    if (const std::optional<int> maxRows = ParseTomlInt(content, L"HISTORY_MAX_ROWS")) {
+        g_state.historyConfig.maxRows = std::max(1, *maxRows);
+    }
+    if (const std::optional<UINT> recencyEnabled = ParseTomlUInt(content, L"HISTORY_RECENCY_ENABLED")) {
+        g_state.historyConfig.recencyEnabled = *recencyEnabled != 0U;
+    }
+    if (const std::optional<UINT> fuzzyEnabled = ParseTomlUInt(content, L"HISTORY_FUZZY_ENABLED")) {
+        g_state.historyConfig.fuzzyEnabled = *fuzzyEnabled != 0U;
     }
 }
 
@@ -443,6 +736,120 @@ void LoadScanDirectories() {
     }
     g_state.scanDirectories = ParseQuotedStrings(content.substr(start + 1, end - start - 1));
     EnsureDefaultDirectories();
+}
+
+bool OpenHistoryDatabase(sqlite3** database) {
+    if (database == nullptr) {
+        return false;
+    }
+    *database = nullptr;
+
+    const std::wstring databasePath = GetHistoryDatabasePath();
+    std::error_code error;
+    const std::filesystem::path databaseDirectory = std::filesystem::path(databasePath).parent_path();
+    if (!databaseDirectory.empty()) {
+        std::filesystem::create_directories(databaseDirectory, error);
+        if (error) {
+            return false;
+        }
+    }
+
+    if (sqlite3_open16(databasePath.c_str(), database) != SQLITE_OK || *database == nullptr) {
+        if (*database != nullptr) {
+            sqlite3_close(*database);
+            *database = nullptr;
+        }
+        return false;
+    }
+
+    const char* initSql =
+        "PRAGMA journal_mode=WAL;"
+        "PRAGMA synchronous=NORMAL;"
+        "PRAGMA foreign_keys=ON;"
+        "CREATE TABLE IF NOT EXISTS launch_history ("
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    item_key TEXT NOT NULL UNIQUE,"
+        "    display_name TEXT NOT NULL,"
+        "    command_line TEXT NOT NULL,"
+        "    working_directory TEXT NOT NULL DEFAULT '',"
+        "    source_kind INTEGER NOT NULL DEFAULT 0,"
+        "    run_count INTEGER NOT NULL DEFAULT 0,"
+        "    rank REAL NOT NULL DEFAULT 0,"
+        "    last_run_utc TEXT NOT NULL DEFAULT '',"
+        "    created_utc TEXT NOT NULL DEFAULT '',"
+        "    updated_utc TEXT NOT NULL DEFAULT ''"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_launch_history_rank ON launch_history(rank DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_launch_history_last_run ON launch_history(last_run_utc DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_launch_history_display_name ON launch_history(display_name);";
+
+    if (sqlite3_exec(*database, initSql, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        sqlite3_close(*database);
+        *database = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+bool ExecuteSql(sqlite3* database, const char* sql) {
+    return database != nullptr && sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
+bool PrepareStatement(sqlite3* database, const wchar_t* sql, sqlite3_stmt** statement) {
+    if (database == nullptr || statement == nullptr) {
+        return false;
+    }
+    *statement = nullptr;
+    return sqlite3_prepare16_v2(database, sql, -1, statement, nullptr) == SQLITE_OK && *statement != nullptr;
+}
+
+void FinalizeStatement(sqlite3_stmt* statement) {
+    if (statement != nullptr) {
+        sqlite3_finalize(statement);
+    }
+}
+
+bool BindText(sqlite3_stmt* statement, int index, const std::wstring& value) {
+    return sqlite3_bind_text16(statement, index, value.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+}
+
+void LoadHistoryCache() {
+    g_state.historyByKey.clear();
+    if (!g_state.historyConfig.enabled) {
+        return;
+    }
+
+    sqlite3* database = nullptr;
+    if (!OpenHistoryDatabase(&database)) {
+        return;
+    }
+
+    sqlite3_stmt* statement = nullptr;
+    const wchar_t* sql = L"SELECT item_key, rank, run_count, last_run_utc FROM launch_history;";
+    if (!PrepareStatement(database, sql, &statement)) {
+        sqlite3_close(database);
+        return;
+    }
+
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const void* itemKeyText = sqlite3_column_text16(statement, 0);
+        const void* lastRunText = sqlite3_column_text16(statement, 3);
+
+        HistoryInfo info {};
+        info.rank = sqlite3_column_double(statement, 1);
+        info.runCount = sqlite3_column_int(statement, 2);
+        if (lastRunText != nullptr) {
+            info.lastRunUtc = static_cast<const wchar_t*>(lastRunText);
+        }
+
+        if (itemKeyText != nullptr) {
+            g_state.historyByKey.emplace(static_cast<const wchar_t*>(itemKeyText), std::move(info));
+        }
+    }
+
+    FinalizeStatement(statement);
+    sqlite3_close(database);
 }
 
 std::vector<std::wstring> SplitCommandFields(std::wstring_view line) {
@@ -571,6 +978,7 @@ void LoadCommandItems() {
         LaunchItem item {};
         item.name = UnescapeCommandField(StripOuterQuotes(fields[0]));
         item.commandLine = UnescapeCommandField(StripOuterQuotes(fields[1]));
+        item.sourceKind = ItemSourceKind::CommandConf;
         if (fields.size() > 2) {
             item.workingDirectory = UnescapeCommandField(StripOuterQuotes(fields[2]));
         }
@@ -580,6 +988,7 @@ void LoadCommandItems() {
         if (fields.size() > 4 && !fields[4].empty()) {
             item.priorityClass = static_cast<DWORD>(_wtoi(fields[4].c_str()));
         }
+        item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
         g_state.items.push_back(std::move(item));
     }
 }
@@ -615,6 +1024,8 @@ void LoadFilesystemItems() {
             item.name = path.stem().wstring();
             item.commandLine = path.wstring();
             item.workingDirectory = path.parent_path().wstring();
+            item.sourceKind = ItemSourceKind::ScannedFile;
+            item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
             const std::wstring key = Lowercase(item.name + L"|" + item.commandLine);
             if (seen.insert(key).second) {
                 g_state.items.push_back(std::move(item));
@@ -642,19 +1053,65 @@ std::wstring GetControlText(HWND window) {
     return text;
 }
 
+struct RankedResult {
+    size_t itemIndex = 0;
+    int matchScore = 0;
+    double rank = 0.0;
+    int recencyBonus = 0;
+    double finalScore = 0.0;
+    std::wstring lastRunUtc;
+};
+
 void RebuildResultList() {
     const std::wstring query = Trim(GetControlText(g_state.searchEdit));
     SendMessageW(g_state.resultList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_state.resultList, LB_RESETCONTENT, 0, 0);
 
+    std::vector<RankedResult> rankedResults;
+    rankedResults.reserve(g_state.items.size());
+
     for (size_t index = 0; index < g_state.items.size(); ++index) {
         const LaunchItem& item = g_state.items[index];
-        if (!ContainsInsensitive(item.name, query) && !ContainsInsensitive(item.commandLine, query)) {
+        const int matchScore = ComputeMatchScore(item, query);
+        if (matchScore < 0) {
             continue;
         }
+
+        RankedResult result {};
+        result.itemIndex = index;
+        result.matchScore = matchScore;
+        if (const auto it = g_state.historyByKey.find(item.itemKey); it != g_state.historyByKey.end()) {
+            result.rank = it->second.rank;
+            result.lastRunUtc = it->second.lastRunUtc;
+            result.recencyBonus = ComputeRecencyBonus(it->second.lastRunUtc);
+        }
+        result.finalScore = static_cast<double>(matchScore) * 1000.0 + result.rank * 20.0 + static_cast<double>(result.recencyBonus);
+        rankedResults.push_back(std::move(result));
+    }
+
+    std::sort(rankedResults.begin(), rankedResults.end(), [](const RankedResult& lhs, const RankedResult& rhs) {
+        if (lhs.finalScore != rhs.finalScore) {
+            return lhs.finalScore > rhs.finalScore;
+        }
+        if (lhs.matchScore != rhs.matchScore) {
+            return lhs.matchScore > rhs.matchScore;
+        }
+        if (lhs.rank != rhs.rank) {
+            return lhs.rank > rhs.rank;
+        }
+        if (lhs.lastRunUtc != rhs.lastRunUtc) {
+            return lhs.lastRunUtc > rhs.lastRunUtc;
+        }
+        const LaunchItem& lhsItem = g_state.items[lhs.itemIndex];
+        const LaunchItem& rhsItem = g_state.items[rhs.itemIndex];
+        return _wcsicmp(lhsItem.name.c_str(), rhsItem.name.c_str()) < 0;
+    });
+
+    for (const RankedResult& result : rankedResults) {
+        const LaunchItem& item = g_state.items[result.itemIndex];
         const LRESULT inserted = SendMessageW(g_state.resultList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.name.c_str()));
         if (inserted >= 0) {
-            SendMessageW(g_state.resultList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(index));
+            SendMessageW(g_state.resultList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(result.itemIndex));
         }
     }
 
@@ -663,6 +1120,112 @@ void RebuildResultList() {
     }
     SendMessageW(g_state.resultList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_state.resultList, nullptr, TRUE);
+}
+
+void RecordSuccessfulLaunch(const LaunchItem& item) {
+    if (!g_state.historyConfig.enabled) {
+        return;
+    }
+
+    sqlite3* database = nullptr;
+    if (!OpenHistoryDatabase(&database)) {
+        return;
+    }
+
+    const std::wstring nowUtc = GetCurrentUtcTimestamp();
+    bool success = ExecuteSql(database, "BEGIN IMMEDIATE TRANSACTION;");
+
+    sqlite3_stmt* upsertStatement = nullptr;
+    const wchar_t* upsertSql =
+        L"INSERT INTO launch_history ("
+        L"    item_key, display_name, command_line, working_directory, source_kind,"
+        L"    run_count, rank, last_run_utc, created_utc, updated_utc"
+        L") VALUES ("
+        L"    ?, ?, ?, ?, ?,"
+        L"    1, 1.0, ?, ?, ?"
+        L") ON CONFLICT(item_key) DO UPDATE SET "
+        L"    display_name = excluded.display_name,"
+        L"    command_line = excluded.command_line,"
+        L"    working_directory = excluded.working_directory,"
+        L"    source_kind = excluded.source_kind,"
+        L"    run_count = launch_history.run_count + 1,"
+        L"    rank = launch_history.rank + 1.0,"
+        L"    last_run_utc = excluded.last_run_utc,"
+        L"    updated_utc = excluded.updated_utc;";
+
+    if (success && PrepareStatement(database, upsertSql, &upsertStatement)) {
+        success = BindText(upsertStatement, 1, item.itemKey) &&
+            BindText(upsertStatement, 2, item.name) &&
+            BindText(upsertStatement, 3, item.commandLine) &&
+            BindText(upsertStatement, 4, item.workingDirectory) &&
+            sqlite3_bind_int(upsertStatement, 5, static_cast<int>(item.sourceKind)) == SQLITE_OK &&
+            BindText(upsertStatement, 6, nowUtc) &&
+            BindText(upsertStatement, 7, nowUtc) &&
+            BindText(upsertStatement, 8, nowUtc) &&
+            sqlite3_step(upsertStatement) == SQLITE_DONE;
+    } else {
+        success = false;
+    }
+    FinalizeStatement(upsertStatement);
+
+    double totalRank = 0.0;
+    sqlite3_stmt* sumStatement = nullptr;
+    if (success && PrepareStatement(database, L"SELECT COALESCE(SUM(rank), 0) FROM launch_history;", &sumStatement)) {
+        if (sqlite3_step(sumStatement) == SQLITE_ROW) {
+            totalRank = sqlite3_column_double(sumStatement, 0);
+        } else {
+            success = false;
+        }
+    } else if (success) {
+        success = false;
+    }
+    FinalizeStatement(sumStatement);
+
+    if (success && totalRank > g_state.historyConfig.rankSumLimit) {
+        sqlite3_stmt* decayStatement = nullptr;
+        if (PrepareStatement(database, L"UPDATE launch_history SET rank = rank * ?, updated_utc = ?;", &decayStatement)) {
+            success = sqlite3_bind_double(decayStatement, 1, g_state.historyConfig.decayFactor) == SQLITE_OK &&
+                BindText(decayStatement, 2, nowUtc) &&
+                sqlite3_step(decayStatement) == SQLITE_DONE;
+        } else {
+            success = false;
+        }
+        FinalizeStatement(decayStatement);
+    }
+
+    sqlite3_stmt* pruneStatement = nullptr;
+    if (success && PrepareStatement(database, L"DELETE FROM launch_history WHERE rank < ?;", &pruneStatement)) {
+        success = sqlite3_bind_double(pruneStatement, 1, g_state.historyConfig.pruneBelow) == SQLITE_OK &&
+            sqlite3_step(pruneStatement) == SQLITE_DONE;
+    } else if (success) {
+        success = false;
+    }
+    FinalizeStatement(pruneStatement);
+
+    sqlite3_stmt* trimStatement = nullptr;
+    if (success && PrepareStatement(database,
+            L"DELETE FROM launch_history WHERE id IN ("
+            L"    SELECT id FROM launch_history "
+            L"    ORDER BY rank DESC, last_run_utc DESC "
+            L"    LIMIT -1 OFFSET ?"
+            L");",
+            &trimStatement)) {
+        success = sqlite3_bind_int(trimStatement, 1, g_state.historyConfig.maxRows) == SQLITE_OK &&
+            sqlite3_step(trimStatement) == SQLITE_DONE;
+    } else if (success) {
+        success = false;
+    }
+    FinalizeStatement(trimStatement);
+
+    ExecuteSql(database, success ? "COMMIT;" : "ROLLBACK;");
+    sqlite3_close(database);
+
+    if (success) {
+        HistoryInfo& info = g_state.historyByKey[item.itemKey];
+        info.rank += 1.0;
+        info.runCount += 1;
+        info.lastRunUtc = nowUtc;
+    }
 }
 
 bool LaunchItemByIndex(size_t index) {
@@ -695,6 +1258,7 @@ bool LaunchItemByIndex(size_t index) {
         CloseHandle(processInfo.hProcess);
     }
 
+    RecordSuccessfulLaunch(item);
     HideLauncher();
     return true;
 }
@@ -793,6 +1357,7 @@ void ReadHotkeyControl() {
 
 void ShowLauncher() {
     ReloadItems();
+    LoadHistoryCache();
     RebuildResultList();
     LayoutLauncher();
     ShowWindow(g_state.launcherWindow, SW_SHOW);
@@ -1006,6 +1571,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     InitializeDpi();
     LoadHotkeyConfig();
+    LoadHistoryConfig();
 
     if (!InitializeWindows()) {
         return 1;
