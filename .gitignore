@@ -40,6 +40,11 @@
 Config.ini
 dorun.ini
 *.local.toml
+Command.conf
+DoRun.toml
+dorun.toml
+docs/history-system-design.md
+AGENTS.md
 
 # OS / editor
 Thumbs.db
