@@ -1,0 +1,11 @@
+# DoRun runtime configuration.
+# Default launcher hotkey is Alt+Space.
+
+HOTKEY_MODIFIERS = 1
+HOTKEY_VK = 32
+
+DIR = [
+    "C:\\Windows\\System32",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)"
+]

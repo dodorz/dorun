@@ -1,0 +1,6 @@
+#pragma once
+
+#define DORUN_VERSION_MAJOR 0
+#define DORUN_VERSION_MINOR 1
+#define DORUN_VERSION_PATCH 1
+#define DORUN_VERSION_BUILD 2

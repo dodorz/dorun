@@ -1,0 +1,45 @@
+# Build outputs
+/build/
+/x64/
+/Debug/
+/Release/
+
+# Visual Studio
+/.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# MSVC intermediate and debug artifacts
+*.obj
+*.iobj
+*.ipdb
+*.ilk
+*.idb
+*.pch
+*.pdb
+*.res
+*.tlog
+*.tmp
+*.log
+*.cache
+*.lastbuildstate
+
+# Generated binaries and libraries
+*.exe
+!build.bat
+!rebuild.bat
+*.dll
+*.lib
+*.exp
+
+# Local configuration overrides
+command.conf
+*.local.toml
+
+# OS / editor
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,11 @@
+#pragma once
+
+#define IDC_SEARCH 1001
+#define IDC_RESULTS 1002
+#define IDC_CONFIG 1003
+
+#define IDC_HOTKEY_LAUNCH 1101
+#define IDC_BTN_SAVE 1102
+#define IDC_BTN_CANCEL 1103
+
+#define ID_HOTKEY_LAUNCH 40001
