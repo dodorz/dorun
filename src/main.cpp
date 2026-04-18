@@ -84,6 +84,12 @@ struct AppState {
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
+    bool launcherDataLoaded = false;
+    bool refreshScheduled = false;
+    bool pendingItemsRefresh = false;
+    bool pendingHistoryRefresh = false;
+    ULONGLONG lastItemsRefreshTick = 0;
+    ULONGLONG lastHistoryRefreshTick = 0;
 };
 
 AppState g_state {};
@@ -97,6 +103,11 @@ constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr size_t kVisibleItemCount = 8;
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
+constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
+constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
+constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
+
+void RebuildResultList();
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
@@ -1080,6 +1091,42 @@ void ReloadItems() {
     LoadFilesystemItems();
 }
 
+void RequestLauncherDataRefresh(bool refreshItems, bool refreshHistory) {
+    g_state.pendingItemsRefresh = g_state.pendingItemsRefresh || refreshItems;
+    g_state.pendingHistoryRefresh = g_state.pendingHistoryRefresh || refreshHistory;
+    if (g_state.refreshScheduled || g_state.hostWindow == nullptr) {
+        return;
+    }
+    g_state.refreshScheduled = true;
+    PostMessageW(g_state.hostWindow, kMessageRefreshLauncherData, 0, 0);
+}
+
+void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
+    const ULONGLONG now = GetTickCount64();
+    const bool shouldRefreshItems = forceItems ||
+        !g_state.launcherDataLoaded ||
+        (now - g_state.lastItemsRefreshTick) >= kItemsRefreshIntervalMs;
+    const bool shouldRefreshHistory = forceHistory ||
+        !g_state.launcherDataLoaded ||
+        (now - g_state.lastHistoryRefreshTick) >= kHistoryRefreshIntervalMs;
+
+    bool rebuiltItems = false;
+    if (shouldRefreshItems) {
+        ReloadItems();
+        g_state.lastItemsRefreshTick = now;
+        rebuiltItems = true;
+    }
+    if (shouldRefreshHistory) {
+        LoadHistoryCache();
+        g_state.lastHistoryRefreshTick = now;
+    }
+
+    if (rebuiltItems || shouldRefreshHistory || !g_state.launcherDataLoaded) {
+        RebuildResultList();
+    }
+    g_state.launcherDataLoaded = true;
+}
+
 std::wstring GetControlText(HWND window) {
     const int length = GetWindowTextLengthW(window);
     std::wstring text(static_cast<size_t>(length), L'\0');
@@ -1394,9 +1441,6 @@ void ReadHotkeyControl() {
 }
 
 void ShowLauncher() {
-    ReloadItems();
-    LoadHistoryCache();
-    RebuildResultList();
     LayoutLauncher();
     ShowWindow(g_state.launcherWindow, SW_SHOW);
     SetForegroundWindow(g_state.launcherWindow);
@@ -1404,6 +1448,7 @@ void ShowLauncher() {
     SetEnglishImeForWindow(g_state.searchEdit);
     SendMessageW(g_state.searchEdit, EM_SETSEL, 0, -1);
     StartVisibilityTimer();
+    RequestLauncherDataRefresh(false, false);
 }
 
 void ShowConfigWindow() {
@@ -1540,6 +1585,15 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         ShowLauncher();
         return 0;
     }
+    if (message == kMessageRefreshLauncherData) {
+        const bool refreshItems = g_state.pendingItemsRefresh;
+        const bool refreshHistory = g_state.pendingHistoryRefresh;
+        g_state.pendingItemsRefresh = false;
+        g_state.pendingHistoryRefresh = false;
+        g_state.refreshScheduled = false;
+        RefreshLauncherDataIfNeeded(refreshItems, refreshHistory);
+        return 0;
+    }
     if (message == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
@@ -1617,6 +1671,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     RegisterLauncherHotkey();
+    RequestLauncherDataRefresh(true, true);
 
     MSG message {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
