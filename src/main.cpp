@@ -1658,12 +1658,26 @@ bool LaunchItemByIndex(size_t index) {
             HideLauncher();
             success = true;
         } else if (command == L"builtin:reboot") {
-            success = RunShellCommand(L"shutdown.exe", L"/r /t 0");
+            const int response = MessageBoxW(
+                g_state.launcherWindow,
+                L"Restart the computer now?",
+                L"Confirm Reboot",
+                MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+            if (response == IDYES) {
+                success = RunShellCommand(L"shutdown.exe", L"/r /t 0");
+            }
             if (success) {
                 HideLauncher();
             }
         } else if (command == L"builtin:poweroff") {
-            success = RunShellCommand(L"shutdown.exe", L"/s /t 0");
+            const int response = MessageBoxW(
+                g_state.launcherWindow,
+                L"Shut down the computer now?",
+                L"Confirm Shutdown",
+                MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+            if (response == IDYES) {
+                success = RunShellCommand(L"shutdown.exe", L"/s /t 0");
+            }
             if (success) {
                 HideLauncher();
             }
