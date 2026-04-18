@@ -65,6 +65,12 @@ struct LaunchItem {
     std::wstring itemKey;
 };
 
+struct BuiltinCommandDefinition {
+    const wchar_t* name;
+    const wchar_t* description;
+    const wchar_t* token;
+};
+
 struct ScanDirectoryConfig {
     std::wstring path;
     std::unordered_set<std::wstring> extensions;
@@ -112,6 +118,16 @@ constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
+constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
+
+constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
+    { L"/quit", L"Exit DoRun", L"quit" },
+    { L"/reload", L"Reload configuration files", L"reload" },
+    { L"/reboot", L"Restart the computer", L"reboot" },
+    { L"/poweroff", L"Shut down the computer", L"poweroff" },
+    { L"/config", L"Open DoRun.yaml", L"config" },
+    { L"/cmdconfig", L"Open Command.conf", L"cmdconfig" },
+};
 
 void RebuildResultList();
 
@@ -1082,6 +1098,37 @@ bool OpenHistoryDatabase(sqlite3** database) {
     return true;
 }
 
+bool EnsureParentDirectoryForFile(const std::wstring& path) {
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::path(path).parent_path();
+    if (directory.empty()) {
+        return true;
+    }
+    std::filesystem::create_directories(directory, error);
+    return !error;
+}
+
+bool EnsureFileExists(const std::wstring& path) {
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        return true;
+    }
+    if (!EnsureParentDirectoryForFile(path)) {
+        return false;
+    }
+    return SaveUtf8TextFile(path, L"");
+}
+
+bool OpenPathInShell(const std::wstring& path) {
+    const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
+bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCommand = SW_HIDE) {
+    const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", file, parameters, nullptr, showCommand);
+    return reinterpret_cast<INT_PTR>(result) > 32;
+}
+
 bool ExecuteSql(sqlite3* database, const char* sql) {
     return database != nullptr && sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
 }
@@ -1283,6 +1330,17 @@ void LoadCommandItems() {
     }
 }
 
+void LoadBuiltinCommandItems() {
+    for (const BuiltinCommandDefinition& command : kBuiltinCommands) {
+        LaunchItem item {};
+        item.name = std::wstring(command.name) + L" - " + command.description;
+        item.commandLine = std::wstring(kBuiltinCommandPrefix) + command.token;
+        item.sourceKind = ItemSourceKind::Synthetic;
+        item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
+        g_state.items.push_back(std::move(item));
+    }
+}
+
 void LoadFilesystemItems() {
     std::unordered_set<std::wstring> seen;
     for (const LaunchItem& item : g_state.items) {
@@ -1350,6 +1408,7 @@ void ReloadItems() {
     LoadScanDirectories(content);
     LoadCommandItems();
     LoadFilesystemItems();
+    LoadBuiltinCommandItems();
 }
 
 void RequestLauncherDataRefresh(bool refreshItems, bool refreshHistory) {
@@ -1406,6 +1465,7 @@ struct RankedResult {
 
 void RebuildResultList() {
     const std::wstring query = Trim(GetControlText(g_state.searchEdit));
+    const bool builtinQuery = !query.empty() && query.front() == L'/';
     SendMessageW(g_state.resultList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_state.resultList, LB_RESETCONTENT, 0, 0);
 
@@ -1414,6 +1474,12 @@ void RebuildResultList() {
 
     for (size_t index = 0; index < g_state.items.size(); ++index) {
         const LaunchItem& item = g_state.items[index];
+        if (builtinQuery && item.sourceKind != ItemSourceKind::Synthetic) {
+            continue;
+        }
+        if (!builtinQuery && item.sourceKind == ItemSourceKind::Synthetic) {
+            continue;
+        }
         const int matchScore = ComputeMatchScore(item, query);
         if (matchScore < 0) {
             continue;
@@ -1422,10 +1488,12 @@ void RebuildResultList() {
         RankedResult result {};
         result.itemIndex = index;
         result.matchScore = matchScore;
-        if (const auto it = g_state.historyByKey.find(item.itemKey); it != g_state.historyByKey.end()) {
-            result.rank = it->second.rank;
-            result.lastRunUtc = it->second.lastRunUtc;
-            result.recencyBonus = ComputeRecencyBonus(it->second.lastRunUtc);
+        if (item.sourceKind != ItemSourceKind::Synthetic) {
+            if (const auto it = g_state.historyByKey.find(item.itemKey); it != g_state.historyByKey.end()) {
+                result.rank = it->second.rank;
+                result.lastRunUtc = it->second.lastRunUtc;
+                result.recencyBonus = ComputeRecencyBonus(it->second.lastRunUtc);
+            }
         }
         result.finalScore = static_cast<double>(matchScore) * 1000.0 + result.rank * 20.0 + static_cast<double>(result.recencyBonus);
         rankedResults.push_back(std::move(result));
@@ -1465,7 +1533,7 @@ void RebuildResultList() {
 }
 
 void RecordSuccessfulLaunch(const LaunchItem& item) {
-    if (!g_state.historyConfig.enabled) {
+    if (item.sourceKind == ItemSourceKind::Synthetic || !g_state.historyConfig.enabled) {
         return;
     }
 
@@ -1576,6 +1644,45 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     const LaunchItem& item = g_state.items[index];
+    if (item.sourceKind == ItemSourceKind::Synthetic) {
+        const std::wstring command = Lowercase(item.commandLine);
+        bool success = false;
+        if (command == L"builtin:quit") {
+            PostMessageW(g_state.hostWindow, WM_CLOSE, 0, 0);
+            success = true;
+        } else if (command == L"builtin:reload") {
+            LoadHotkeyConfig();
+            LoadHistoryConfig();
+            RegisterLauncherHotkey();
+            RequestLauncherDataRefresh(true, true);
+            HideLauncher();
+            success = true;
+        } else if (command == L"builtin:reboot") {
+            success = RunShellCommand(L"shutdown.exe", L"/r /t 0");
+            if (success) {
+                HideLauncher();
+            }
+        } else if (command == L"builtin:poweroff") {
+            success = RunShellCommand(L"shutdown.exe", L"/s /t 0");
+            if (success) {
+                HideLauncher();
+            }
+        } else if (command == L"builtin:config") {
+            const std::wstring path = GetWritableConfigPath(kConfigFileName);
+            success = EnsureFileExists(path) && OpenPathInShell(path);
+            if (success) {
+                HideLauncher();
+            }
+        } else if (command == L"builtin:cmdconfig") {
+            const std::wstring path = GetWritableConfigPath(kCommandFileName);
+            success = EnsureFileExists(path) && OpenPathInShell(path);
+            if (success) {
+                HideLauncher();
+            }
+        }
+        return success;
+    }
+
     SetEnglishImeForWindow(g_state.searchEdit);
     std::wstring commandLine = ExpandEnvironmentVariables(item.commandLine);
     std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(item.workingDirectory);
