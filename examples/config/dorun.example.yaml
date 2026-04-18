@@ -1,0 +1,41 @@
+# DoRun config example.
+# Copy this file to DoRun.yaml and place it next to DoRun.exe,
+# or under %APPDATA%\DoRun\DoRun.yaml.
+
+# Launcher hotkey:
+# 1 = MOD_ALT
+# 2 = MOD_CONTROL
+# 4 = MOD_SHIFT
+# 8 = MOD_WIN
+HOTKEY_MODIFIERS: 1
+HOTKEY_VK: 32
+
+HISTORY_ENABLED: 1
+HISTORY_DB_PATH: ''
+HISTORY_RANK_SUM_LIMIT: 5000
+HISTORY_DECAY_FACTOR: 0.9
+HISTORY_PRUNE_BELOW: 1
+HISTORY_MAX_ROWS: 5000
+HISTORY_RECENCY_ENABLED: 1
+HISTORY_FUZZY_ENABLED: 1
+
+# Global defaults for directory indexing.
+INDEX_INCLUDE_PATHEXT: true
+INDEX_RECURSIVE: true
+INDEX_EXTENSIONS:
+  - '.exe'
+  - '.lnk'
+
+# Each indexed directory is defined once and can override the globals above.
+DIR:
+  - PATH: 'C:\Windows\System32'
+    INDEX_RECURSIVE: false
+
+  - PATH: 'C:\Program Files'
+    INDEX_INCLUDE_PATHEXT: false
+    INDEX_EXTENSIONS:
+      - '.exe'
+      - '.lnk'
+      - '.cmd'
+
+  - PATH: 'C:\Program Files (x86)'

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <locale>
 #include <optional>
 #include <sstream>
@@ -64,6 +65,12 @@ struct LaunchItem {
     std::wstring itemKey;
 };
 
+struct ScanDirectoryConfig {
+    std::wstring path;
+    std::unordered_set<std::wstring> extensions;
+    bool recursive = true;
+};
+
 struct AppState {
     HINSTANCE instance = nullptr;
     HWND hostWindow = nullptr;
@@ -79,8 +86,7 @@ struct AppState {
     HFONT uiFont = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
-    std::vector<std::wstring> scanDirectories;
-    std::unordered_set<std::wstring> executableExtensions;
+    std::vector<ScanDirectoryConfig> scanDirectories;
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
@@ -98,7 +104,7 @@ constexpr wchar_t kHostClassName[] = L"DoRun.HostWindow";
 constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
 constexpr wchar_t kConfigClassName[] = L"DoRun.ConfigWindow";
 constexpr wchar_t kAppDirectoryName[] = L"DoRun";
-constexpr wchar_t kTomlFileName[] = L"DoRun.toml";
+constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr size_t kVisibleItemCount = 8;
 constexpr UINT_PTR kVisibilityTimerId = 1;
@@ -247,60 +253,241 @@ bool SaveUtf8TextFile(const std::wstring& path, const std::wstring& content) {
     return stream.good();
 }
 
-std::optional<std::wstring> ParseTomlRawValue(const std::wstring& content, std::wstring_view key) {
-    const std::wstring pattern = std::wstring(key) + L" =";
-    const size_t keyPos = content.find(pattern);
-    if (keyPos == std::wstring::npos) {
-        return std::nullopt;
-    }
+struct YamlLine {
+    int indent = 0;
+    std::wstring text;
+};
 
-    size_t valueStart = keyPos + pattern.size();
-    while (valueStart < content.size() && iswspace(content[valueStart]) != 0) {
-        ++valueStart;
+std::wstring StripYamlComment(std::wstring_view line) {
+    bool inSingleQuote = false;
+    bool inDoubleQuote = false;
+    std::wstring result;
+    result.reserve(line.size());
+    for (size_t index = 0; index < line.size(); ++index) {
+        const wchar_t ch = line[index];
+        if (ch == L'\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+            result.push_back(ch);
+            continue;
+        }
+        if (ch == L'"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+            result.push_back(ch);
+            continue;
+        }
+        if (ch == L'#' && !inSingleQuote && !inDoubleQuote) {
+            break;
+        }
+        result.push_back(ch);
     }
-
-    size_t valueEnd = valueStart;
-    while (valueEnd < content.size() && content[valueEnd] != L'\r' && content[valueEnd] != L'\n') {
-        ++valueEnd;
-    }
-
-    return Trim(content.substr(valueStart, valueEnd - valueStart));
+    return result;
 }
 
-std::optional<UINT> ParseTomlUInt(const std::wstring& content, std::wstring_view key) {
-    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+std::wstring RTrim(std::wstring value) {
+    while (!value.empty() && iswspace(value.back()) != 0) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::vector<YamlLine> ParseYamlLines(const std::wstring& content) {
+    std::vector<YamlLine> lines;
+    std::wstringstream stream(content);
+    std::wstring rawLine;
+    while (std::getline(stream, rawLine)) {
+        if (!rawLine.empty() && rawLine.back() == L'\r') {
+            rawLine.pop_back();
+        }
+
+        const std::wstring withoutComments = RTrim(StripYamlComment(rawLine));
+        size_t offset = 0;
+        while (offset < withoutComments.size() && withoutComments[offset] == L' ') {
+            ++offset;
+        }
+
+        const std::wstring trimmed = withoutComments.substr(offset);
+        if (trimmed.empty()) {
+            continue;
+        }
+
+        lines.push_back({ static_cast<int>(offset), trimmed });
+    }
+    return lines;
+}
+
+bool MatchYamlKey(const std::wstring& text, std::wstring_view key, std::wstring* remainder) {
+    if (!text.starts_with(key)) {
+        return false;
+    }
+    const size_t keyLength = key.size();
+    if (text.size() <= keyLength || text[keyLength] != L':') {
+        return false;
+    }
+    if (remainder != nullptr) {
+        *remainder = Trim(text.substr(keyLength + 1));
+    }
+    return true;
+}
+
+std::optional<std::wstring> ExtractYamlChildBlock(const std::wstring& content, std::wstring_view key) {
+    const std::vector<YamlLine> lines = ParseYamlLines(content);
+    for (size_t index = 0; index < lines.size(); ++index) {
+        if (lines[index].indent != 0) {
+            continue;
+        }
+
+        std::wstring remainder;
+        if (!MatchYamlKey(lines[index].text, key, &remainder) || !remainder.empty()) {
+            continue;
+        }
+
+        std::vector<YamlLine> children;
+        int minIndent = (std::numeric_limits<int>::max)();
+        for (size_t childIndex = index + 1; childIndex < lines.size(); ++childIndex) {
+            if (lines[childIndex].indent <= lines[index].indent) {
+                break;
+            }
+            children.push_back(lines[childIndex]);
+            minIndent = std::min(minIndent, lines[childIndex].indent);
+        }
+
+        if (children.empty()) {
+            return std::nullopt;
+        }
+
+        std::wstring block;
+        for (const YamlLine& line : children) {
+            block.append(static_cast<size_t>(line.indent - minIndent), L' ');
+            block += line.text;
+            block += L"\n";
+        }
+        return block;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::wstring> ParseYamlRawValue(const std::wstring& content, std::wstring_view key) {
+    const std::vector<YamlLine> lines = ParseYamlLines(content);
+    for (const YamlLine& line : lines) {
+        if (line.indent != 0) {
+            continue;
+        }
+
+        std::wstring remainder;
+        if (!MatchYamlKey(line.text, key, &remainder) || remainder.empty()) {
+            continue;
+        }
+        return remainder;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::wstring> ParseYamlSequenceMapBlocks(const std::wstring& content, std::wstring_view key) {
+    std::vector<std::wstring> blocks;
+    const std::optional<std::wstring> block = ExtractYamlChildBlock(content, key);
+    if (!block) {
+        return blocks;
+    }
+
+    const std::vector<YamlLine> lines = ParseYamlLines(*block);
+    std::wstring currentBlock;
+    for (const YamlLine& line : lines) {
+        if (line.indent == 0 && line.text.starts_with(L"- ")) {
+            if (!currentBlock.empty()) {
+                blocks.push_back(currentBlock);
+                currentBlock.clear();
+            }
+            currentBlock += line.text.substr(2);
+            currentBlock += L"\n";
+            continue;
+        }
+
+        if (currentBlock.empty()) {
+            continue;
+        }
+        currentBlock.append(static_cast<size_t>(line.indent), L' ');
+        currentBlock += line.text;
+        currentBlock += L"\n";
+    }
+
+    if (!currentBlock.empty()) {
+        blocks.push_back(currentBlock);
+    }
+    return blocks;
+}
+
+std::optional<UINT> ParseYamlUInt(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlRawValue(content, key);
     if (!rawValue || rawValue->empty()) {
         return std::nullopt;
     }
     return static_cast<UINT>(_wtoi(rawValue->c_str()));
 }
 
-std::optional<int> ParseTomlInt(const std::wstring& content, std::wstring_view key) {
-    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+std::optional<int> ParseYamlInt(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlRawValue(content, key);
     if (!rawValue || rawValue->empty()) {
         return std::nullopt;
     }
     return _wtoi(rawValue->c_str());
 }
 
-std::optional<double> ParseTomlDouble(const std::wstring& content, std::wstring_view key) {
-    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+std::optional<double> ParseYamlDouble(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlRawValue(content, key);
     if (!rawValue || rawValue->empty()) {
         return std::nullopt;
     }
     return _wtof(rawValue->c_str());
 }
 
-std::optional<std::wstring> ParseTomlString(const std::wstring& content, std::wstring_view key) {
-    const std::optional<std::wstring> rawValue = ParseTomlRawValue(content, key);
+std::optional<std::wstring> ParseYamlString(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlRawValue(content, key);
     if (!rawValue) {
         return std::nullopt;
     }
     std::wstring value = *rawValue;
-    if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
+    if (value.size() >= 2 &&
+        ((value.front() == L'"' && value.back() == L'"') || (value.front() == L'\'' && value.back() == L'\''))) {
         value = value.substr(1, value.size() - 2);
     }
     return value;
+}
+
+std::vector<std::wstring> ParseYamlStringArray(const std::wstring& content, std::wstring_view key) {
+    std::vector<std::wstring> values;
+    const std::optional<std::wstring> block = ExtractYamlChildBlock(content, key);
+    if (!block) {
+        return values;
+    }
+
+    for (const YamlLine& line : ParseYamlLines(*block)) {
+        if (line.indent != 0 || !line.text.starts_with(L"- ")) {
+            continue;
+        }
+        std::wstring value = Trim(line.text.substr(2));
+        if (value.size() >= 2 &&
+            ((value.front() == L'"' && value.back() == L'"') || (value.front() == L'\'' && value.back() == L'\''))) {
+            value = value.substr(1, value.size() - 2);
+        }
+        values.push_back(std::move(value));
+    }
+    return values;
+}
+
+std::optional<bool> ParseYamlBool(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlRawValue(content, key);
+    if (!rawValue || rawValue->empty()) {
+        return std::nullopt;
+    }
+
+    const std::wstring value = Lowercase(Trim(*rawValue));
+    if (value == L"1" || value == L"true") {
+        return true;
+    }
+    if (value == L"0" || value == L"false") {
+        return false;
+    }
+    return std::nullopt;
 }
 
 std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
@@ -617,16 +804,16 @@ void EnsureDefaultHotkey() {
 void LoadHotkeyConfig() {
     EnsureDefaultHotkey();
 
-    const std::wstring tomlPath = FindConfigPath(kTomlFileName);
-    const std::wstring content = LoadUtf8TextFile(tomlPath);
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
     if (content.empty()) {
         return;
     }
 
-    if (const std::optional<UINT> modifiers = ParseTomlUInt(content, L"HOTKEY_MODIFIERS")) {
+    if (const std::optional<UINT> modifiers = ParseYamlUInt(content, L"HOTKEY_MODIFIERS")) {
         g_state.hotkey.modifiers = *modifiers;
     }
-    if (const std::optional<UINT> vk = ParseTomlUInt(content, L"HOTKEY_VK")) {
+    if (const std::optional<UINT> vk = ParseYamlUInt(content, L"HOTKEY_VK")) {
         g_state.hotkey.vk = *vk;
     }
     if (g_state.hotkey.vk == 0U) {
@@ -637,66 +824,80 @@ void LoadHotkeyConfig() {
 void LoadHistoryConfig() {
     g_state.historyConfig = HistoryConfig {};
 
-    const std::wstring tomlPath = FindConfigPath(kTomlFileName);
-    const std::wstring content = LoadUtf8TextFile(tomlPath);
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
     if (content.empty()) {
         return;
     }
 
-    if (const std::optional<UINT> enabled = ParseTomlUInt(content, L"HISTORY_ENABLED")) {
+    if (const std::optional<UINT> enabled = ParseYamlUInt(content, L"HISTORY_ENABLED")) {
         g_state.historyConfig.enabled = *enabled != 0U;
     }
-    if (const std::optional<std::wstring> databasePath = ParseTomlString(content, L"HISTORY_DB_PATH")) {
+    if (const std::optional<std::wstring> databasePath = ParseYamlString(content, L"HISTORY_DB_PATH")) {
         g_state.historyConfig.databasePath = *databasePath;
     }
-    if (const std::optional<double> rankSumLimit = ParseTomlDouble(content, L"HISTORY_RANK_SUM_LIMIT")) {
+    if (const std::optional<double> rankSumLimit = ParseYamlDouble(content, L"HISTORY_RANK_SUM_LIMIT")) {
         g_state.historyConfig.rankSumLimit = std::max(1.0, *rankSumLimit);
     }
-    if (const std::optional<double> decayFactor = ParseTomlDouble(content, L"HISTORY_DECAY_FACTOR")) {
+    if (const std::optional<double> decayFactor = ParseYamlDouble(content, L"HISTORY_DECAY_FACTOR")) {
         g_state.historyConfig.decayFactor = std::clamp(*decayFactor, 0.01, 0.999);
     }
-    if (const std::optional<double> pruneBelow = ParseTomlDouble(content, L"HISTORY_PRUNE_BELOW")) {
+    if (const std::optional<double> pruneBelow = ParseYamlDouble(content, L"HISTORY_PRUNE_BELOW")) {
         g_state.historyConfig.pruneBelow = std::max(0.0, *pruneBelow);
     }
-    if (const std::optional<int> maxRows = ParseTomlInt(content, L"HISTORY_MAX_ROWS")) {
+    if (const std::optional<int> maxRows = ParseYamlInt(content, L"HISTORY_MAX_ROWS")) {
         g_state.historyConfig.maxRows = std::max(1, *maxRows);
     }
-    if (const std::optional<UINT> recencyEnabled = ParseTomlUInt(content, L"HISTORY_RECENCY_ENABLED")) {
+    if (const std::optional<UINT> recencyEnabled = ParseYamlUInt(content, L"HISTORY_RECENCY_ENABLED")) {
         g_state.historyConfig.recencyEnabled = *recencyEnabled != 0U;
     }
-    if (const std::optional<UINT> fuzzyEnabled = ParseTomlUInt(content, L"HISTORY_FUZZY_ENABLED")) {
+    if (const std::optional<UINT> fuzzyEnabled = ParseYamlUInt(content, L"HISTORY_FUZZY_ENABLED")) {
         g_state.historyConfig.fuzzyEnabled = *fuzzyEnabled != 0U;
     }
 }
 
 void SaveHotkeyConfig() {
-    const std::wstring tomlPath = GetWritableConfigPath(kTomlFileName);
-    std::wstring content = LoadUtf8TextFile(tomlPath);
-    const std::wstring modifiersLine = L"HOTKEY_MODIFIERS = " + std::to_wstring(g_state.hotkey.modifiers);
-    const std::wstring vkLine = L"HOTKEY_VK = " + std::to_wstring(g_state.hotkey.vk);
+    const std::wstring configPath = GetWritableConfigPath(kConfigFileName);
+    std::wstring content = LoadUtf8TextFile(configPath);
+    const std::wstring modifiersLine = L"HOTKEY_MODIFIERS: " + std::to_wstring(g_state.hotkey.modifiers);
+    const std::wstring vkLine = L"HOTKEY_VK: " + std::to_wstring(g_state.hotkey.vk);
 
     auto upsertLine = [&](std::wstring_view key, const std::wstring& replacement) {
-        const std::wstring pattern = std::wstring(key) + L" =";
-        const size_t keyPos = content.find(pattern);
-        if (keyPos == std::wstring::npos) {
-            if (!content.empty() && content.back() != L'\n') {
-                content += L"\n";
+        std::wstringstream stream(content);
+        std::wstring line;
+        std::wstring rebuilt;
+        bool replaced = false;
+
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == L'\r') {
+                line.pop_back();
             }
-            content += replacement;
-            content += L"\n";
-            return;
+
+            std::wstring remainder;
+            if (!replaced && MatchYamlKey(Trim(line), key, &remainder)) {
+                rebuilt += replacement;
+                rebuilt += L"\n";
+                replaced = true;
+                continue;
+            }
+
+            rebuilt += line;
+            rebuilt += L"\n";
         }
 
-        size_t lineEnd = content.find(L'\n', keyPos);
-        if (lineEnd == std::wstring::npos) {
-            lineEnd = content.size();
+        if (!replaced) {
+            if (!rebuilt.empty() && rebuilt.back() != L'\n') {
+                rebuilt += L"\n";
+            }
+            rebuilt += replacement;
+            rebuilt += L"\n";
         }
-        content.replace(keyPos, lineEnd - keyPos, replacement);
+        content = std::move(rebuilt);
     };
 
     upsertLine(L"HOTKEY_MODIFIERS", modifiersLine);
     upsertLine(L"HOTKEY_VK", vkLine);
-    SaveUtf8TextFile(tomlPath, content);
+    SaveUtf8TextFile(configPath, content);
 }
 
 void RegisterLauncherHotkey() {
@@ -704,35 +905,15 @@ void RegisterLauncherHotkey() {
     RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk);
 }
 
-std::vector<std::wstring> ParseQuotedStrings(const std::wstring& text) {
-    std::vector<std::wstring> values;
-    std::wstring current;
-    bool inString = false;
-    for (size_t i = 0; i < text.size(); ++i) {
-        const wchar_t ch = text[i];
-        if (!inString) {
-            if (ch == L'"') {
-                inString = true;
-                current.clear();
-            }
-            continue;
-        }
-
-        if (ch == L'\\' && i + 1 < text.size()) {
-            current.push_back(text[++i]);
-            continue;
-        }
-        if (ch == L'"') {
-            values.push_back(current);
-            inString = false;
-            continue;
-        }
-        current.push_back(ch);
+std::wstring NormalizeExtension(std::wstring value) {
+    value = Lowercase(Trim(value));
+    if (!value.empty() && value.front() != L'.') {
+        value.insert(value.begin(), L'.');
     }
-    return values;
+    return value;
 }
 
-std::unordered_set<std::wstring> LoadExecutableExtensions() {
+std::unordered_set<std::wstring> LoadExecutableExtensionsFromPathExt() {
     std::unordered_set<std::wstring> extensions;
     std::array<wchar_t, 32767> buffer {};
     const DWORD length = GetEnvironmentVariableW(L"PATHEXT", buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -740,18 +921,45 @@ std::unordered_set<std::wstring> LoadExecutableExtensions() {
         std::wstringstream stream(buffer.data());
         std::wstring token;
         while (std::getline(stream, token, L';')) {
-            token = Lowercase(Trim(token));
-            if (!token.empty() && token.front() != L'.') {
-                token.insert(token.begin(), L'.');
-            }
+            token = NormalizeExtension(token);
             if (!token.empty()) {
                 extensions.insert(token);
             }
         }
     }
-    extensions.insert(L".exe");
-    extensions.insert(L".lnk");
     return extensions;
+}
+
+std::unordered_set<std::wstring> BuildExecutableExtensions(bool includePathExt, const std::vector<std::wstring>& configuredExtensions) {
+    std::unordered_set<std::wstring> extensions = includePathExt
+        ? LoadExecutableExtensionsFromPathExt()
+        : std::unordered_set<std::wstring> {};
+
+    for (std::wstring extension : configuredExtensions) {
+        extension = NormalizeExtension(std::move(extension));
+        if (!extension.empty()) {
+            extensions.insert(extension);
+        }
+    }
+    return extensions;
+}
+
+std::unordered_set<std::wstring> LoadExecutableExtensions(const std::wstring& content) {
+    bool includePathExt = true;
+    if (!content.empty()) {
+        if (const std::optional<bool> configured = ParseYamlBool(content, L"INDEX_INCLUDE_PATHEXT")) {
+            includePathExt = *configured;
+        }
+    }
+
+    std::vector<std::wstring> configuredExtensions = content.empty()
+        ? std::vector<std::wstring> {}
+        : ParseYamlStringArray(content, L"INDEX_EXTENSIONS");
+    if (configuredExtensions.empty()) {
+        configuredExtensions = { L".exe", L".lnk" };
+    }
+
+    return BuildExecutableExtensions(includePathExt, configuredExtensions);
 }
 
 void EnsureDefaultDirectories() {
@@ -759,28 +967,65 @@ void EnsureDefaultDirectories() {
         return;
     }
     g_state.scanDirectories = {
-        L"C:\\Windows\\System32",
-        L"C:\\Program Files",
-        L"C:\\Program Files (x86)",
+        { L"C:\\Windows\\System32" },
+        { L"C:\\Program Files" },
+        { L"C:\\Program Files (x86)" },
     };
 }
 
-void LoadScanDirectories() {
+void LoadScanDirectories(const std::wstring& content) {
     g_state.scanDirectories.clear();
-    const std::wstring content = LoadUtf8TextFile(FindConfigPath(kTomlFileName));
+    const std::unordered_set<std::wstring> globalExtensions = LoadExecutableExtensions(content);
+    bool globalRecursive = true;
+    if (!content.empty()) {
+        if (const std::optional<bool> configured = ParseYamlBool(content, L"INDEX_RECURSIVE")) {
+            globalRecursive = *configured;
+        }
+    }
+
+    auto applyDefaults = [&](ScanDirectoryConfig& config) {
+        config.extensions = globalExtensions;
+        config.recursive = globalRecursive;
+    };
+
     if (content.empty()) {
         EnsureDefaultDirectories();
+        for (ScanDirectoryConfig& directory : g_state.scanDirectories) {
+            applyDefaults(directory);
+        }
         return;
     }
-    const size_t dirPos = content.find(L"DIR");
-    const size_t start = content.find(L'[', dirPos);
-    const size_t end = content.find(L']', start);
-    if (dirPos == std::wstring::npos || start == std::wstring::npos || end == std::wstring::npos || end <= start) {
+
+    for (const std::wstring& block : ParseYamlSequenceMapBlocks(content, L"DIR")) {
+        const std::optional<std::wstring> path = ParseYamlString(block, L"PATH");
+        if (!path || path->empty()) {
+            continue;
+        }
+
+        ScanDirectoryConfig directory {};
+        directory.path = *path;
+        applyDefaults(directory);
+        if (const std::optional<bool> recursive = ParseYamlBool(block, L"INDEX_RECURSIVE")) {
+            directory.recursive = *recursive;
+        }
+        const std::vector<std::wstring> directoryExtensions = ParseYamlStringArray(block, L"INDEX_EXTENSIONS");
+        const std::optional<bool> includePathExt = ParseYamlBool(block, L"INDEX_INCLUDE_PATHEXT");
+        if (includePathExt || !directoryExtensions.empty()) {
+            std::vector<std::wstring> effectiveExtensions = directoryExtensions;
+            if (effectiveExtensions.empty()) {
+                effectiveExtensions = { L".exe", L".lnk" };
+            }
+            directory.extensions = BuildExecutableExtensions(includePathExt.value_or(true), effectiveExtensions);
+        }
+        g_state.scanDirectories.push_back(std::move(directory));
+    }
+
+    if (g_state.scanDirectories.empty()) {
         EnsureDefaultDirectories();
-        return;
+        for (ScanDirectoryConfig& directory : g_state.scanDirectories) {
+            applyDefaults(directory);
+        }
     }
-    g_state.scanDirectories = ParseQuotedStrings(content.substr(start + 1, end - start - 1));
-    EnsureDefaultDirectories();
 }
 
 bool OpenHistoryDatabase(sqlite3** database) {
@@ -1044,25 +1289,16 @@ void LoadFilesystemItems() {
         seen.insert(Lowercase(item.name + L"|" + item.commandLine));
     }
 
-    for (const std::wstring& directory : g_state.scanDirectories) {
+    for (const ScanDirectoryConfig& directory : g_state.scanDirectories) {
         std::error_code error;
-        if (!std::filesystem::exists(directory, error)) {
+        if (!std::filesystem::exists(directory.path, error)) {
             continue;
         }
 
-        for (std::filesystem::recursive_directory_iterator it(directory, std::filesystem::directory_options::skip_permission_denied, error), end; it != end; it.increment(error)) {
-            if (error) {
-                error.clear();
-                continue;
-            }
-            if (!it->is_regular_file(error)) {
-                continue;
-            }
-
-            const std::filesystem::path path = it->path();
+        auto appendItem = [&](const std::filesystem::path& path) {
             const std::wstring extension = Lowercase(path.extension().wstring());
-            if (g_state.executableExtensions.find(extension) == g_state.executableExtensions.end()) {
-                continue;
+            if (directory.extensions.find(extension) == directory.extensions.end()) {
+                return;
             }
 
             LaunchItem item {};
@@ -1075,6 +1311,31 @@ void LoadFilesystemItems() {
             if (seen.insert(key).second) {
                 g_state.items.push_back(std::move(item));
             }
+        };
+
+        if (!directory.recursive) {
+            for (std::filesystem::directory_iterator it(directory.path, std::filesystem::directory_options::skip_permission_denied, error), end; it != end; it.increment(error)) {
+                if (error) {
+                    error.clear();
+                    continue;
+                }
+                if (!it->is_regular_file(error)) {
+                    continue;
+                }
+                appendItem(it->path());
+            }
+            continue;
+        }
+
+        for (std::filesystem::recursive_directory_iterator it(directory.path, std::filesystem::directory_options::skip_permission_denied, error), end; it != end; it.increment(error)) {
+            if (error) {
+                error.clear();
+                continue;
+            }
+            if (!it->is_regular_file(error)) {
+                continue;
+            }
+            appendItem(it->path());
         }
     }
 
@@ -1084,9 +1345,9 @@ void LoadFilesystemItems() {
 }
 
 void ReloadItems() {
-    g_state.executableExtensions = LoadExecutableExtensions();
+    const std::wstring content = LoadUtf8TextFile(FindConfigPath(kConfigFileName));
     g_state.items.clear();
-    LoadScanDirectories();
+    LoadScanDirectories(content);
     LoadCommandItems();
     LoadFilesystemItems();
 }
