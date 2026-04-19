@@ -83,11 +83,6 @@ struct AppState {
     HWND launcherWindow = nullptr;
     HWND searchEdit = nullptr;
     HWND resultList = nullptr;
-    HWND configButton = nullptr;
-    HWND configWindow = nullptr;
-    HWND configHotkey = nullptr;
-    HWND configSaveButton = nullptr;
-    HWND configCancelButton = nullptr;
     WNDPROC editProc = nullptr;
     HFONT uiFont = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
@@ -108,7 +103,6 @@ AppState g_state {};
 
 constexpr wchar_t kHostClassName[] = L"DoRun.HostWindow";
 constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
-constexpr wchar_t kConfigClassName[] = L"DoRun.ConfigWindow";
 constexpr wchar_t kAppDirectoryName[] = L"DoRun";
 constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
@@ -732,7 +726,6 @@ void LayoutLauncher() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
     const int width = Scale(720);
     const int margin = Scale(12);
-    const int buttonWidth = Scale(96);
     const int controlHeight = Scale(32);
     const int listHeight = Scale(30) * static_cast<int>(kVisibleItemCount);
     const int height = margin * 3 + controlHeight + listHeight;
@@ -740,22 +733,8 @@ void LayoutLauncher() {
     const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 4;
 
     SetWindowPos(g_state.launcherWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
-    MoveWindow(g_state.searchEdit, margin, margin, width - margin * 3 - buttonWidth, controlHeight, TRUE);
-    MoveWindow(g_state.configButton, width - margin - buttonWidth, margin, buttonWidth, controlHeight, TRUE);
+    MoveWindow(g_state.searchEdit, margin, margin, width - margin * 2, controlHeight, TRUE);
     MoveWindow(g_state.resultList, margin, margin * 2 + controlHeight, width - margin * 2, listHeight, TRUE);
-}
-
-void LayoutConfig(HWND window) {
-    RECT anchor {};
-    GetWindowRect(g_state.launcherWindow, &anchor);
-    const int width = Scale(340);
-    const int height = Scale(160);
-    const int margin = Scale(16);
-    const int controlHeight = Scale(28);
-    SetWindowPos(window, HWND_TOPMOST, anchor.left + Scale(40), anchor.top + Scale(40), width, height, SWP_SHOWWINDOW);
-    MoveWindow(g_state.configHotkey, margin, margin + Scale(28), width - margin * 2, controlHeight, TRUE);
-    MoveWindow(g_state.configSaveButton, width - margin * 2 - Scale(176), height - margin - controlHeight, Scale(80), controlHeight, TRUE);
-    MoveWindow(g_state.configCancelButton, width - margin - Scale(80), height - margin - controlHeight, Scale(80), controlHeight, TRUE);
 }
 
 void HideLauncher() {
@@ -770,7 +749,7 @@ bool IsChildOrSameWindow(HWND parent, HWND candidate) {
 }
 
 bool IsLauncherRelatedWindow(HWND window) {
-    return IsChildOrSameWindow(g_state.launcherWindow, window) || IsChildOrSameWindow(g_state.configWindow, window);
+    return IsChildOrSameWindow(g_state.launcherWindow, window);
 }
 
 void StartVisibilityTimer() {
@@ -870,50 +849,6 @@ void LoadHistoryConfig() {
     if (const std::optional<UINT> fuzzyEnabled = ParseYamlUInt(content, L"HISTORY_FUZZY_ENABLED")) {
         g_state.historyConfig.fuzzyEnabled = *fuzzyEnabled != 0U;
     }
-}
-
-void SaveHotkeyConfig() {
-    const std::wstring configPath = GetWritableConfigPath(kConfigFileName);
-    std::wstring content = LoadUtf8TextFile(configPath);
-    const std::wstring modifiersLine = L"HOTKEY_MODIFIERS: " + std::to_wstring(g_state.hotkey.modifiers);
-    const std::wstring vkLine = L"HOTKEY_VK: " + std::to_wstring(g_state.hotkey.vk);
-
-    auto upsertLine = [&](std::wstring_view key, const std::wstring& replacement) {
-        std::wstringstream stream(content);
-        std::wstring line;
-        std::wstring rebuilt;
-        bool replaced = false;
-
-        while (std::getline(stream, line)) {
-            if (!line.empty() && line.back() == L'\r') {
-                line.pop_back();
-            }
-
-            std::wstring remainder;
-            if (!replaced && MatchYamlKey(Trim(line), key, &remainder)) {
-                rebuilt += replacement;
-                rebuilt += L"\n";
-                replaced = true;
-                continue;
-            }
-
-            rebuilt += line;
-            rebuilt += L"\n";
-        }
-
-        if (!replaced) {
-            if (!rebuilt.empty() && rebuilt.back() != L'\n') {
-                rebuilt += L"\n";
-            }
-            rebuilt += replacement;
-            rebuilt += L"\n";
-        }
-        content = std::move(rebuilt);
-    };
-
-    upsertLine(L"HOTKEY_MODIFIERS", modifiersLine);
-    upsertLine(L"HOTKEY_VK", vkLine);
-    SaveUtf8TextFile(configPath, content);
 }
 
 void RegisterLauncherHotkey() {
@@ -1788,40 +1723,6 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
     return CallWindowProcW(g_state.editProc, window, message, wParam, lParam);
 }
 
-void PopulateHotkeyControl() {
-    BYTE modifiers = 0;
-    if ((g_state.hotkey.modifiers & MOD_ALT) != 0U) {
-        modifiers |= HOTKEYF_ALT;
-    }
-    if ((g_state.hotkey.modifiers & MOD_CONTROL) != 0U) {
-        modifiers |= HOTKEYF_CONTROL;
-    }
-    if ((g_state.hotkey.modifiers & MOD_SHIFT) != 0U) {
-        modifiers |= HOTKEYF_SHIFT;
-    }
-    SendMessageW(g_state.configHotkey, HKM_SETHOTKEY, MAKEWORD(g_state.hotkey.vk, modifiers), 0);
-}
-
-void ReadHotkeyControl() {
-    const DWORD hotkey = static_cast<DWORD>(SendMessageW(g_state.configHotkey, HKM_GETHOTKEY, 0, 0));
-    const UINT vk = LOBYTE(hotkey);
-    const UINT flags = HIBYTE(hotkey);
-    UINT modifiers = 0;
-    if ((flags & HOTKEYF_ALT) != 0U) {
-        modifiers |= MOD_ALT;
-    }
-    if ((flags & HOTKEYF_CONTROL) != 0U) {
-        modifiers |= MOD_CONTROL;
-    }
-    if ((flags & HOTKEYF_SHIFT) != 0U) {
-        modifiers |= MOD_SHIFT;
-    }
-    if (vk != 0U) {
-        g_state.hotkey.vk = vk;
-        g_state.hotkey.modifiers = modifiers;
-    }
-}
-
 void ShowLauncher() {
     LayoutLauncher();
     ShowWindow(g_state.launcherWindow, SW_SHOW);
@@ -1833,88 +1734,13 @@ void ShowLauncher() {
     RequestLauncherDataRefresh(false, false);
 }
 
-void ShowConfigWindow() {
-    if (g_state.configWindow != nullptr) {
-        ShowWindow(g_state.configWindow, SW_SHOWNORMAL);
-        SetForegroundWindow(g_state.configWindow);
-        return;
-    }
-
-    g_state.configWindow = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        kConfigClassName,
-        L"DoRun Settings",
-        WS_CAPTION | WS_POPUP | WS_SYSMENU,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        g_state.launcherWindow,
-        nullptr,
-        g_state.instance,
-        nullptr);
-}
-
-LRESULT CALLBACK ConfigWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE: {
-        HWND label = CreateWindowExW(0, L"STATIC", L"Launcher Hotkey", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, window, nullptr, g_state.instance, nullptr);
-        g_state.configHotkey = CreateWindowExW(WS_EX_CLIENTEDGE, HOTKEY_CLASSW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_HOTKEY_LAUNCH)), g_state.instance, nullptr);
-        g_state.configSaveButton = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_SAVE)), g_state.instance, nullptr);
-        g_state.configCancelButton = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BTN_CANCEL)), g_state.instance, nullptr);
-        ApplyFont(label);
-        ApplyFont(g_state.configHotkey);
-        ApplyFont(g_state.configSaveButton);
-        ApplyFont(g_state.configCancelButton);
-        PopulateHotkeyControl();
-        LayoutConfig(window);
-        return 0;
-    }
-    case WM_DPICHANGED:
-        UpdateUiFont(HIWORD(wParam));
-        EnumChildWindows(window, [](HWND child, LPARAM) -> BOOL {
-            ApplyFont(child);
-            return TRUE;
-        }, 0);
-        LayoutConfig(window);
-        return 0;
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_BTN_SAVE) {
-            ReadHotkeyControl();
-            SaveHotkeyConfig();
-            RegisterLauncherHotkey();
-            DestroyWindow(window);
-            return 0;
-        }
-        if (LOWORD(wParam) == IDC_BTN_CANCEL) {
-            DestroyWindow(window);
-            return 0;
-        }
-        break;
-    case WM_CLOSE:
-        DestroyWindow(window);
-        return 0;
-    case WM_DESTROY:
-        g_state.configWindow = nullptr;
-        g_state.configHotkey = nullptr;
-        g_state.configSaveButton = nullptr;
-        g_state.configCancelButton = nullptr;
-        return 0;
-    default:
-        break;
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
-}
-
 LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE:
         g_state.searchEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
         g_state.resultList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
-        g_state.configButton = CreateWindowExW(0, L"BUTTON", L"Config", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CONFIG)), g_state.instance, nullptr);
         ApplyFont(g_state.searchEdit);
         ApplyFont(g_state.resultList);
-        ApplyFont(g_state.configButton);
         g_state.editProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
         LayoutLauncher();
         return 0;
@@ -1925,10 +1751,6 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_DBLCLK) {
             LaunchSelectedItem();
-            return 0;
-        }
-        if (LOWORD(wParam) == IDC_CONFIG && HIWORD(wParam) == BN_CLICKED) {
-            ShowConfigWindow();
             return 0;
         }
         break;
@@ -1942,7 +1764,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         break;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE && reinterpret_cast<HWND>(lParam) != g_state.configWindow) {
+        if (LOWORD(wParam) == WA_INACTIVE) {
             HideLauncher();
         }
         break;
@@ -1950,7 +1772,6 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         UpdateUiFont(HIWORD(wParam));
         ApplyFont(g_state.searchEdit);
         ApplyFont(g_state.resultList);
-        ApplyFont(g_state.configButton);
         LayoutLauncher();
         return 0;
     case WM_CLOSE:
@@ -2001,9 +1822,6 @@ bool InitializeWindows() {
         return false;
     }
     if (RegisterWindowClass(kLauncherClassName, LauncherWindowProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1)) == 0) {
-        return false;
-    }
-    if (RegisterWindowClass(kConfigClassName, ConfigWindowProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1)) == 0) {
         return false;
     }
 
