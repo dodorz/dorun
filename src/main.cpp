@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <imm.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -41,6 +42,11 @@ struct HistoryConfig {
     int maxRows = 5000;
     bool recencyEnabled = true;
     bool fuzzyEnabled = true;
+};
+
+struct LauncherAppearanceConfig {
+    int cornerRadius = 18;
+    int opacity = 245;
 };
 
 struct HistoryInfo {
@@ -90,6 +96,7 @@ struct AppState {
     std::vector<ScanDirectoryConfig> scanDirectories;
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
+    LauncherAppearanceConfig launcherAppearance {};
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
@@ -113,6 +120,34 @@ constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+
+#ifndef DWMWCP_DEFAULT
+#define DWMWCP_DEFAULT 0
+#endif
+
+#ifndef DWMWCP_DONOTROUND
+#define DWMWCP_DONOTROUND 1
+#endif
+
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
+
+#ifndef DWMWCP_ROUNDSMALL
+#define DWMWCP_ROUNDSMALL 3
+#endif
+
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
 
 constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
     { L"/quit", L"Exit DoRun", L"quit" },
@@ -721,6 +756,80 @@ void UpdateUiFont(int dpi) {
     g_state.uiFont = CreateFontIndirectW(&metrics.lfMessageFont);
 }
 
+bool TryApplyNativeRoundedCorners() {
+    if (g_state.launcherWindow == nullptr) {
+        return false;
+    }
+
+    const DWM_WINDOW_CORNER_PREFERENCE preference = static_cast<DWM_WINDOW_CORNER_PREFERENCE>(
+        g_state.launcherAppearance.cornerRadius <= 0
+            ? DWMWCP_DONOTROUND
+            : (g_state.launcherAppearance.cornerRadius <= 12 ? DWMWCP_ROUNDSMALL : DWMWCP_ROUND));
+    const HRESULT cornerResult = DwmSetWindowAttribute(
+        g_state.launcherWindow,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &preference,
+        sizeof(preference));
+    if (FAILED(cornerResult)) {
+        return false;
+    }
+
+    const COLORREF borderColor = DWMWA_COLOR_NONE;
+    DwmSetWindowAttribute(
+        g_state.launcherWindow,
+        DWMWA_BORDER_COLOR,
+        &borderColor,
+        sizeof(borderColor));
+    return true;
+}
+
+void ApplyLauncherAppearance() {
+    if (g_state.launcherWindow == nullptr) {
+        return;
+    }
+
+    LONG_PTR exStyle = GetWindowLongPtrW(g_state.launcherWindow, GWL_EXSTYLE);
+    if (g_state.launcherAppearance.opacity < 255) {
+        exStyle |= WS_EX_LAYERED;
+        SetWindowLongPtrW(g_state.launcherWindow, GWL_EXSTYLE, exStyle);
+        SetLayeredWindowAttributes(g_state.launcherWindow, 0, static_cast<BYTE>(g_state.launcherAppearance.opacity), LWA_ALPHA);
+    } else {
+        exStyle &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
+        SetWindowLongPtrW(g_state.launcherWindow, GWL_EXSTYLE, exStyle);
+    }
+
+    if (TryApplyNativeRoundedCorners()) {
+        SetWindowRgn(g_state.launcherWindow, nullptr, TRUE);
+        return;
+    }
+
+    if (g_state.launcherAppearance.cornerRadius <= 0) {
+        SetWindowRgn(g_state.launcherWindow, nullptr, TRUE);
+        return;
+    }
+
+    RECT windowRect {};
+    if (GetWindowRect(g_state.launcherWindow, &windowRect) == FALSE) {
+        return;
+    }
+
+    const int width = windowRect.right - windowRect.left;
+    const int height = windowRect.bottom - windowRect.top;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int diameter = std::max(2, std::min(g_state.launcherAppearance.cornerRadius * 2, std::min(width, height)));
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+    if (region == nullptr) {
+        return;
+    }
+
+    if (SetWindowRgn(g_state.launcherWindow, region, TRUE) == 0) {
+        DeleteObject(region);
+    }
+}
+
 void LayoutLauncher() {
     RECT workArea {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
@@ -735,6 +844,7 @@ void LayoutLauncher() {
     SetWindowPos(g_state.launcherWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     MoveWindow(g_state.searchEdit, margin, margin, width - margin * 2, controlHeight, TRUE);
     MoveWindow(g_state.resultList, margin, margin * 2 + controlHeight, width - margin * 2, listHeight, TRUE);
+    ApplyLauncherAppearance();
 }
 
 void HideLauncher() {
@@ -848,6 +958,23 @@ void LoadHistoryConfig() {
     }
     if (const std::optional<UINT> fuzzyEnabled = ParseYamlUInt(content, L"HISTORY_FUZZY_ENABLED")) {
         g_state.historyConfig.fuzzyEnabled = *fuzzyEnabled != 0U;
+    }
+}
+
+void LoadLauncherAppearanceConfig() {
+    g_state.launcherAppearance = LauncherAppearanceConfig {};
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        return;
+    }
+
+    if (const std::optional<int> cornerRadius = ParseYamlInt(content, L"LAUNCHER_CORNER_RADIUS")) {
+        g_state.launcherAppearance.cornerRadius = std::clamp(*cornerRadius, 0, 96);
+    }
+    if (const std::optional<int> opacity = ParseYamlInt(content, L"LAUNCHER_OPACITY")) {
+        g_state.launcherAppearance.opacity = std::clamp(*opacity, 32, 255);
     }
 }
 
@@ -1588,7 +1715,9 @@ bool LaunchItemByIndex(size_t index) {
         } else if (command == L"builtin:reload") {
             LoadHotkeyConfig();
             LoadHistoryConfig();
+            LoadLauncherAppearanceConfig();
             RegisterLauncherHotkey();
+            ApplyLauncherAppearance();
             RequestLauncherDataRefresh(true, true);
             HideLauncher();
             success = true;
@@ -1737,8 +1866,8 @@ void ShowLauncher() {
 LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE:
-        g_state.searchEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
-        g_state.resultList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
+        g_state.searchEdit = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
+        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
         ApplyFont(g_state.searchEdit);
         ApplyFont(g_state.resultList);
         g_state.editProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
@@ -1834,7 +1963,7 @@ bool InitializeWindows() {
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         kLauncherClassName,
         L"DoRun",
-        WS_POPUP | WS_BORDER,
+        WS_POPUP,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -1844,6 +1973,7 @@ bool InitializeWindows() {
         g_state.instance,
         nullptr);
 
+    ApplyLauncherAppearance();
     return g_state.launcherWindow != nullptr;
 }
 
@@ -1865,6 +1995,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InitializeDpi();
     LoadHotkeyConfig();
     LoadHistoryConfig();
+    LoadLauncherAppearanceConfig();
 
     if (!InitializeWindows()) {
         return 1;

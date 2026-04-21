@@ -10,6 +10,12 @@
 HOTKEY_MODIFIERS: 1
 HOTKEY_VK: 32
 
+# Launcher appearance.
+# `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.
+# `LAUNCHER_OPACITY` uses the Win32 alpha range 32-255. Set to 255 for a fully opaque window.
+LAUNCHER_CORNER_RADIUS: 18
+LAUNCHER_OPACITY: 245
+
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''
 HISTORY_RANK_SUM_LIMIT: 5000
