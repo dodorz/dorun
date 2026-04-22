@@ -2,6 +2,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <imm.h>
+#include <powrprof.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <winsqlite/winsqlite3.h>
@@ -160,6 +161,8 @@ constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
     { L"/reload", L"Reload configuration files", L"reload" },
     { L"/reboot", L"Restart the computer", L"reboot" },
     { L"/poweroff", L"Shut down the computer", L"poweroff" },
+    { L"/hibernate", L"Hibernate the computer", L"hibernate" },
+    { L"/standby", L"Put the computer to sleep", L"standby" },
     { L"/config", L"Open DoRun.yaml", L"config" },
     { L"/cmdconfig", L"Open Command.conf", L"cmdconfig" },
 };
@@ -1261,6 +1264,10 @@ bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCom
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+bool SuspendSystem(bool hibernate) {
+    return SetSuspendState(hibernate ? TRUE : FALSE, FALSE, FALSE) != FALSE;
+}
+
 std::wstring QuoteCommandLineArgument(std::wstring_view argument) {
     std::wstring quoted;
     quoted.reserve(argument.size() + 2);
@@ -1859,6 +1866,16 @@ bool LaunchItemByIndex(size_t index) {
             if (response == IDYES) {
                 success = RunShellCommand(L"shutdown.exe", L"/s /t 0");
             }
+            if (success) {
+                HideLauncher();
+            }
+        } else if (command == L"builtin:hibernate") {
+            success = SuspendSystem(true);
+            if (success) {
+                HideLauncher();
+            }
+        } else if (command == L"builtin:standby") {
+            success = SuspendSystem(false);
             if (success) {
                 HideLauncher();
             }
