@@ -49,6 +49,10 @@ struct LauncherAppearanceConfig {
     int opacity = 245;
 };
 
+struct EditorConfig {
+    std::wstring commandLine;
+};
+
 struct HistoryInfo {
     double rank = 0.0;
     int runCount = 0;
@@ -97,6 +101,8 @@ struct AppState {
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
     LauncherAppearanceConfig launcherAppearance {};
+    EditorConfig editorConfig {};
+    std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
@@ -180,6 +186,14 @@ std::wstring Lowercase(std::wstring_view text) {
     std::wstring value(text);
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
         return static_cast<wchar_t>(towlower(ch));
+    });
+    return value;
+}
+
+std::wstring Uppercase(std::wstring_view text) {
+    std::wstring value(text);
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towupper(ch));
     });
     return value;
 }
@@ -552,6 +566,45 @@ std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
     }
 
     expanded.resize(wcsnlen_s(expanded.c_str(), expanded.size()));
+    return expanded;
+}
+
+void RefreshCommandVariables() {
+    g_state.commandVariables.clear();
+    if (!g_state.editorConfig.commandLine.empty()) {
+        g_state.commandVariables.emplace(L"EDITOR", g_state.editorConfig.commandLine);
+    }
+}
+
+std::wstring ExpandCommandVariables(std::wstring_view text) {
+    if (text.empty()) {
+        return L"";
+    }
+
+    std::wstring expanded;
+    expanded.reserve(text.size());
+
+    for (size_t index = 0; index < text.size(); ++index) {
+        if (text[index] != L'$' || (index + 1) >= text.size() || text[index + 1] != L'{') {
+            expanded.push_back(text[index]);
+            continue;
+        }
+
+        const size_t end = text.find(L'}', index + 2);
+        if (end == std::wstring_view::npos) {
+            expanded.push_back(text[index]);
+            continue;
+        }
+
+        const std::wstring key = Uppercase(Trim(text.substr(index + 2, end - (index + 2))));
+        if (const auto it = g_state.commandVariables.find(key); it != g_state.commandVariables.end()) {
+            expanded += it->second;
+        } else {
+            expanded.append(text.substr(index, end - index + 1));
+        }
+        index = end;
+    }
+
     return expanded;
 }
 
@@ -978,6 +1031,23 @@ void LoadLauncherAppearanceConfig() {
     }
 }
 
+void LoadEditorConfig() {
+    g_state.editorConfig = EditorConfig {};
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        RefreshCommandVariables();
+        return;
+    }
+
+    if (const std::optional<std::wstring> commandLine = ParseYamlString(content, L"EDITOR")) {
+        g_state.editorConfig.commandLine = Trim(*commandLine);
+    }
+
+    RefreshCommandVariables();
+}
+
 void RegisterLauncherHotkey() {
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
     RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk);
@@ -1191,6 +1261,52 @@ bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCom
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+std::wstring QuoteCommandLineArgument(std::wstring_view argument) {
+    std::wstring quoted;
+    quoted.reserve(argument.size() + 2);
+    quoted.push_back(L'"');
+    quoted.append(argument);
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass) {
+    std::wstring commandLine = ExpandEnvironmentVariables(commandLineText);
+    std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(workingDirectoryText);
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+
+    STARTUPINFOW startupInfo {};
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = static_cast<WORD>(showCommand);
+
+    PROCESS_INFORMATION processInfo {};
+    const wchar_t* workingDirectory = workingDirectoryBuffer.empty() ? nullptr : workingDirectoryBuffer.c_str();
+    const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | priorityClass;
+    const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
+    if (ok == FALSE) {
+        const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", commandLine.c_str(), nullptr, workingDirectory, showCommand);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+            return false;
+        }
+        return true;
+    }
+
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    return true;
+}
+
+bool OpenPathWithConfiguredEditor(const std::wstring& path) {
+    if (g_state.editorConfig.commandLine.empty()) {
+        return OpenPathInShell(path);
+    }
+
+    const std::wstring commandLine = g_state.editorConfig.commandLine + L" " + QuoteCommandLineArgument(path);
+    return LaunchProcessCommand(commandLine, L"", SW_SHOWNORMAL, NORMAL_PRIORITY_CLASS);
+}
+
 bool ExecuteSql(sqlite3* database, const char* sql) {
     return database != nullptr && sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
 }
@@ -1375,11 +1491,11 @@ void LoadCommandItems() {
         }
 
         LaunchItem item {};
-        item.name = UnescapeCommandField(StripOuterQuotes(fields[0]));
-        item.commandLine = UnescapeCommandField(StripOuterQuotes(fields[1]));
+        item.name = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[0])));
+        item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[1])));
         item.sourceKind = ItemSourceKind::CommandConf;
         if (fields.size() > 2) {
-            item.workingDirectory = UnescapeCommandField(StripOuterQuotes(fields[2]));
+            item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
         }
         if (fields.size() > 3 && !fields[3].empty()) {
             item.showCommand = _wtoi(fields[3].c_str());
@@ -1716,6 +1832,7 @@ bool LaunchItemByIndex(size_t index) {
             LoadHotkeyConfig();
             LoadHistoryConfig();
             LoadLauncherAppearanceConfig();
+            LoadEditorConfig();
             RegisterLauncherHotkey();
             ApplyLauncherAppearance();
             RequestLauncherDataRefresh(true, true);
@@ -1747,13 +1864,13 @@ bool LaunchItemByIndex(size_t index) {
             }
         } else if (command == L"builtin:config") {
             const std::wstring path = GetWritableConfigPath(kConfigFileName);
-            success = EnsureFileExists(path) && OpenPathInShell(path);
+            success = EnsureFileExists(path) && OpenPathWithConfiguredEditor(path);
             if (success) {
                 HideLauncher();
             }
         } else if (command == L"builtin:cmdconfig") {
             const std::wstring path = GetWritableConfigPath(kCommandFileName);
-            success = EnsureFileExists(path) && OpenPathInShell(path);
+            success = EnsureFileExists(path) && OpenPathWithConfiguredEditor(path);
             if (success) {
                 HideLauncher();
             }
@@ -1762,28 +1879,8 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     SetEnglishImeForWindow(g_state.searchEdit);
-    std::wstring commandLine = ExpandEnvironmentVariables(item.commandLine);
-    std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(item.workingDirectory);
-    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
-    mutableCommand.push_back(L'\0');
-
-    STARTUPINFOW startupInfo {};
-    startupInfo.cb = sizeof(startupInfo);
-    startupInfo.dwFlags = STARTF_USESHOWWINDOW;
-    startupInfo.wShowWindow = static_cast<WORD>(item.showCommand);
-
-    PROCESS_INFORMATION processInfo {};
-    const wchar_t* workingDirectory = workingDirectoryBuffer.empty() ? nullptr : workingDirectoryBuffer.c_str();
-    const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | item.priorityClass;
-    const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
-    if (ok == FALSE) {
-        const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", commandLine.c_str(), nullptr, workingDirectory, item.showCommand);
-        if (reinterpret_cast<INT_PTR>(result) <= 32) {
-            return false;
-        }
-    } else {
-        CloseHandle(processInfo.hThread);
-        CloseHandle(processInfo.hProcess);
+    if (!LaunchProcessCommand(item.commandLine, item.workingDirectory, item.showCommand, item.priorityClass)) {
+        return false;
     }
 
     RecordSuccessfulLaunch(item);
@@ -1996,6 +2093,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadHotkeyConfig();
     LoadHistoryConfig();
     LoadLauncherAppearanceConfig();
+    LoadEditorConfig();
 
     if (!InitializeWindows()) {
         return 1;

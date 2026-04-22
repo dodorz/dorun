@@ -16,6 +16,11 @@ HOTKEY_VK: 32
 LAUNCHER_CORNER_RADIUS: 18
 LAUNCHER_OPACITY: 245
 
+# Optional editor command used by `/config` and `/cmdconfig`.
+# This can be an executable path or a command line with arguments.
+# In Command.conf you can reference it as `${EDITOR}`.
+EDITOR: ''
+
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''
 HISTORY_RANK_SUM_LIMIT: 5000
