@@ -71,6 +71,9 @@ struct LaunchItem {
     std::wstring commandLine;
     std::wstring inlineBatchScript;
     std::wstring workingDirectory;
+    std::wstring normalizedName;
+    std::wstring normalizedCommandLine;
+    std::wstring normalizedCommandBaseName;
     int showCommand = SW_SHOWNORMAL;
     DWORD priorityClass = NORMAL_PRIORITY_CLASS;
     ItemSourceKind sourceKind = ItemSourceKind::ScannedFile;
@@ -108,6 +111,7 @@ struct AppState {
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
+    bool resultRebuildScheduled = false;
     bool pendingItemsRefresh = false;
     bool pendingHistoryRefresh = false;
     ULONGLONG lastItemsRefreshTick = 0;
@@ -125,6 +129,7 @@ constexpr size_t kVisibleItemCount = 8;
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
+constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
@@ -169,6 +174,7 @@ constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
 };
 
 void RebuildResultList();
+void RequestResultListRebuild();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags = 0);
 
@@ -695,6 +701,34 @@ int GetMatchScoreForText(std::wstring_view haystack, std::wstring_view needle, i
     return -1;
 }
 
+int GetMatchScoreForNormalizedText(std::wstring_view normalizedHaystack, std::wstring_view normalizedNeedle, int exactScore, int prefixScore, int substringScore, int subsequenceScore) {
+    if (normalizedNeedle.empty()) {
+        return 1;
+    }
+
+    if (normalizedHaystack == normalizedNeedle) {
+        return exactScore;
+    }
+    if (normalizedHaystack.starts_with(normalizedNeedle)) {
+        return prefixScore;
+    }
+    if (normalizedHaystack.find(normalizedNeedle) != std::wstring::npos) {
+        return substringScore;
+    }
+    if (g_state.historyConfig.fuzzyEnabled && IsSubsequenceMatch(normalizedHaystack, normalizedNeedle)) {
+        return subsequenceScore;
+    }
+    return -1;
+}
+
+void PopulateSearchFields(LaunchItem& item) {
+    item.normalizedName = Lowercase(item.name);
+    item.normalizedCommandLine = Lowercase(item.commandLine);
+
+    std::filesystem::path commandPath(item.commandLine);
+    item.normalizedCommandBaseName = Lowercase(commandPath.stem().wstring());
+}
+
 int ComputeMatchScore(const LaunchItem& item, std::wstring_view query) {
     if (query.empty()) {
         return 1;
@@ -707,11 +741,10 @@ int ComputeMatchScore(const LaunchItem& item, std::wstring_view query) {
 
     int score = 0;
     for (const std::wstring& token : tokens) {
-        const int nameScore = GetMatchScoreForText(item.name, token, 100, 90, 75, 60);
-        const std::filesystem::path commandPath(item.commandLine);
-        const std::wstring commandBaseName = commandPath.stem().wstring();
-        const int commandBaseScore = GetMatchScoreForText(commandBaseName, token, 55, 55, 50, 45);
-        const int commandScore = GetMatchScoreForText(item.commandLine, token, 40, 40, 40, 25);
+        const std::wstring normalizedToken = Lowercase(token);
+        const int nameScore = GetMatchScoreForNormalizedText(item.normalizedName, normalizedToken, 100, 90, 75, 60);
+        const int commandBaseScore = GetMatchScoreForNormalizedText(item.normalizedCommandBaseName, normalizedToken, 55, 55, 50, 45);
+        const int commandScore = GetMatchScoreForNormalizedText(item.normalizedCommandLine, normalizedToken, 40, 40, 40, 25);
         const int bestScore = std::max({nameScore, commandBaseScore, commandScore});
         if (bestScore < 0) {
             return -1;
@@ -1600,6 +1633,7 @@ void LoadCommandItems() {
             }
         }
 
+        PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, BuildCommandIdentity(item), item.workingDirectory);
         g_state.items.push_back(std::move(item));
     }
@@ -1611,6 +1645,7 @@ void LoadBuiltinCommandItems() {
         item.name = std::wstring(command.name) + L" - " + command.description;
         item.commandLine = std::wstring(kBuiltinCommandPrefix) + command.token;
         item.sourceKind = ItemSourceKind::Synthetic;
+        PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
         g_state.items.push_back(std::move(item));
     }
@@ -1639,6 +1674,7 @@ void LoadFilesystemItems() {
             item.commandLine = path.wstring();
             item.workingDirectory = path.parent_path().wstring();
             item.sourceKind = ItemSourceKind::ScannedFile;
+            PopulateSearchFields(item);
             item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
             const std::wstring key = Lowercase(item.name + L"|" + item.commandLine);
             if (seen.insert(key).second) {
@@ -1694,6 +1730,14 @@ void RequestLauncherDataRefresh(bool refreshItems, bool refreshHistory) {
     }
     g_state.refreshScheduled = true;
     PostMessageW(g_state.hostWindow, kMessageRefreshLauncherData, 0, 0);
+}
+
+void RequestResultListRebuild() {
+    if (g_state.resultRebuildScheduled || g_state.launcherWindow == nullptr) {
+        return;
+    }
+    g_state.resultRebuildScheduled = true;
+    PostMessageW(g_state.launcherWindow, kMessageRebuildResults, 0, 0);
 }
 
 void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
@@ -2082,7 +2126,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         return 0;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_SEARCH && HIWORD(wParam) == EN_CHANGE) {
-            RebuildResultList();
+            RequestResultListRebuild();
             return 0;
         }
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_DBLCLK) {
@@ -2112,6 +2156,10 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         return 0;
     case WM_CLOSE:
         HideLauncher();
+        return 0;
+    case kMessageRebuildResults:
+        g_state.resultRebuildScheduled = false;
+        RebuildResultList();
         return 0;
     default:
         break;
