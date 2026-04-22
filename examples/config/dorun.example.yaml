@@ -13,8 +13,16 @@ HOTKEY_VK: 32
 # Launcher appearance.
 # `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.
 # `LAUNCHER_OPACITY` uses the Win32 alpha range 32-255. Set to 255 for a fully opaque window.
+# `LAUNCHER_VISIBLE_ITEM_COUNT` controls how many result rows are visible without scrolling.
+# `LAUNCHER_SEARCH_FONT_FAMILY` and `LAUNCHER_RESULT_FONT_FAMILY` override the font face. Leave empty to follow the system default.
+# `LAUNCHER_SEARCH_FONT_SIZE` and `LAUNCHER_RESULT_FONT_SIZE` use point sizes. Set to 0 to follow the system default.
 LAUNCHER_CORNER_RADIUS: 18
 LAUNCHER_OPACITY: 245
+LAUNCHER_VISIBLE_ITEM_COUNT: 8
+LAUNCHER_SEARCH_FONT_FAMILY: ''
+LAUNCHER_RESULT_FONT_FAMILY: ''
+LAUNCHER_SEARCH_FONT_SIZE: 0
+LAUNCHER_RESULT_FONT_SIZE: 0
 
 # Optional editor command used by `/config` and `/cmdconfig`.
 # This can be an executable path or a command line with arguments.
