@@ -69,6 +69,7 @@ enum class ItemSourceKind : int {
 struct LaunchItem {
     std::wstring name;
     std::wstring commandLine;
+    std::wstring inlineBatchScript;
     std::wstring workingDirectory;
     int showCommand = SW_SHOWNORMAL;
     DWORD priorityClass = NORMAL_PRIORITY_CLASS;
@@ -168,6 +169,8 @@ constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
 };
 
 void RebuildResultList();
+std::wstring QuoteCommandLineArgument(std::wstring_view argument);
+bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags = 0);
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
@@ -619,6 +622,13 @@ std::wstring BuildItemKey(ItemSourceKind sourceKind, std::wstring_view commandLi
     return std::to_wstring(static_cast<int>(sourceKind)) + L"\n" +
         NormalizeHistoryField(commandLine) + L"\n" +
         NormalizeHistoryField(workingDirectory);
+}
+
+std::wstring BuildCommandIdentity(const LaunchItem& item) {
+    if (!item.inlineBatchScript.empty()) {
+        return L"inline-batch\n" + item.inlineBatchScript;
+    }
+    return item.commandLine;
 }
 
 std::wstring GetDefaultHistoryDatabasePath() {
@@ -1259,6 +1269,46 @@ bool OpenPathInShell(const std::wstring& path) {
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+std::wstring GetTempBatchDirectory() {
+    const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
+    if (!localAppDataDirectory.empty()) {
+        return (std::filesystem::path(localAppDataDirectory) / L"temp").wstring();
+    }
+
+    std::array<wchar_t, MAX_PATH> buffer {};
+    const DWORD length = GetTempPathW(static_cast<DWORD>(buffer.size()), buffer.data());
+    if (length == 0 || length >= buffer.size()) {
+        return GetModuleDirectory();
+    }
+    return std::wstring(buffer.data(), length);
+}
+
+std::wstring MakeInlineBatchFilePath() {
+    std::error_code error;
+    const std::filesystem::path directory = GetTempBatchDirectory();
+    std::filesystem::create_directories(directory, error);
+
+    const DWORD processId = GetCurrentProcessId();
+    const ULONGLONG tickCount = GetTickCount64();
+    const std::wstring fileName = L"DoRun-inline-" + std::to_wstring(processId) + L"-" + std::to_wstring(tickCount) + L".bat";
+    return (directory / fileName).wstring();
+}
+
+bool LaunchInlineBatchScript(const LaunchItem& item) {
+    const std::wstring batchPath = MakeInlineBatchFilePath();
+    std::wstring script = ExpandCommandVariables(item.inlineBatchScript);
+    if (!script.ends_with(L"\n")) {
+        script += L"\n";
+    }
+    if (!SaveUtf8TextFile(batchPath, script)) {
+        return false;
+    }
+
+    const std::wstring commandLine = L"cmd.exe /c " + QuoteCommandLineArgument(batchPath);
+    const DWORD extraCreationFlags = item.showCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
+    return LaunchProcessCommand(commandLine, item.workingDirectory, item.showCommand, item.priorityClass, extraCreationFlags);
+}
+
 bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCommand = SW_HIDE) {
     const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", file, parameters, nullptr, showCommand);
     return reinterpret_cast<INT_PTR>(result) > 32;
@@ -1277,7 +1327,7 @@ std::wstring QuoteCommandLineArgument(std::wstring_view argument) {
     return quoted;
 }
 
-bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass) {
+bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags) {
     std::wstring commandLine = ExpandEnvironmentVariables(commandLineText);
     std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(workingDirectoryText);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
@@ -1290,7 +1340,7 @@ bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view w
 
     PROCESS_INFORMATION processInfo {};
     const wchar_t* workingDirectory = workingDirectoryBuffer.empty() ? nullptr : workingDirectoryBuffer.c_str();
-    const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | priorityClass;
+    const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | priorityClass | extraCreationFlags;
     const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
     if (ok == FALSE) {
         const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", commandLine.c_str(), nullptr, workingDirectory, showCommand);
@@ -1487,30 +1537,70 @@ void LoadCommandItems() {
 
     std::wstring line;
     while (std::getline(stream, line)) {
-        line = Trim(line);
-        if (IsCommandCommentLine(line)) {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine)) {
             continue;
         }
 
-        const std::vector<std::wstring> fields = SplitCommandFields(line);
+        std::vector<std::wstring> fields = SplitCommandFields(trimmedLine);
         if (fields.size() < 2) {
             continue;
         }
 
         LaunchItem item {};
         item.name = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[0])));
-        item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[1])));
         item.sourceKind = ItemSourceKind::CommandConf;
-        if (fields.size() > 2) {
-            item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
+
+        bool startsInlineBatch = false;
+        if (fields[1].empty() && trimmedLine.ends_with(L"{") && !fields.empty()) {
+            if (fields.back() == L"{") {
+                startsInlineBatch = true;
+            } else if (!fields.back().empty() && fields.back().back() == L'{') {
+                fields.back().pop_back();
+                fields.back() = Trim(fields.back());
+                startsInlineBatch = true;
+            }
         }
-        if (fields.size() > 3 && !fields[3].empty()) {
-            item.showCommand = _wtoi(fields[3].c_str());
+
+        if (startsInlineBatch) {
+            if (fields.size() > 2 && !fields[2].empty()) {
+                item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
+            }
+            if (fields.size() > 3 && !fields[3].empty()) {
+                item.showCommand = _wtoi(fields[3].c_str());
+            }
+            if (fields.size() > 4 && !fields[4].empty()) {
+                item.priorityClass = static_cast<DWORD>(_wtoi(fields[4].c_str()));
+            }
+
+            std::wstring script;
+            bool closed = false;
+            while (std::getline(stream, line)) {
+                if (Trim(line) == L"}") {
+                    closed = true;
+                    break;
+                }
+                script += line;
+                script += L"\n";
+            }
+            if (!closed) {
+                continue;
+            }
+            item.inlineBatchScript = std::move(script);
+        } else {
+            item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[1])));
+            if (fields.size() > 2) {
+                item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
+            }
+            if (fields.size() > 3 && !fields[3].empty()) {
+                item.showCommand = _wtoi(fields[3].c_str());
+            }
+            if (fields.size() > 4 && !fields[4].empty()) {
+                item.priorityClass = static_cast<DWORD>(_wtoi(fields[4].c_str()));
+            }
         }
-        if (fields.size() > 4 && !fields[4].empty()) {
-            item.priorityClass = static_cast<DWORD>(_wtoi(fields[4].c_str()));
-        }
-        item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
+
+        item.itemKey = BuildItemKey(item.sourceKind, BuildCommandIdentity(item), item.workingDirectory);
         g_state.items.push_back(std::move(item));
     }
 }
@@ -1896,7 +1986,10 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     SetEnglishImeForWindow(g_state.searchEdit);
-    if (!LaunchProcessCommand(item.commandLine, item.workingDirectory, item.showCommand, item.priorityClass)) {
+    const bool launched = item.inlineBatchScript.empty()
+        ? LaunchProcessCommand(item.commandLine, item.workingDirectory, item.showCommand, item.priorityClass)
+        : LaunchInlineBatchScript(item);
+    if (!launched) {
         return false;
     }
 
