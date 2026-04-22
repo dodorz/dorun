@@ -48,6 +48,11 @@ struct HistoryConfig {
 struct LauncherAppearanceConfig {
     int cornerRadius = 18;
     int opacity = 245;
+    int visibleItemCount = 8;
+    std::wstring searchFontFamily;
+    std::wstring resultFontFamily;
+    int searchFontPointSize = 0;
+    int resultFontPointSize = 0;
 };
 
 struct EditorConfig {
@@ -99,7 +104,8 @@ struct AppState {
     HWND searchEdit = nullptr;
     HWND resultList = nullptr;
     WNDPROC editProc = nullptr;
-    HFONT uiFont = nullptr;
+    HFONT searchFont = nullptr;
+    HFONT resultFont = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
     std::vector<ScanDirectoryConfig> scanDirectories;
@@ -125,7 +131,6 @@ constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
 constexpr wchar_t kAppDirectoryName[] = L"DoRun";
 constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
-constexpr size_t kVisibleItemCount = 8;
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
@@ -834,25 +839,70 @@ int ComputeRecencyBonus(const std::wstring& lastRunUtc) {
     return 0;
 }
 
-void ApplyFont(HWND window) {
-    if (window != nullptr && g_state.uiFont != nullptr) {
-        SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(g_state.uiFont), TRUE);
-    }
-}
-
-void UpdateUiFont(int dpi) {
-    g_state.dpi = dpi;
-    if (g_state.uiFont != nullptr) {
-        DeleteObject(g_state.uiFont);
-        g_state.uiFont = nullptr;
-    }
-
+HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSize) {
     NONCLIENTMETRICSW metrics {};
     metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, static_cast<UINT>(dpi)) == FALSE) {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
     }
-    g_state.uiFont = CreateFontIndirectW(&metrics.lfMessageFont);
+
+    if (!fontFamily.empty()) {
+        wcsncpy_s(metrics.lfMessageFont.lfFaceName, fontFamily.data(), _TRUNCATE);
+    }
+
+    if (pointSize > 0) {
+        HDC screenDc = GetDC(nullptr);
+        const int logPixelsY = screenDc != nullptr ? GetDeviceCaps(screenDc, LOGPIXELSY) : dpi;
+        if (screenDc != nullptr) {
+            ReleaseDC(nullptr, screenDc);
+        }
+        metrics.lfMessageFont.lfHeight = -MulDiv(pointSize, logPixelsY, 72);
+    }
+
+    return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+void ApplyFont(HWND window, HFONT font) {
+    if (window != nullptr && font != nullptr) {
+        SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
+}
+
+int MeasureFontTextHeight(HFONT font) {
+    if (font == nullptr) {
+        return Scale(18);
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr) {
+        return Scale(18);
+    }
+
+    const HGDIOBJ oldFont = SelectObject(screenDc, font);
+    TEXTMETRICW textMetric {};
+    const BOOL ok = GetTextMetricsW(screenDc, &textMetric);
+    SelectObject(screenDc, oldFont);
+    ReleaseDC(nullptr, screenDc);
+
+    if (ok == FALSE) {
+        return Scale(18);
+    }
+    return textMetric.tmHeight;
+}
+
+void UpdateUiFont(int dpi) {
+    g_state.dpi = dpi;
+    if (g_state.searchFont != nullptr) {
+        DeleteObject(g_state.searchFont);
+        g_state.searchFont = nullptr;
+    }
+    if (g_state.resultFont != nullptr) {
+        DeleteObject(g_state.resultFont);
+        g_state.resultFont = nullptr;
+    }
+
+    g_state.searchFont = CreateConfiguredUiFont(dpi, g_state.launcherAppearance.searchFontFamily, g_state.launcherAppearance.searchFontPointSize);
+    g_state.resultFont = CreateConfiguredUiFont(dpi, g_state.launcherAppearance.resultFontFamily, g_state.launcherAppearance.resultFontPointSize);
 }
 
 bool TryApplyNativeRoundedCorners() {
@@ -934,8 +984,15 @@ void LayoutLauncher() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
     const int width = Scale(720);
     const int margin = Scale(12);
-    const int controlHeight = Scale(32);
-    const int listHeight = Scale(30) * static_cast<int>(kVisibleItemCount);
+    const int controlHeight = std::max(Scale(32), MeasureFontTextHeight(g_state.searchFont) + Scale(12));
+    int listItemHeight = Scale(30);
+    if (g_state.resultList != nullptr) {
+        const LRESULT measuredHeight = SendMessageW(g_state.resultList, LB_GETITEMHEIGHT, 0, 0);
+        if (measuredHeight > 0) {
+            listItemHeight = static_cast<int>(measuredHeight);
+        }
+    }
+    const int listHeight = listItemHeight * g_state.launcherAppearance.visibleItemCount;
     const int height = margin * 3 + controlHeight + listHeight;
     const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
     const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 4;
@@ -1074,6 +1131,21 @@ void LoadLauncherAppearanceConfig() {
     }
     if (const std::optional<int> opacity = ParseYamlInt(content, L"LAUNCHER_OPACITY")) {
         g_state.launcherAppearance.opacity = std::clamp(*opacity, 32, 255);
+    }
+    if (const std::optional<int> visibleItemCount = ParseYamlInt(content, L"LAUNCHER_VISIBLE_ITEM_COUNT")) {
+        g_state.launcherAppearance.visibleItemCount = std::clamp(*visibleItemCount, 1, 20);
+    }
+    if (const std::optional<std::wstring> searchFontFamily = ParseYamlString(content, L"LAUNCHER_SEARCH_FONT_FAMILY")) {
+        g_state.launcherAppearance.searchFontFamily = Trim(*searchFontFamily);
+    }
+    if (const std::optional<std::wstring> resultFontFamily = ParseYamlString(content, L"LAUNCHER_RESULT_FONT_FAMILY")) {
+        g_state.launcherAppearance.resultFontFamily = Trim(*resultFontFamily);
+    }
+    if (const std::optional<int> searchFontPointSize = ParseYamlInt(content, L"LAUNCHER_SEARCH_FONT_SIZE")) {
+        g_state.launcherAppearance.searchFontPointSize = std::clamp(*searchFontPointSize, 0, 72);
+    }
+    if (const std::optional<int> resultFontPointSize = ParseYamlInt(content, L"LAUNCHER_RESULT_FONT_SIZE")) {
+        g_state.launcherAppearance.resultFontPointSize = std::clamp(*resultFontPointSize, 0, 72);
     }
 }
 
@@ -1974,8 +2046,12 @@ bool LaunchItemByIndex(size_t index) {
             LoadHistoryConfig();
             LoadLauncherAppearanceConfig();
             LoadEditorConfig();
+            UpdateUiFont(g_state.dpi);
             RegisterLauncherHotkey();
             ApplyLauncherAppearance();
+            ApplyFont(g_state.searchEdit, g_state.searchFont);
+            ApplyFont(g_state.resultList, g_state.resultFont);
+            LayoutLauncher();
             RequestLauncherDataRefresh(true, true);
             HideLauncher();
             success = true;
@@ -2118,9 +2194,9 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     switch (message) {
     case WM_CREATE:
         g_state.searchEdit = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
-        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
-        ApplyFont(g_state.searchEdit);
-        ApplyFont(g_state.resultList);
+        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
+        ApplyFont(g_state.searchEdit, g_state.searchFont);
+        ApplyFont(g_state.resultList, g_state.resultFont);
         g_state.editProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
         LayoutLauncher();
         return 0;
@@ -2150,8 +2226,8 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         break;
     case WM_DPICHANGED:
         UpdateUiFont(HIWORD(wParam));
-        ApplyFont(g_state.searchEdit);
-        ApplyFont(g_state.resultList);
+        ApplyFont(g_state.searchEdit, g_state.searchFont);
+        ApplyFont(g_state.resultList, g_state.resultFont);
         LayoutLauncher();
         return 0;
     case WM_CLOSE:
@@ -2267,9 +2343,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
-    if (g_state.uiFont != nullptr) {
-        DeleteObject(g_state.uiFont);
-        g_state.uiFont = nullptr;
+    if (g_state.searchFont != nullptr) {
+        DeleteObject(g_state.searchFont);
+        g_state.searchFont = nullptr;
+    }
+    if (g_state.resultFont != nullptr) {
+        DeleteObject(g_state.resultFont);
+        g_state.resultFont = nullptr;
     }
     return static_cast<int>(message.wParam);
 }
