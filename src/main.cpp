@@ -85,6 +85,15 @@ struct LaunchItem {
     std::wstring itemKey;
 };
 
+struct SearchQueryState {
+    std::wstring rawQuery;
+    std::wstring normalizedQuery;
+    std::vector<std::wstring> normalizedTokens;
+    std::vector<size_t> matchedItemIndices;
+    bool builtinQuery = false;
+    bool valid = false;
+};
+
 struct BuiltinCommandDefinition {
     const wchar_t* name;
     const wchar_t* description;
@@ -115,6 +124,7 @@ struct AppState {
     EditorConfig editorConfig {};
     std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
+    SearchQueryState lastSearch {};
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
     bool resultRebuildScheduled = false;
@@ -764,19 +774,13 @@ void PopulateSearchFields(LaunchItem& item) {
     item.normalizedCommandBaseName = Lowercase(commandPath.stem().wstring());
 }
 
-int ComputeMatchScore(const LaunchItem& item, std::wstring_view query) {
-    if (query.empty()) {
-        return 1;
-    }
-
-    const std::vector<std::wstring> tokens = SplitQueryTokens(query);
-    if (tokens.empty()) {
+int ComputeMatchScore(const LaunchItem& item, const std::vector<std::wstring>& normalizedTokens) {
+    if (normalizedTokens.empty()) {
         return 1;
     }
 
     int score = 0;
-    for (const std::wstring& token : tokens) {
-        const std::wstring normalizedToken = Lowercase(token);
+    for (const std::wstring& normalizedToken : normalizedTokens) {
         const int nameScore = GetMatchScoreForNormalizedText(item.normalizedName, normalizedToken, 100, 90, 75, 60);
         const int commandBaseScore = GetMatchScoreForNormalizedText(item.normalizedCommandBaseName, normalizedToken, 55, 55, 50, 45);
         const int commandScore = GetMatchScoreForNormalizedText(item.normalizedCommandLine, normalizedToken, 40, 40, 40, 25);
@@ -1688,6 +1692,7 @@ void LoadCommandItems() {
         bool startsInlineBatch = false;
         if (fields[1].empty() && trimmedLine.ends_with(L"{") && !fields.empty()) {
             if (fields.back() == L"{") {
+                fields.pop_back();
                 startsInlineBatch = true;
             } else if (!fields.back().empty() && fields.back().back() == L'{') {
                 fields.back().pop_back();
@@ -1817,6 +1822,7 @@ void LoadFilesystemItems() {
 void ReloadItems() {
     const std::wstring content = LoadUtf8TextFile(FindConfigPath(kConfigFileName));
     g_state.items.clear();
+    g_state.lastSearch = SearchQueryState {};
     LoadScanDirectories(content);
     LoadCommandItems();
     LoadFilesystemItems();
@@ -1886,13 +1892,34 @@ struct RankedResult {
 void RebuildResultList() {
     const std::wstring query = Trim(GetControlText(g_state.searchEdit));
     const bool builtinQuery = !query.empty() && query.front() == L'/';
+    const std::wstring normalizedQuery = Lowercase(query);
+    std::vector<std::wstring> normalizedTokens = SplitQueryTokens(normalizedQuery);
+
     SendMessageW(g_state.resultList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_state.resultList, LB_RESETCONTENT, 0, 0);
 
     std::vector<RankedResult> rankedResults;
     rankedResults.reserve(g_state.items.size());
+    std::vector<size_t> candidateIndices;
+    const bool canReuseLastMatches =
+        g_state.lastSearch.valid &&
+        g_state.lastSearch.builtinQuery == builtinQuery &&
+        !g_state.lastSearch.normalizedQuery.empty() &&
+        normalizedQuery.starts_with(g_state.lastSearch.normalizedQuery);
 
-    for (size_t index = 0; index < g_state.items.size(); ++index) {
+    if (canReuseLastMatches) {
+        candidateIndices = g_state.lastSearch.matchedItemIndices;
+    } else {
+        candidateIndices.reserve(g_state.items.size());
+        for (size_t index = 0; index < g_state.items.size(); ++index) {
+            candidateIndices.push_back(index);
+        }
+    }
+
+    std::vector<size_t> matchedItemIndices;
+    matchedItemIndices.reserve(candidateIndices.size());
+
+    for (const size_t index : candidateIndices) {
         const LaunchItem& item = g_state.items[index];
         if (builtinQuery && item.sourceKind != ItemSourceKind::Synthetic) {
             continue;
@@ -1900,7 +1927,7 @@ void RebuildResultList() {
         if (!builtinQuery && item.sourceKind == ItemSourceKind::Synthetic) {
             continue;
         }
-        const int matchScore = ComputeMatchScore(item, query);
+        const int matchScore = ComputeMatchScore(item, normalizedTokens);
         if (matchScore < 0) {
             continue;
         }
@@ -1917,6 +1944,7 @@ void RebuildResultList() {
         }
         result.finalScore = static_cast<double>(matchScore) * 1000.0 + result.rank * 20.0 + static_cast<double>(result.recencyBonus);
         rankedResults.push_back(std::move(result));
+        matchedItemIndices.push_back(index);
     }
 
     std::sort(rankedResults.begin(), rankedResults.end(), [](const RankedResult& lhs, const RankedResult& rhs) {
@@ -1950,6 +1978,13 @@ void RebuildResultList() {
     }
     SendMessageW(g_state.resultList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_state.resultList, nullptr, TRUE);
+
+    g_state.lastSearch.rawQuery = query;
+    g_state.lastSearch.normalizedQuery = std::move(normalizedQuery);
+    g_state.lastSearch.normalizedTokens = std::move(normalizedTokens);
+    g_state.lastSearch.matchedItemIndices = std::move(matchedItemIndices);
+    g_state.lastSearch.builtinQuery = builtinQuery;
+    g_state.lastSearch.valid = true;
 }
 
 void RecordSuccessfulLaunch(const LaunchItem& item) {
