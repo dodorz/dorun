@@ -24,10 +24,11 @@ LAUNCHER_RESULT_FONT_FAMILY: ''
 LAUNCHER_SEARCH_FONT_SIZE: 0
 LAUNCHER_RESULT_FONT_SIZE: 0
 
-# Optional editor command used by `/config` and `/cmdconfig`.
-# This can be an executable path or a command line with arguments.
-# In Command.conf you can reference it as `${EDITOR}`.
+# Optional variables that Command.conf can reference as `${NAME}`.
+# Scalar values defined at the top level of this file are available there.
+# `EDITOR` is also used by `/config` and `/cmdconfig`.
 EDITOR: ''
+TERMINAL: 'wt.exe'
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''

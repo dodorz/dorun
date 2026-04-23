@@ -529,6 +529,43 @@ std::optional<std::wstring> ParseYamlString(const std::wstring& content, std::ws
     return value;
 }
 
+std::wstring ParseYamlScalarValue(std::wstring value) {
+    value = Trim(std::move(value));
+    if (value.size() >= 2 &&
+        ((value.front() == L'"' && value.back() == L'"') || (value.front() == L'\'' && value.back() == L'\''))) {
+        value = value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+std::unordered_map<std::wstring, std::wstring> ParseYamlRootScalarMap(const std::wstring& content) {
+    std::unordered_map<std::wstring, std::wstring> values;
+    for (const YamlLine& line : ParseYamlLines(content)) {
+        if (line.indent != 0) {
+            continue;
+        }
+
+        const size_t separator = line.text.find(L':');
+        if (separator == std::wstring::npos) {
+            continue;
+        }
+
+        std::wstring key = Uppercase(Trim(line.text.substr(0, separator)));
+        if (key.empty()) {
+            continue;
+        }
+
+        const std::wstring rawValue = Trim(line.text.substr(separator + 1));
+        if (rawValue.empty()) {
+            continue;
+        }
+
+        std::wstring value = ParseYamlScalarValue(rawValue);
+        values.insert_or_assign(std::move(key), std::move(value));
+    }
+    return values;
+}
+
 std::vector<std::wstring> ParseYamlStringArray(const std::wstring& content, std::wstring_view key) {
     std::vector<std::wstring> values;
     const std::optional<std::wstring> block = ExtractYamlChildBlock(content, key);
@@ -584,13 +621,6 @@ std::wstring ExpandEnvironmentVariables(std::wstring_view text) {
 
     expanded.resize(wcsnlen_s(expanded.c_str(), expanded.size()));
     return expanded;
-}
-
-void RefreshCommandVariables() {
-    g_state.commandVariables.clear();
-    if (!g_state.editorConfig.commandLine.empty()) {
-        g_state.commandVariables.emplace(L"EDITOR", g_state.editorConfig.commandLine);
-    }
 }
 
 std::wstring ExpandCommandVariables(std::wstring_view text) {
@@ -1149,21 +1179,20 @@ void LoadLauncherAppearanceConfig() {
     }
 }
 
-void LoadEditorConfig() {
+void LoadCommandVariables() {
     g_state.editorConfig = EditorConfig {};
+    g_state.commandVariables.clear();
 
     const std::wstring configPath = FindConfigPath(kConfigFileName);
     const std::wstring content = LoadUtf8TextFile(configPath);
     if (content.empty()) {
-        RefreshCommandVariables();
         return;
     }
 
-    if (const std::optional<std::wstring> commandLine = ParseYamlString(content, L"EDITOR")) {
-        g_state.editorConfig.commandLine = Trim(*commandLine);
+    g_state.commandVariables = ParseYamlRootScalarMap(content);
+    if (const auto it = g_state.commandVariables.find(L"EDITOR"); it != g_state.commandVariables.end()) {
+        g_state.editorConfig.commandLine = Trim(it->second);
     }
-
-    RefreshCommandVariables();
 }
 
 void RegisterLauncherHotkey() {
@@ -2045,7 +2074,7 @@ bool LaunchItemByIndex(size_t index) {
             LoadHotkeyConfig();
             LoadHistoryConfig();
             LoadLauncherAppearanceConfig();
-            LoadEditorConfig();
+            LoadCommandVariables();
             UpdateUiFont(g_state.dpi);
             RegisterLauncherHotkey();
             ApplyLauncherAppearance();
@@ -2327,7 +2356,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadHotkeyConfig();
     LoadHistoryConfig();
     LoadLauncherAppearanceConfig();
-    LoadEditorConfig();
+    LoadCommandVariables();
 
     if (!InitializeWindows()) {
         return 1;
