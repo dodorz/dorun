@@ -583,6 +583,14 @@ std::unordered_map<std::wstring, std::wstring> ParseYamlRootScalarMap(const std:
     return values;
 }
 
+std::unordered_map<std::wstring, std::wstring> ParseYamlScalarMapBlock(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> block = ExtractYamlChildBlock(content, key);
+    if (!block) {
+        return {};
+    }
+    return ParseYamlRootScalarMap(*block);
+}
+
 std::vector<std::wstring> ParseYamlStringArray(const std::wstring& content, std::wstring_view key) {
     std::vector<std::wstring> values;
     const std::optional<std::wstring> block = ExtractYamlChildBlock(content, key);
@@ -1202,6 +1210,9 @@ void LoadCommandVariables() {
     }
 
     g_state.commandVariables = ParseYamlRootScalarMap(content);
+    for (auto& [key, value] : ParseYamlScalarMapBlock(content, L"VARS")) {
+        g_state.commandVariables.insert_or_assign(std::move(key), std::move(value));
+    }
     if (const auto it = g_state.commandVariables.find(L"EDITOR"); it != g_state.commandVariables.end()) {
         g_state.editorConfig.commandLine = Trim(it->second);
     }
@@ -2430,10 +2441,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     commonControls.dwICC = ICC_WIN95_CLASSES;
     InitCommonControlsEx(&commonControls);
 
-    InitializeDpi();
     LoadHotkeyConfig();
     LoadHistoryConfig();
     LoadLauncherAppearanceConfig();
+    InitializeDpi();
     LoadCommandVariables();
 
     if (!InitializeWindows()) {
