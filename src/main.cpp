@@ -5,6 +5,7 @@
 #include <powrprof.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <winsqlite/winsqlite3.h>
 
 #include <algorithm>
@@ -74,6 +75,7 @@ enum class ItemSourceKind : int {
 struct LaunchItem {
     std::wstring name;
     std::wstring commandLine;
+    std::wstring description;
     std::wstring inlineBatchScript;
     std::wstring workingDirectory;
     std::wstring normalizedName;
@@ -112,9 +114,11 @@ struct AppState {
     HWND launcherWindow = nullptr;
     HWND searchEdit = nullptr;
     HWND resultList = nullptr;
+    HWND descriptionText = nullptr;
     WNDPROC editProc = nullptr;
     HFONT searchFont = nullptr;
     HFONT resultFont = nullptr;
+    HFONT descriptionFont = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
     std::vector<ScanDirectoryConfig> scanDirectories;
@@ -949,9 +953,17 @@ void UpdateUiFont(int dpi) {
         DeleteObject(g_state.resultFont);
         g_state.resultFont = nullptr;
     }
+    if (g_state.descriptionFont != nullptr) {
+        DeleteObject(g_state.descriptionFont);
+        g_state.descriptionFont = nullptr;
+    }
 
     g_state.searchFont = CreateConfiguredUiFont(dpi, g_state.launcherAppearance.searchFontFamily, g_state.launcherAppearance.searchFontPointSize);
     g_state.resultFont = CreateConfiguredUiFont(dpi, g_state.launcherAppearance.resultFontFamily, g_state.launcherAppearance.resultFontPointSize);
+    const int descriptionPointSize = g_state.launcherAppearance.resultFontPointSize > 0
+        ? std::max(6, g_state.launcherAppearance.resultFontPointSize - 2)
+        : 8;
+    g_state.descriptionFont = CreateConfiguredUiFont(dpi, g_state.launcherAppearance.resultFontFamily, descriptionPointSize);
 }
 
 bool TryApplyNativeRoundedCorners() {
@@ -1034,6 +1046,7 @@ void LayoutLauncher() {
     const int width = Scale(720);
     const int margin = Scale(12);
     const int controlHeight = std::max(Scale(32), MeasureFontTextHeight(g_state.searchFont) + Scale(12));
+    const int descriptionHeight = std::max(Scale(18), MeasureFontTextHeight(g_state.descriptionFont) + Scale(4));
     int listItemHeight = Scale(30);
     if (g_state.resultList != nullptr) {
         const LRESULT measuredHeight = SendMessageW(g_state.resultList, LB_GETITEMHEIGHT, 0, 0);
@@ -1042,13 +1055,14 @@ void LayoutLauncher() {
         }
     }
     const int listHeight = listItemHeight * g_state.launcherAppearance.visibleItemCount;
-    const int height = margin * 3 + controlHeight + listHeight;
+    const int height = margin * 4 + controlHeight + listHeight + descriptionHeight;
     const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
     const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 4;
 
     SetWindowPos(g_state.launcherWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     MoveWindow(g_state.searchEdit, margin, margin, width - margin * 2, controlHeight, TRUE);
     MoveWindow(g_state.resultList, margin, margin * 2 + controlHeight, width - margin * 2, listHeight, TRUE);
+    MoveWindow(g_state.descriptionText, margin, margin * 3 + controlHeight + listHeight, width - margin * 2, descriptionHeight, TRUE);
     ApplyLauncherAppearance();
 }
 
@@ -1426,6 +1440,40 @@ bool OpenPathInShell(const std::wstring& path) {
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+std::wstring ResolveShortcutCommandLine(const std::wstring& path) {
+    IShellLinkW* shellLink = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink));
+    if (FAILED(result) || shellLink == nullptr) {
+        return L"";
+    }
+
+    IPersistFile* persistFile = nullptr;
+    result = shellLink->QueryInterface(IID_PPV_ARGS(&persistFile));
+    if (FAILED(result) || persistFile == nullptr) {
+        shellLink->Release();
+        return L"";
+    }
+
+    std::wstring commandLine;
+    result = persistFile->Load(path.c_str(), STGM_READ);
+    if (SUCCEEDED(result)) {
+        std::array<wchar_t, INFOTIPSIZE> targetPath {};
+        std::array<wchar_t, INFOTIPSIZE> arguments {};
+        WIN32_FIND_DATAW findData {};
+        if (SUCCEEDED(shellLink->GetPath(targetPath.data(), static_cast<int>(targetPath.size()), &findData, SLGP_UNCPRIORITY)) && targetPath[0] != L'\0') {
+            commandLine = targetPath.data();
+            if (SUCCEEDED(shellLink->GetArguments(arguments.data(), static_cast<int>(arguments.size()))) && arguments[0] != L'\0') {
+                commandLine += L" ";
+                commandLine += arguments.data();
+            }
+        }
+    }
+
+    persistFile->Release();
+    shellLink->Release();
+    return commandLine;
+}
+
 std::wstring GetTempBatchDirectory() {
     const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
     if (!localAppDataDirectory.empty()) {
@@ -1745,8 +1793,10 @@ void LoadCommandItems() {
                 continue;
             }
             item.inlineBatchScript = std::move(script);
+            item.description = item.inlineBatchScript;
         } else {
             item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[1])));
+            item.description = item.commandLine;
             if (fields.size() > 2) {
                 item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
             }
@@ -1769,6 +1819,7 @@ void LoadBuiltinCommandItems() {
         LaunchItem item {};
         item.name = std::wstring(command.name) + L" - " + command.description;
         item.commandLine = std::wstring(kBuiltinCommandPrefix) + command.token;
+        item.description = command.description;
         item.sourceKind = ItemSourceKind::Synthetic;
         PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
@@ -1798,6 +1849,10 @@ void LoadFilesystemItems() {
             item.name = path.stem().wstring();
             item.commandLine = path.wstring();
             item.workingDirectory = path.parent_path().wstring();
+            item.description = extension == L".lnk" ? ResolveShortcutCommandLine(item.commandLine) : item.commandLine;
+            if (item.description.empty()) {
+                item.description = item.commandLine;
+            }
             item.sourceKind = ItemSourceKind::ScannedFile;
             PopulateSearchFields(item);
             item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
@@ -1856,6 +1911,26 @@ void RequestLauncherDataRefresh(bool refreshItems, bool refreshHistory) {
     }
     g_state.refreshScheduled = true;
     PostMessageW(g_state.hostWindow, kMessageRefreshLauncherData, 0, 0);
+}
+
+void UpdateSelectedItemDescription() {
+    if (g_state.descriptionText == nullptr || g_state.resultList == nullptr) {
+        return;
+    }
+
+    const LRESULT selected = SendMessageW(g_state.resultList, LB_GETCURSEL, 0, 0);
+    if (selected == LB_ERR) {
+        SetWindowTextW(g_state.descriptionText, L"");
+        return;
+    }
+
+    const LRESULT itemIndex = SendMessageW(g_state.resultList, LB_GETITEMDATA, static_cast<WPARAM>(selected), 0);
+    if (itemIndex == LB_ERR || static_cast<size_t>(itemIndex) >= g_state.items.size()) {
+        SetWindowTextW(g_state.descriptionText, L"");
+        return;
+    }
+
+    SetWindowTextW(g_state.descriptionText, g_state.items[static_cast<size_t>(itemIndex)].description.c_str());
 }
 
 void RequestResultListRebuild() {
@@ -2023,6 +2098,7 @@ void RebuildResultList() {
     g_state.lastSearch.matchedItemIndices = std::move(matchedItemIndices);
     g_state.lastSearch.builtinQuery = builtinQuery;
     g_state.lastSearch.valid = true;
+    UpdateSelectedItemDescription();
 }
 
 void RecordSuccessfulLaunch(const LaunchItem& item) {
@@ -2153,6 +2229,7 @@ bool LaunchItemByIndex(size_t index) {
             ApplyLauncherAppearance();
             ApplyFont(g_state.searchEdit, g_state.searchFont);
             ApplyFont(g_state.resultList, g_state.resultFont);
+            ApplyFont(g_state.descriptionText, g_state.descriptionFont);
             LayoutLauncher();
             RequestLauncherDataRefresh(true, true);
             HideLauncher();
@@ -2250,6 +2327,7 @@ void MoveSelection(int delta) {
         selected = count - 1;
     }
     SendMessageW(g_state.resultList, LB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+    UpdateSelectedItemDescription();
 }
 
 LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -2299,8 +2377,10 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     case WM_CREATE:
         g_state.searchEdit = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
         g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
+        g_state.descriptionText = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DESCRIPTION)), g_state.instance, nullptr);
         ApplyFont(g_state.searchEdit, g_state.searchFont);
         ApplyFont(g_state.resultList, g_state.resultFont);
+        ApplyFont(g_state.descriptionText, g_state.descriptionFont);
         g_state.editProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
         LayoutLauncher();
         return 0;
@@ -2312,6 +2392,10 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_DBLCLK) {
             LaunchSelectedItem();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_SELCHANGE) {
+            UpdateSelectedItemDescription();
             return 0;
         }
         break;
@@ -2346,6 +2430,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         UpdateUiFont(HIWORD(wParam));
         ApplyFont(g_state.searchEdit, g_state.searchFont);
         ApplyFont(g_state.resultList, g_state.resultFont);
+        ApplyFont(g_state.descriptionText, g_state.descriptionFont);
         LayoutLauncher();
         return 0;
     case WM_CLOSE:
@@ -2435,6 +2520,8 @@ void InitializeDpi() {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_state.instance = instance;
+    const HRESULT comInitResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool comInitialized = SUCCEEDED(comInitResult);
 
     INITCOMMONCONTROLSEX commonControls {};
     commonControls.dwSize = sizeof(commonControls);
@@ -2448,6 +2535,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCommandVariables();
 
     if (!InitializeWindows()) {
+        if (comInitialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -2468,6 +2558,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_state.resultFont != nullptr) {
         DeleteObject(g_state.resultFont);
         g_state.resultFont = nullptr;
+    }
+    if (g_state.descriptionFont != nullptr) {
+        DeleteObject(g_state.descriptionFont);
+        g_state.descriptionFont = nullptr;
+    }
+    if (comInitialized) {
+        CoUninitialize();
     }
     return static_cast<int>(message.wParam);
 }
