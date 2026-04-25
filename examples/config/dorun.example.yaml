@@ -25,10 +25,12 @@ LAUNCHER_SEARCH_FONT_SIZE: 0
 LAUNCHER_RESULT_FONT_SIZE: 0
 
 # Optional variables that Command.conf can reference as `${NAME}`.
-# Scalar values defined at the top level of this file are available there.
+# Define new variables under `VARS` to avoid conflicts with DoRun settings.
+# For compatibility, old top-level scalar variables still work, but `VARS` wins.
 # `EDITOR` is also used by `/config` and `/cmdconfig`.
-EDITOR: ''
-TERMINAL: 'wt.exe'
+VARS:
+  EDITOR: ''
+  TERMINAL: 'wt.exe'
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''
