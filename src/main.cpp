@@ -125,6 +125,8 @@ struct AppState {
     std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     SearchQueryState lastSearch {};
+    ULONGLONG lastSearchInputTick = 0;
+    bool deferredRefreshArmed = false;
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
     bool resultRebuildScheduled = false;
@@ -142,9 +144,12 @@ constexpr wchar_t kAppDirectoryName[] = L"DoRun";
 constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr UINT_PTR kVisibilityTimerId = 1;
+constexpr UINT_PTR kDeferredRefreshTimerId = 2;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
+constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
+constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 300;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
@@ -190,6 +195,8 @@ constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
 
 void RebuildResultList();
 void RequestResultListRebuild();
+void CancelDeferredRefresh();
+void RecordSearchInputActivity();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags = 0);
 
@@ -1041,6 +1048,7 @@ void HideLauncher() {
     if (g_state.launcherWindow != nullptr) {
         KillTimer(g_state.launcherWindow, kVisibilityTimerId);
     }
+    CancelDeferredRefresh();
     ShowWindow(g_state.launcherWindow, SW_HIDE);
 }
 
@@ -1847,6 +1855,25 @@ void RequestResultListRebuild() {
     PostMessageW(g_state.launcherWindow, kMessageRebuildResults, 0, 0);
 }
 
+void ArmDeferredRefresh() {
+    if (g_state.launcherWindow == nullptr) {
+        return;
+    }
+    g_state.deferredRefreshArmed = true;
+    SetTimer(g_state.launcherWindow, kDeferredRefreshTimerId, kDeferredRefreshCheckIntervalMs, nullptr);
+}
+
+void CancelDeferredRefresh() {
+    if (g_state.launcherWindow != nullptr) {
+        KillTimer(g_state.launcherWindow, kDeferredRefreshTimerId);
+    }
+    g_state.deferredRefreshArmed = false;
+}
+
+void RecordSearchInputActivity() {
+    g_state.lastSearchInputTick = GetTickCount64();
+}
+
 void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
     const ULONGLONG now = GetTickCount64();
     const bool shouldRefreshItems = forceItems ||
@@ -2219,6 +2246,7 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
         SetEnglishImeForWindow(window);
     }
     if (message == WM_KEYDOWN) {
+        RecordSearchInputActivity();
         if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && wParam == 'Q') {
             PostQuitMessage(0);
             return 0;
@@ -2250,8 +2278,9 @@ void ShowLauncher() {
     SetFocus(g_state.searchEdit);
     SetEnglishImeForWindow(g_state.searchEdit);
     SendMessageW(g_state.searchEdit, EM_SETSEL, 0, -1);
+    RecordSearchInputActivity();
     StartVisibilityTimer();
-    RequestLauncherDataRefresh(false, false);
+    ArmDeferredRefresh();
 }
 
 LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -2266,6 +2295,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         return 0;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_SEARCH && HIWORD(wParam) == EN_CHANGE) {
+            RecordSearchInputActivity();
             RequestResultListRebuild();
             return 0;
         }
@@ -2280,6 +2310,19 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
             if (foregroundWindow != nullptr && !IsLauncherRelatedWindow(foregroundWindow)) {
                 HideLauncher();
             }
+            return 0;
+        }
+        if (wParam == kDeferredRefreshTimerId) {
+            if (!g_state.deferredRefreshArmed || !IsWindowVisible(g_state.launcherWindow)) {
+                CancelDeferredRefresh();
+                return 0;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if ((now - g_state.lastSearchInputTick) < kDeferredRefreshIdleDelayMs) {
+                return 0;
+            }
+            CancelDeferredRefresh();
+            RequestLauncherDataRefresh(false, false);
             return 0;
         }
         break;
