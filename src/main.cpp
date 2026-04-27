@@ -131,6 +131,8 @@ struct AppState {
     SearchQueryState lastSearch {};
     ULONGLONG lastSearchInputTick = 0;
     bool deferredRefreshArmed = false;
+    bool filesystemCachePrimed = false;
+    bool filesystemCachePendingRescan = false;
     bool launcherDataLoaded = false;
     bool refreshScheduled = false;
     bool resultRebuildScheduled = false;
@@ -157,6 +159,7 @@ constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
+constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
 
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
@@ -714,6 +717,102 @@ std::wstring GetHistoryDatabasePath() {
         return ExpandEnvironmentVariables(g_state.historyConfig.databasePath);
     }
     return GetDefaultHistoryDatabasePath();
+}
+
+std::wstring GetFilesystemCachePath() {
+    const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
+    if (localAppDataDirectory.empty()) {
+        return (std::filesystem::path(GetModuleDirectory()) / L"filesystem-cache.txt").wstring();
+    }
+    return (std::filesystem::path(localAppDataDirectory) / L"filesystem-cache.txt").wstring();
+}
+
+std::wstring EscapeCacheField(std::wstring_view value) {
+    std::wstring escaped;
+    escaped.reserve(value.size());
+    for (const wchar_t ch : value) {
+        switch (ch) {
+        case L'\\':
+            escaped += L"\\\\";
+            break;
+        case L'\t':
+            escaped += L"\\t";
+            break;
+        case L'\n':
+            escaped += L"\\n";
+            break;
+        case L'\r':
+            escaped += L"\\r";
+            break;
+        default:
+            escaped.push_back(ch);
+            break;
+        }
+    }
+    return escaped;
+}
+
+std::wstring UnescapeCacheField(std::wstring_view value) {
+    std::wstring unescaped;
+    unescaped.reserve(value.size());
+    bool escaped = false;
+    for (const wchar_t ch : value) {
+        if (!escaped) {
+            if (ch == L'\\') {
+                escaped = true;
+            } else {
+                unescaped.push_back(ch);
+            }
+            continue;
+        }
+
+        switch (ch) {
+        case L't':
+            unescaped.push_back(L'\t');
+            break;
+        case L'n':
+            unescaped.push_back(L'\n');
+            break;
+        case L'r':
+            unescaped.push_back(L'\r');
+            break;
+        case L'\\':
+            unescaped.push_back(L'\\');
+            break;
+        default:
+            unescaped.push_back(L'\\');
+            unescaped.push_back(ch);
+            break;
+        }
+        escaped = false;
+    }
+    if (escaped) {
+        unescaped.push_back(L'\\');
+    }
+    return unescaped;
+}
+
+std::wstring BuildScanDirectorySignature() {
+    std::vector<std::wstring> parts;
+    parts.reserve(g_state.scanDirectories.size());
+    for (const ScanDirectoryConfig& directory : g_state.scanDirectories) {
+        std::vector<std::wstring> extensions(directory.extensions.begin(), directory.extensions.end());
+        std::sort(extensions.begin(), extensions.end());
+        std::wstring part = directory.path + L"|" + (directory.recursive ? L"1" : L"0");
+        for (const std::wstring& extension : extensions) {
+            part += L"|";
+            part += extension;
+        }
+        parts.push_back(std::move(part));
+    }
+    std::sort(parts.begin(), parts.end());
+
+    std::wstring signature = kFilesystemCacheMagic;
+    for (const std::wstring& part : parts) {
+        signature += L"\n";
+        signature += part;
+    }
+    return signature;
 }
 
 bool IsSubsequenceMatch(std::wstring_view text, std::wstring_view query) {
@@ -1827,11 +1926,123 @@ void LoadBuiltinCommandItems() {
     }
 }
 
-void LoadFilesystemItems() {
-    std::unordered_set<std::wstring> seen;
-    for (const LaunchItem& item : g_state.items) {
-        seen.insert(Lowercase(item.name + L"|" + item.commandLine));
+void AppendFilesystemItemWithDedup(
+    std::vector<LaunchItem>& target,
+    std::unordered_set<std::wstring>& seen,
+    LaunchItem item) {
+    const std::wstring key = Lowercase(item.name + L"|" + item.commandLine);
+    if (!seen.insert(key).second) {
+        return;
     }
+    target.push_back(std::move(item));
+}
+
+bool SaveFilesystemCache(const std::vector<LaunchItem>& scannedItems) {
+    std::wstring content = BuildScanDirectorySignature();
+    content += L"\n";
+    for (const LaunchItem& item : scannedItems) {
+        content += EscapeCacheField(item.name);
+        content += L"\t";
+        content += EscapeCacheField(item.commandLine);
+        content += L"\t";
+        content += EscapeCacheField(item.description);
+        content += L"\t";
+        content += EscapeCacheField(item.workingDirectory);
+        content += L"\n";
+    }
+    std::error_code error;
+    const std::filesystem::path cachePath = GetFilesystemCachePath();
+    const std::filesystem::path directory = cachePath.parent_path();
+    if (!directory.empty()) {
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            return false;
+        }
+    }
+    return SaveUtf8TextFile(cachePath.wstring(), content);
+}
+
+bool LoadFilesystemItemsFromCache(std::vector<LaunchItem>& destination, std::unordered_set<std::wstring>& seen) {
+    const std::wstring content = LoadUtf8TextFile(GetFilesystemCachePath());
+    if (content.empty()) {
+        return false;
+    }
+
+    std::wstringstream stream(content);
+    std::wstring line;
+    if (!std::getline(stream, line)) {
+        return false;
+    }
+    if (!line.empty() && line.back() == L'\r') {
+        line.pop_back();
+    }
+    if (line != kFilesystemCacheMagic) {
+        return false;
+    }
+
+    std::wstring expectedSignature = BuildScanDirectorySignature();
+    std::wstring actualSignature = line;
+    const size_t expectedSignatureLineCount = static_cast<size_t>(1 + g_state.scanDirectories.size());
+    for (size_t index = 1; index < expectedSignatureLineCount; ++index) {
+        if (!std::getline(stream, line)) {
+            return false;
+        }
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        actualSignature += L"\n";
+        actualSignature += line;
+    }
+    if (actualSignature != expectedSignature) {
+        return false;
+    }
+
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+
+        std::vector<std::wstring> fields;
+        std::wstring current;
+        bool escaped = false;
+        for (const wchar_t ch : line) {
+            if (!escaped && ch == L'\t') {
+                fields.push_back(std::move(current));
+                current.clear();
+                continue;
+            }
+            if (ch == L'\\' && !escaped) {
+                escaped = true;
+                current.push_back(ch);
+                continue;
+            }
+            escaped = false;
+            current.push_back(ch);
+        }
+        fields.push_back(std::move(current));
+        if (fields.size() != 4) {
+            continue;
+        }
+
+        LaunchItem item {};
+        item.name = UnescapeCacheField(fields[0]);
+        item.commandLine = UnescapeCacheField(fields[1]);
+        item.description = UnescapeCacheField(fields[2]);
+        item.workingDirectory = UnescapeCacheField(fields[3]);
+        item.sourceKind = ItemSourceKind::ScannedFile;
+        PopulateSearchFields(item);
+        item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
+        AppendFilesystemItemWithDedup(destination, seen, std::move(item));
+    }
+
+    return true;
+}
+
+void ScanFilesystemItems(std::vector<LaunchItem>& destination, std::unordered_set<std::wstring>& seen) {
+    std::vector<LaunchItem> scannedItems;
 
     for (const ScanDirectoryConfig& directory : g_state.scanDirectories) {
         std::error_code error;
@@ -1856,10 +2067,7 @@ void LoadFilesystemItems() {
             item.sourceKind = ItemSourceKind::ScannedFile;
             PopulateSearchFields(item);
             item.itemKey = BuildItemKey(item.sourceKind, item.commandLine, item.workingDirectory);
-            const std::wstring key = Lowercase(item.name + L"|" + item.commandLine);
-            if (seen.insert(key).second) {
-                g_state.items.push_back(std::move(item));
-            }
+            AppendFilesystemItemWithDedup(scannedItems, seen, std::move(item));
         };
 
         if (!directory.recursive) {
@@ -1888,19 +2096,41 @@ void LoadFilesystemItems() {
         }
     }
 
+    SaveFilesystemCache(scannedItems);
+    for (LaunchItem& item : scannedItems) {
+        destination.push_back(std::move(item));
+    }
+}
+
+bool LoadFilesystemItems(bool allowCache) {
+    std::unordered_set<std::wstring> seen;
+    for (const LaunchItem& item : g_state.items) {
+        seen.insert(Lowercase(item.name + L"|" + item.commandLine));
+    }
+
+    if (allowCache && LoadFilesystemItemsFromCache(g_state.items, seen)) {
+        std::sort(g_state.items.begin(), g_state.items.end(), [](const LaunchItem& lhs, const LaunchItem& rhs) {
+            return _wcsicmp(lhs.name.c_str(), rhs.name.c_str()) < 0;
+        });
+        return true;
+    }
+
+    ScanFilesystemItems(g_state.items, seen);
     std::sort(g_state.items.begin(), g_state.items.end(), [](const LaunchItem& lhs, const LaunchItem& rhs) {
         return _wcsicmp(lhs.name.c_str(), rhs.name.c_str()) < 0;
     });
+    return false;
 }
 
-void ReloadItems() {
+bool ReloadItems(bool allowFilesystemCache) {
     const std::wstring content = LoadUtf8TextFile(FindConfigPath(kConfigFileName));
     g_state.items.clear();
     g_state.lastSearch = SearchQueryState {};
     LoadScanDirectories(content);
     LoadCommandItems();
-    LoadFilesystemItems();
+    const bool loadedFilesystemCache = LoadFilesystemItems(allowFilesystemCache);
     LoadBuiltinCommandItems();
+    return loadedFilesystemCache;
 }
 
 void RequestLauncherDataRefresh(bool refreshItems, bool refreshHistory) {
@@ -1981,9 +2211,18 @@ void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
         (now - g_state.lastHistoryRefreshTick) >= kHistoryRefreshIntervalMs;
 
     bool rebuiltItems = false;
+    bool loadedFilesystemCache = false;
     if (shouldRefreshItems) {
-        ReloadItems();
-        g_state.lastItemsRefreshTick = now;
+        loadedFilesystemCache = ReloadItems(!g_state.filesystemCachePrimed);
+        if (loadedFilesystemCache) {
+            g_state.filesystemCachePrimed = true;
+            g_state.filesystemCachePendingRescan = true;
+            g_state.lastItemsRefreshTick = 0;
+        } else {
+            g_state.filesystemCachePrimed = true;
+            g_state.filesystemCachePendingRescan = false;
+            g_state.lastItemsRefreshTick = now;
+        }
         rebuiltItems = true;
     }
     if (shouldRefreshHistory) {
@@ -1995,6 +2234,10 @@ void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
         RebuildResultList();
     }
     g_state.launcherDataLoaded = true;
+
+    if (loadedFilesystemCache && g_state.filesystemCachePendingRescan) {
+        RequestLauncherDataRefresh(true, false);
+    }
 }
 
 std::wstring GetControlText(HWND window) {
