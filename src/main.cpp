@@ -105,6 +105,7 @@ struct BuiltinCommandDefinition {
 struct ScanDirectoryConfig {
     std::wstring path;
     std::unordered_set<std::wstring> extensions;
+    std::vector<std::wstring> excludedDirectories;
     bool recursive = true;
 };
 
@@ -792,6 +793,50 @@ std::wstring UnescapeCacheField(std::wstring_view value) {
     return unescaped;
 }
 
+std::wstring NormalizePathForComparison(const std::filesystem::path& path) {
+    std::wstring normalized = path.lexically_normal().wstring();
+    while (normalized.size() > 3 && (normalized.back() == L'\\' || normalized.back() == L'/')) {
+        normalized.pop_back();
+    }
+    return Lowercase(std::move(normalized));
+}
+
+std::wstring ResolveExcludedDirectoryPath(const std::wstring& root, const std::wstring& excludedDirectory) {
+    std::filesystem::path path(Trim(excludedDirectory));
+    if (path.empty()) {
+        return L"";
+    }
+    if (path.is_relative()) {
+        path = std::filesystem::path(root) / path;
+    }
+    return NormalizePathForComparison(path);
+}
+
+bool IsPathUnderDirectory(const std::wstring& normalizedPath, const std::wstring& normalizedDirectory) {
+    if (normalizedPath == normalizedDirectory) {
+        return true;
+    }
+    if (normalizedPath.size() <= normalizedDirectory.size() || !normalizedPath.starts_with(normalizedDirectory)) {
+        return false;
+    }
+    const wchar_t separator = normalizedPath[normalizedDirectory.size()];
+    return separator == L'\\' || separator == L'/';
+}
+
+bool IsExcludedScanPath(const ScanDirectoryConfig& directory, const std::filesystem::path& path) {
+    if (directory.excludedDirectories.empty()) {
+        return false;
+    }
+
+    const std::wstring normalizedPath = NormalizePathForComparison(path);
+    for (const std::wstring& excludedDirectory : directory.excludedDirectories) {
+        if (IsPathUnderDirectory(normalizedPath, excludedDirectory)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::wstring BuildScanDirectorySignature() {
     std::vector<std::wstring> parts;
     parts.reserve(g_state.scanDirectories.size());
@@ -802,6 +847,12 @@ std::wstring BuildScanDirectorySignature() {
         for (const std::wstring& extension : extensions) {
             part += L"|";
             part += extension;
+        }
+        std::vector<std::wstring> excludedDirectories = directory.excludedDirectories;
+        std::sort(excludedDirectories.begin(), excludedDirectories.end());
+        for (const std::wstring& excludedDirectory : excludedDirectories) {
+            part += L"|!";
+            part += excludedDirectory;
         }
         parts.push_back(std::move(part));
     }
@@ -1448,6 +1499,12 @@ void LoadScanDirectories(const std::wstring& content) {
             }
             directory.extensions = BuildExecutableExtensions(includePathExt.value_or(true), effectiveExtensions);
         }
+        for (const std::wstring& excludedDirectory : ParseYamlStringArray(block, L"INDEX_EXCLUDE_DIRS")) {
+            std::wstring normalizedExcludedDirectory = ResolveExcludedDirectoryPath(directory.path, excludedDirectory);
+            if (!normalizedExcludedDirectory.empty()) {
+                directory.excludedDirectories.push_back(std::move(normalizedExcludedDirectory));
+            }
+        }
         g_state.scanDirectories.push_back(std::move(directory));
     }
 
@@ -2089,7 +2146,16 @@ void ScanFilesystemItems(std::vector<LaunchItem>& destination, std::unordered_se
                 error.clear();
                 continue;
             }
+            if (it->is_directory(error)) {
+                if (IsExcludedScanPath(directory, it->path())) {
+                    it.disable_recursion_pending();
+                }
+                continue;
+            }
             if (!it->is_regular_file(error)) {
+                continue;
+            }
+            if (IsExcludedScanPath(directory, it->path())) {
                 continue;
             }
             appendItem(it->path());

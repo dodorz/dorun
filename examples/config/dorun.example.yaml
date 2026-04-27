@@ -59,5 +59,9 @@ DIR:
       - '.exe'
       - '.lnk'
       - '.cmd'
+    # Exclude subdirectories from this PATH. Relative entries are resolved under PATH.
+    INDEX_EXCLUDE_DIRS:
+      - 'WindowsApps'
+      - 'Common Files'
 
   - PATH: 'C:\Program Files (x86)'
