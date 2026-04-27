@@ -153,7 +153,7 @@ constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
-constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 300;
+constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
@@ -1960,6 +1960,17 @@ void RecordSearchInputActivity() {
     g_state.lastSearchInputTick = GetTickCount64();
 }
 
+bool ShouldDeferRefreshForActiveTyping() {
+    if (g_state.launcherWindow == nullptr || IsWindowVisible(g_state.launcherWindow) == FALSE) {
+        return false;
+    }
+    if (g_state.lastSearchInputTick == 0) {
+        return false;
+    }
+    const ULONGLONG now = GetTickCount64();
+    return (now - g_state.lastSearchInputTick) < kDeferredRefreshIdleDelayMs;
+}
+
 void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
     const ULONGLONG now = GetTickCount64();
     const bool shouldRefreshItems = forceItems ||
@@ -2452,6 +2463,11 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         return 0;
     }
     if (message == kMessageRefreshLauncherData) {
+        if (ShouldDeferRefreshForActiveTyping()) {
+            g_state.refreshScheduled = false;
+            ArmDeferredRefresh();
+            return 0;
+        }
         const bool refreshItems = g_state.pendingItemsRefresh;
         const bool refreshHistory = g_state.pendingHistoryRefresh;
         g_state.pendingItemsRefresh = false;
