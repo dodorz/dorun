@@ -3,13 +3,24 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 set "SOLUTION=%SCRIPT_DIR%DoRun.sln"
-set "CONFIG=Release"
+set "PROFILE=StaticRelease"
+set "CONFIG=StaticRelease"
 set "PLATFORM=x64"
 set "MSBUILD_EXE="
 set "PROCESS_NAME=DoRun.exe"
 
-if /I "%~1"=="Debug" set "CONFIG=Debug"
-if /I "%~1"=="Release" set "CONFIG=Release"
+if /I "%~1"=="Debug" (
+    set "PROFILE=Debug"
+    set "CONFIG=Debug"
+)
+if /I "%~1"=="Release" (
+    set "PROFILE=Release"
+    set "CONFIG=Release"
+)
+if /I "%~1"=="StaticRelease" (
+    set "PROFILE=StaticRelease"
+    set "CONFIG=StaticRelease"
+)
 if not "%~2"=="" set "PLATFORM=%~2"
 
 call :find_msbuild
@@ -19,7 +30,7 @@ call :stop_running_process
 if errorlevel 1 goto :fail
 
 echo Using MSBuild: %MSBUILD_EXE%
-echo Building %SOLUTION% /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+echo Building %PROFILE% (%CONFIG% / %PLATFORM%) from %SOLUTION%
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%scripts\invoke_msbuild.ps1" -Msbuild "%MSBUILD_EXE%" -Solution "%SOLUTION%" -Configuration "%CONFIG%" -Platform "%PLATFORM%"
 if errorlevel 1 goto :fail
 
