@@ -1983,9 +1983,9 @@ std::vector<std::wstring> SplitStartupCommandFields(std::wstring_view line) {
     return fields;
 }
 
-void ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstring>& fields, size_t commandFieldIndex) {
+bool ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstring>& fields, size_t commandFieldIndex) {
     if (commandFieldIndex >= fields.size()) {
-        return;
+        return false;
     }
 
     item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[commandFieldIndex])));
@@ -2002,6 +2002,7 @@ void ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstr
     if (fields.size() > priorityClassFieldIndex && !fields[priorityClassFieldIndex].empty()) {
         item.priorityClass = static_cast<DWORD>(_wtoi(fields[priorityClassFieldIndex].c_str()));
     }
+    return !item.commandLine.empty();
 }
 
 struct CronLineParts {
@@ -2304,7 +2305,9 @@ void LoadCommandItems() {
             item.inlineBatchScript = std::move(script);
             item.description = item.inlineBatchScript;
         } else {
-            ApplyCommandOptionsFromFields(item, fields, 1);
+            if (!ApplyCommandOptionsFromFields(item, fields, 1)) {
+                continue;
+            }
         }
 
         PopulateSearchFields(item);
@@ -2353,8 +2356,7 @@ void LoadCronTasks() {
             }
 
             const std::vector<std::wstring> commandFields = SplitStartupCommandFields(parsedLine->command);
-            ApplyCommandOptionsFromFields(task.item, commandFields, 0);
-            if (task.item.commandLine.empty()) {
+            if (!ApplyCommandOptionsFromFields(task.item, commandFields, 0)) {
                 continue;
             }
 
@@ -2388,8 +2390,7 @@ void RunStartupCommands() {
 
             LaunchItem item {};
             const std::vector<std::wstring> fields = SplitStartupCommandFields(startupLine);
-            ApplyCommandOptionsFromFields(item, fields, 0);
-            if (item.commandLine.empty()) {
+            if (!ApplyCommandOptionsFromFields(item, fields, 0)) {
                 continue;
             }
 
