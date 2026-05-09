@@ -2098,6 +2098,26 @@ void RunStartupCommands() {
     }
 }
 
+bool ShouldRunStartupCommands() {
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (arguments == nullptr) {
+        return false;
+    }
+
+    bool shouldRun = false;
+    for (int index = 1; index < argumentCount; ++index) {
+        std::wstring_view argument(arguments[index]);
+        if (argument == L"/startup" || argument == L"-startup" || argument == L"--startup") {
+            shouldRun = true;
+            break;
+        }
+    }
+
+    LocalFree(arguments);
+    return shouldRun;
+}
+
 void LoadBuiltinCommandItems() {
     for (const BuiltinCommandDefinition& command : kBuiltinCommands) {
         LaunchItem item {};
@@ -2995,7 +3015,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     RegisterLauncherHotkey();
-    RunStartupCommands();
+    if (ShouldRunStartupCommands()) {
+        RunStartupCommands();
+    }
     RequestLauncherDataRefresh(true, true);
 
     MSG message {};
