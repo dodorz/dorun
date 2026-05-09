@@ -9,6 +9,7 @@
 #include <winsqlite/winsqlite3.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cmath>
 #include <cwctype>
@@ -87,6 +88,21 @@ struct LaunchItem {
     std::wstring itemKey;
 };
 
+struct CronFieldSpec {
+    bool wildcard = false;
+    std::vector<bool> allowed;
+};
+
+struct CronTask {
+    CronFieldSpec minute;
+    CronFieldSpec hour;
+    CronFieldSpec dayOfMonth;
+    CronFieldSpec month;
+    CronFieldSpec weekday;
+    LaunchItem item;
+    std::wstring lastRunMinuteKey;
+};
+
 struct SearchQueryState {
     std::wstring rawQuery;
     std::wstring normalizedQuery;
@@ -129,6 +145,7 @@ struct AppState {
     EditorConfig editorConfig {};
     std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
+    std::vector<CronTask> cronTasks;
     SearchQueryState lastSearch {};
     ULONGLONG lastSearchInputTick = 0;
     bool deferredRefreshArmed = false;
@@ -152,8 +169,10 @@ constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT_PTR kDeferredRefreshTimerId = 2;
+constexpr UINT_PTR kCronTimerId = 3;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
+constexpr UINT kCronTimerIntervalMs = 30 * 1000;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
@@ -205,6 +224,7 @@ void RebuildResultList();
 void RequestResultListRebuild();
 void CancelDeferredRefresh();
 void RecordSearchInputActivity();
+void LoadCronTasks();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags = 0);
 
@@ -1984,6 +2004,236 @@ void ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstr
     }
 }
 
+struct CronLineParts {
+    std::wstring minute;
+    std::wstring hour;
+    std::wstring dayOfMonth;
+    std::wstring month;
+    std::wstring weekday;
+    std::wstring command;
+};
+
+std::optional<int> ParseCronInteger(std::wstring_view text) {
+    std::wstring value = Trim(text);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != L'\0') {
+        return std::nullopt;
+    }
+    if (parsed < (std::numeric_limits<int>::min)() || parsed > (std::numeric_limits<int>::max)()) {
+        return std::nullopt;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::wstring NormalizeCronMinuteKey(const SYSTEMTIME& time) {
+    wchar_t buffer[32] {};
+    swprintf_s(
+        buffer,
+        L"%04u%02u%02u%02u%02u",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute);
+    return buffer;
+}
+
+std::optional<CronLineParts> ParseCronLineParts(std::wstring_view line) {
+    CronLineParts parts {};
+    size_t position = 0;
+    auto readToken = [&](std::wstring* target) -> bool {
+        while (position < line.size() && iswspace(line[position]) != 0) {
+            ++position;
+        }
+        if (position >= line.size()) {
+            return false;
+        }
+        const size_t start = position;
+        while (position < line.size() && iswspace(line[position]) == 0) {
+            ++position;
+        }
+        *target = std::wstring(line.substr(start, position - start));
+        return true;
+    };
+
+    if (!readToken(&parts.minute) ||
+        !readToken(&parts.hour) ||
+        !readToken(&parts.dayOfMonth) ||
+        !readToken(&parts.month) ||
+        !readToken(&parts.weekday)) {
+        return std::nullopt;
+    }
+
+    while (position < line.size() && iswspace(line[position]) != 0) {
+        ++position;
+    }
+    if (position >= line.size()) {
+        return std::nullopt;
+    }
+
+    parts.command = Trim(line.substr(position));
+    if (parts.command.empty()) {
+        return std::nullopt;
+    }
+    return parts;
+}
+
+bool TrySetCronValue(std::vector<bool>& allowed, int minValue, int maxValue, int value) {
+    if (value < minValue || value > maxValue) {
+        return false;
+    }
+    if (value >= static_cast<int>(allowed.size())) {
+        return false;
+    }
+    allowed[static_cast<size_t>(value)] = true;
+    return true;
+}
+
+bool ParseCronFieldSpec(std::wstring_view text, int minValue, int maxValue, bool sundaySevenAlias, CronFieldSpec* spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    spec->wildcard = false;
+    spec->allowed.assign(static_cast<size_t>(maxValue + 1), false);
+
+    const std::wstring value = Trim(text);
+    if (value.empty()) {
+        return false;
+    }
+
+    size_t segmentStart = 0;
+    auto normalizeValue = [&](int rawValue) -> std::optional<int> {
+        if (sundaySevenAlias && rawValue == 7) {
+            return 0;
+        }
+        if (rawValue < minValue || rawValue > maxValue) {
+            return std::nullopt;
+        }
+        return rawValue;
+    };
+
+    while (segmentStart <= value.size()) {
+        const size_t segmentEnd = value.find(L',', segmentStart);
+        const std::wstring segment = Trim(value.substr(segmentStart, segmentEnd == std::wstring::npos ? std::wstring::npos : segmentEnd - segmentStart));
+        if (segment.empty()) {
+            return false;
+        }
+
+        if (segment == L"*" || segment == L"?") {
+            spec->wildcard = true;
+            spec->allowed.assign(static_cast<size_t>(maxValue + 1), true);
+            return true;
+        }
+
+        const size_t slashIndex = segment.find(L'/');
+        const std::wstring basePart = Trim(segment.substr(0, slashIndex));
+        const std::wstring stepPart = slashIndex == std::wstring::npos ? L"" : Trim(segment.substr(slashIndex + 1));
+
+        int step = 1;
+        if (!stepPart.empty()) {
+            const std::optional<int> parsedStep = ParseCronInteger(stepPart);
+            if (!parsedStep || *parsedStep <= 0) {
+                return false;
+            }
+            step = *parsedStep;
+        }
+
+        int rangeStart = minValue;
+        int rangeEnd = maxValue;
+        if (basePart != L"*") {
+            const size_t dashIndex = basePart.find(L'-');
+            if (dashIndex == std::wstring::npos) {
+                const std::optional<int> parsedValue = ParseCronInteger(basePart);
+                if (!parsedValue) {
+                    return false;
+                }
+                const std::optional<int> normalized = normalizeValue(*parsedValue);
+                if (!normalized) {
+                    return false;
+                }
+                rangeStart = *normalized;
+                rangeEnd = maxValue;
+            } else {
+                const std::wstring startPart = Trim(basePart.substr(0, dashIndex));
+                const std::wstring endPart = Trim(basePart.substr(dashIndex + 1));
+                const std::optional<int> parsedStart = ParseCronInteger(startPart);
+                const std::optional<int> parsedEnd = ParseCronInteger(endPart);
+                if (!parsedStart || !parsedEnd) {
+                    return false;
+                }
+                if (sundaySevenAlias && (*parsedStart == 7 || *parsedEnd == 7)) {
+                    return false;
+                }
+                rangeStart = *parsedStart;
+                rangeEnd = *parsedEnd;
+                if (rangeStart < minValue || rangeStart > maxValue || rangeEnd < minValue || rangeEnd > maxValue || rangeStart > rangeEnd) {
+                    return false;
+                }
+            }
+        }
+
+        for (int valueIndex = rangeStart; valueIndex <= rangeEnd; valueIndex += step) {
+            if (!TrySetCronValue(spec->allowed, minValue, maxValue, valueIndex)) {
+                return false;
+            }
+        }
+
+        if (segmentEnd == std::wstring::npos) {
+            break;
+        }
+        segmentStart = segmentEnd + 1;
+    }
+
+    return true;
+}
+
+bool CronFieldMatches(const CronFieldSpec& spec, int value) {
+    if (spec.wildcard) {
+        return true;
+    }
+    if (value < 0 || value >= static_cast<int>(spec.allowed.size())) {
+        return false;
+    }
+    return spec.allowed[static_cast<size_t>(value)];
+}
+
+bool CronTaskMatchesTime(const CronTask& task, const SYSTEMTIME& time) {
+    const int weekday = static_cast<int>(time.wDayOfWeek);
+    const bool minuteMatches = CronFieldMatches(task.minute, static_cast<int>(time.wMinute));
+    const bool hourMatches = CronFieldMatches(task.hour, static_cast<int>(time.wHour));
+    const bool monthMatches = CronFieldMatches(task.month, static_cast<int>(time.wMonth));
+    const bool dayOfMonthMatches = CronFieldMatches(task.dayOfMonth, static_cast<int>(time.wDay));
+    const bool weekdayMatches = CronFieldMatches(task.weekday, weekday);
+
+    const bool dayOfMonthWildcard = task.dayOfMonth.wildcard;
+    const bool weekdayWildcard = task.weekday.wildcard;
+    bool dayMatches = false;
+    if (dayOfMonthWildcard && weekdayWildcard) {
+        dayMatches = true;
+    } else if (dayOfMonthWildcard) {
+        dayMatches = weekdayMatches;
+    } else if (weekdayWildcard) {
+        dayMatches = dayOfMonthMatches;
+    } else {
+        dayMatches = dayOfMonthMatches || weekdayMatches;
+    }
+
+    return minuteMatches && hourMatches && monthMatches && dayMatches;
+}
+
+bool LaunchCronTask(const CronTask& task) {
+    if (task.item.inlineBatchScript.empty()) {
+        return LaunchProcessCommand(task.item.commandLine, task.item.workingDirectory, task.item.showCommand, task.item.priorityClass);
+    }
+    return LaunchInlineBatchScript(task.item);
+}
+
 void LoadCommandItems() {
     std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
@@ -1998,6 +2248,10 @@ void LoadCommandItems() {
             continue;
         }
         if (IsCommandBlockStart(trimmedLine, L"STARTUP")) {
+            SkipCommandBlock(stream);
+            continue;
+        }
+        if (IsCommandBlockStart(trimmedLine, L"CRON")) {
             SkipCommandBlock(stream);
             continue;
         }
@@ -2059,6 +2313,56 @@ void LoadCommandItems() {
     }
 }
 
+void LoadCronTasks() {
+    g_state.cronTasks.clear();
+
+    std::wifstream stream(FindConfigPath(kCommandFileName));
+    if (!stream.is_open()) {
+        return;
+    }
+    stream.imbue(std::locale(".UTF-8"));
+
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine) || !IsCommandBlockStart(trimmedLine, L"CRON")) {
+            continue;
+        }
+
+        while (std::getline(stream, line)) {
+            const std::wstring cronLine = Trim(line);
+            if (cronLine == L"}") {
+                break;
+            }
+            if (IsCommandCommentLine(cronLine)) {
+                continue;
+            }
+
+            const std::optional<CronLineParts> parsedLine = ParseCronLineParts(cronLine);
+            if (!parsedLine) {
+                continue;
+            }
+
+            CronTask task {};
+            if (!ParseCronFieldSpec(parsedLine->minute, 0, 59, false, &task.minute) ||
+                !ParseCronFieldSpec(parsedLine->hour, 0, 23, false, &task.hour) ||
+                !ParseCronFieldSpec(parsedLine->dayOfMonth, 1, 31, false, &task.dayOfMonth) ||
+                !ParseCronFieldSpec(parsedLine->month, 1, 12, false, &task.month) ||
+                !ParseCronFieldSpec(parsedLine->weekday, 0, 7, true, &task.weekday)) {
+                continue;
+            }
+
+            const std::vector<std::wstring> commandFields = SplitStartupCommandFields(parsedLine->command);
+            ApplyCommandOptionsFromFields(task.item, commandFields, 0);
+            if (task.item.commandLine.empty()) {
+                continue;
+            }
+
+            g_state.cronTasks.push_back(std::move(task));
+        }
+    }
+}
+
 void RunStartupCommands() {
     std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
@@ -2095,6 +2399,34 @@ void RunStartupCommands() {
                 LaunchInlineBatchScript(item);
             }
         }
+    }
+}
+
+void RunCronTasks() {
+    if (g_state.cronTasks.empty()) {
+        return;
+    }
+
+    SYSTEMTIME localTime {};
+    GetLocalTime(&localTime);
+    const std::wstring minuteKey = NormalizeCronMinuteKey(localTime);
+
+    for (CronTask& task : g_state.cronTasks) {
+        if (!CronTaskMatchesTime(task, localTime)) {
+            continue;
+        }
+        if (task.lastRunMinuteKey == minuteKey) {
+            continue;
+        }
+
+        LaunchCronTask(task);
+        task.lastRunMinuteKey = minuteKey;
+    }
+}
+
+void StartCronTimer() {
+    if (g_state.hostWindow != nullptr) {
+        SetTimer(g_state.hostWindow, kCronTimerId, kCronTimerIntervalMs, nullptr);
     }
 }
 
@@ -2342,6 +2674,7 @@ bool ReloadItems(bool allowFilesystemCache) {
     g_state.lastSearch = SearchQueryState {};
     LoadScanDirectories(content);
     LoadCommandItems();
+    LoadCronTasks();
     const bool loadedFilesystemCache = LoadFilesystemItems(allowFilesystemCache);
     LoadBuiltinCommandItems();
     return loadedFilesystemCache;
@@ -2692,6 +3025,7 @@ bool LaunchItemByIndex(size_t index) {
             LoadHistoryConfig();
             LoadLauncherAppearanceConfig();
             LoadCommandVariables();
+            LoadCronTasks();
             UpdateUiFont(g_state.dpi);
             RegisterLauncherHotkey();
             ApplyLauncherAppearance();
@@ -2919,6 +3253,10 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         ShowLauncher();
         return 0;
     }
+    if (message == WM_TIMER && wParam == kCronTimerId) {
+        RunCronTasks();
+        return 0;
+    }
     if (message == kMessageRefreshLauncherData) {
         if (ShouldDeferRefreshForActiveTyping()) {
             g_state.refreshScheduled = false;
@@ -3006,6 +3344,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadLauncherAppearanceConfig();
     InitializeDpi();
     LoadCommandVariables();
+    LoadCronTasks();
 
     if (!InitializeWindows()) {
         if (comInitialized) {
@@ -3018,6 +3357,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (ShouldRunStartupCommands()) {
         RunStartupCommands();
     }
+    RunCronTasks();
+    StartCronTimer();
     RequestLauncherDataRefresh(true, true);
 
     MSG message {};
