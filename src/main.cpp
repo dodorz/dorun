@@ -1889,6 +1889,101 @@ std::wstring StripOuterQuotes(std::wstring value) {
     return value;
 }
 
+bool IsCommandBlockStart(std::wstring_view text, std::wstring_view blockName) {
+    if (!text.starts_with(blockName)) {
+        return false;
+    }
+    const size_t suffixIndex = blockName.size();
+    if (text.size() == suffixIndex + 1 && text[suffixIndex] == L'{') {
+        return true;
+    }
+    return text.size() == suffixIndex + 2 && text[suffixIndex] == L' ' && text[suffixIndex + 1] == L'{';
+}
+
+void SkipCommandBlock(std::wistream& stream) {
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        if (Trim(line) == L"}") {
+            return;
+        }
+    }
+}
+
+std::vector<std::wstring> SplitStartupCommandFields(std::wstring_view line) {
+    std::vector<std::wstring> fields;
+    std::wstring current;
+    bool inQuotes = false;
+    bool escaped = false;
+    auto isEscapableChar = [](wchar_t ch) {
+        return ch == L'\\' || ch == L':' || ch == L'"' || ch == L';' || ch == L'#';
+    };
+    auto isSchemeName = [](std::wstring_view value) {
+        return !value.empty() && std::all_of(value.begin(), value.end(), [](wchar_t ch) { return iswalpha(ch) != 0; });
+    };
+
+    for (size_t index = 0; index < line.size(); ++index) {
+        const wchar_t ch = line[index];
+        if (escaped) {
+            if (isEscapableChar(ch)) {
+                current.push_back(ch);
+            } else {
+                current.push_back(L'\\');
+                current.push_back(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        if (ch == L'\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == L'"') {
+            inQuotes = !inQuotes;
+            current.push_back(ch);
+        } else if (ch == L':' && !inQuotes) {
+            const bool isDriveLetter = current.size() == 1 && iswalpha(current[0]) != 0 &&
+                index + 1 < line.size() && (line[index + 1] == L'\\' || line[index + 1] == L'/');
+            const bool isUriScheme = isSchemeName(current) &&
+                ((index + 2 < line.size() && line[index + 1] == L'/' && line[index + 2] == L'/') ||
+                 (current == L"shell"));
+            if (isDriveLetter || isUriScheme) {
+                current.push_back(ch);
+                continue;
+            }
+            fields.push_back(Trim(current));
+            current.clear();
+        } else {
+            current.push_back(ch);
+        }
+    }
+    if (escaped) {
+        current.push_back(L'\\');
+    }
+    fields.push_back(Trim(current));
+    return fields;
+}
+
+void ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstring>& fields, size_t commandFieldIndex) {
+    if (commandFieldIndex >= fields.size()) {
+        return;
+    }
+
+    item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[commandFieldIndex])));
+    item.description = item.commandLine;
+    const size_t workingDirectoryFieldIndex = commandFieldIndex + 1;
+    if (fields.size() > workingDirectoryFieldIndex) {
+        item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[workingDirectoryFieldIndex])));
+    }
+    const size_t showCommandFieldIndex = commandFieldIndex + 2;
+    if (fields.size() > showCommandFieldIndex && !fields[showCommandFieldIndex].empty()) {
+        item.showCommand = _wtoi(fields[showCommandFieldIndex].c_str());
+    }
+    const size_t priorityClassFieldIndex = commandFieldIndex + 3;
+    if (fields.size() > priorityClassFieldIndex && !fields[priorityClassFieldIndex].empty()) {
+        item.priorityClass = static_cast<DWORD>(_wtoi(fields[priorityClassFieldIndex].c_str()));
+    }
+}
+
 void LoadCommandItems() {
     std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
@@ -1900,6 +1995,10 @@ void LoadCommandItems() {
     while (std::getline(stream, line)) {
         const std::wstring trimmedLine = Trim(line);
         if (IsCommandCommentLine(trimmedLine)) {
+            continue;
+        }
+        if (IsCommandBlockStart(trimmedLine, L"STARTUP")) {
+            SkipCommandBlock(stream);
             continue;
         }
 
@@ -1951,22 +2050,51 @@ void LoadCommandItems() {
             item.inlineBatchScript = std::move(script);
             item.description = item.inlineBatchScript;
         } else {
-            item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[1])));
-            item.description = item.commandLine;
-            if (fields.size() > 2) {
-                item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[2])));
-            }
-            if (fields.size() > 3 && !fields[3].empty()) {
-                item.showCommand = _wtoi(fields[3].c_str());
-            }
-            if (fields.size() > 4 && !fields[4].empty()) {
-                item.priorityClass = static_cast<DWORD>(_wtoi(fields[4].c_str()));
-            }
+            ApplyCommandOptionsFromFields(item, fields, 1);
         }
 
         PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, BuildCommandIdentity(item), item.workingDirectory);
         g_state.items.push_back(std::move(item));
+    }
+}
+
+void RunStartupCommands() {
+    std::wifstream stream(FindConfigPath(kCommandFileName));
+    if (!stream.is_open()) {
+        return;
+    }
+    stream.imbue(std::locale(".UTF-8"));
+
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine) || !IsCommandBlockStart(trimmedLine, L"STARTUP")) {
+            continue;
+        }
+
+        while (std::getline(stream, line)) {
+            const std::wstring startupLine = Trim(line);
+            if (startupLine == L"}") {
+                break;
+            }
+            if (IsCommandCommentLine(startupLine)) {
+                continue;
+            }
+
+            LaunchItem item {};
+            const std::vector<std::wstring> fields = SplitStartupCommandFields(startupLine);
+            ApplyCommandOptionsFromFields(item, fields, 0);
+            if (item.commandLine.empty()) {
+                continue;
+            }
+
+            if (item.inlineBatchScript.empty()) {
+                LaunchProcessCommand(item.commandLine, item.workingDirectory, item.showCommand, item.priorityClass);
+            } else {
+                LaunchInlineBatchScript(item);
+            }
+        }
     }
 }
 
@@ -2867,6 +2995,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     RegisterLauncherHotkey();
+    RunStartupCommands();
     RequestLauncherDataRefresh(true, true);
 
     MSG message {};
