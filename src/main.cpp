@@ -73,6 +73,12 @@ enum class ItemSourceKind : int {
     Synthetic = 2,
 };
 
+enum class RunningProcessPolicy {
+    Launch,
+    Restart,
+    Queue,
+};
+
 struct LaunchItem {
     std::wstring name;
     std::wstring commandLine;
@@ -84,6 +90,7 @@ struct LaunchItem {
     std::wstring normalizedCommandBaseName;
     int showCommand = SW_SHOWNORMAL;
     DWORD priorityClass = NORMAL_PRIORITY_CLASS;
+    RunningProcessPolicy runningProcessPolicy = RunningProcessPolicy::Launch;
     ItemSourceKind sourceKind = ItemSourceKind::ScannedFile;
     std::wstring itemKey;
 };
@@ -101,6 +108,8 @@ struct CronTask {
     CronFieldSpec weekday;
     LaunchItem item;
     std::wstring lastRunMinuteKey;
+    HANDLE runningProcess = nullptr;
+    int queuedLaunchCount = 0;
 };
 
 struct SearchQueryState {
@@ -173,6 +182,7 @@ constexpr UINT_PTR kCronTimerId = 3;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
 constexpr UINT kCronTimerIntervalMs = 30 * 1000;
+constexpr DWORD kCronRestartTerminateWaitMs = 5000;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
@@ -226,7 +236,13 @@ void CancelDeferredRefresh();
 void RecordSearchInputActivity();
 void LoadCronTasks();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
-bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags = 0);
+bool LaunchProcessCommand(
+    std::wstring_view commandLineText,
+    std::wstring_view workingDirectoryText,
+    int showCommand,
+    DWORD priorityClass,
+    DWORD extraCreationFlags = 0,
+    HANDLE* launchedProcess = nullptr);
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
@@ -1675,7 +1691,7 @@ std::wstring MakeInlineBatchFilePath() {
     return (directory / fileName).wstring();
 }
 
-bool LaunchInlineBatchScript(const LaunchItem& item) {
+bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = nullptr) {
     const std::wstring batchPath = MakeInlineBatchFilePath();
     std::wstring script = ExpandCommandVariables(item.inlineBatchScript);
     if (!script.ends_with(L"\n")) {
@@ -1687,7 +1703,7 @@ bool LaunchInlineBatchScript(const LaunchItem& item) {
 
     const std::wstring commandLine = L"cmd.exe /c " + QuoteCommandLineArgument(batchPath);
     const DWORD extraCreationFlags = item.showCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
-    return LaunchProcessCommand(commandLine, item.workingDirectory, item.showCommand, item.priorityClass, extraCreationFlags);
+    return LaunchProcessCommand(commandLine, item.workingDirectory, item.showCommand, item.priorityClass, extraCreationFlags, launchedProcess);
 }
 
 bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCommand = SW_HIDE) {
@@ -1708,7 +1724,17 @@ std::wstring QuoteCommandLineArgument(std::wstring_view argument) {
     return quoted;
 }
 
-bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view workingDirectoryText, int showCommand, DWORD priorityClass, DWORD extraCreationFlags) {
+bool LaunchProcessCommand(
+    std::wstring_view commandLineText,
+    std::wstring_view workingDirectoryText,
+    int showCommand,
+    DWORD priorityClass,
+    DWORD extraCreationFlags,
+    HANDLE* launchedProcess) {
+    if (launchedProcess != nullptr) {
+        *launchedProcess = nullptr;
+    }
+
     std::wstring commandLine = ExpandEnvironmentVariables(commandLineText);
     std::wstring workingDirectoryBuffer = ExpandEnvironmentVariables(workingDirectoryText);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
@@ -1724,15 +1750,31 @@ bool LaunchProcessCommand(std::wstring_view commandLineText, std::wstring_view w
     const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | priorityClass | extraCreationFlags;
     const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
     if (ok == FALSE) {
-        const HINSTANCE result = ShellExecuteW(g_state.launcherWindow, L"open", commandLine.c_str(), nullptr, workingDirectory, showCommand);
-        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+        SHELLEXECUTEINFOW executeInfo {};
+        executeInfo.cbSize = sizeof(executeInfo);
+        executeInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
+        executeInfo.hwnd = g_state.launcherWindow;
+        executeInfo.lpVerb = L"open";
+        executeInfo.lpFile = commandLine.c_str();
+        executeInfo.lpDirectory = workingDirectory;
+        executeInfo.nShow = showCommand;
+        if (ShellExecuteExW(&executeInfo) == FALSE || reinterpret_cast<INT_PTR>(executeInfo.hInstApp) <= 32) {
             return false;
+        }
+        if (launchedProcess != nullptr) {
+            *launchedProcess = executeInfo.hProcess;
+        } else if (executeInfo.hProcess != nullptr) {
+            CloseHandle(executeInfo.hProcess);
         }
         return true;
     }
 
     CloseHandle(processInfo.hThread);
-    CloseHandle(processInfo.hProcess);
+    if (launchedProcess != nullptr) {
+        *launchedProcess = processInfo.hProcess;
+    } else {
+        CloseHandle(processInfo.hProcess);
+    }
     return true;
 }
 
@@ -1922,10 +1964,151 @@ bool IsCommandBlockStart(std::wstring_view text, std::wstring_view blockName) {
 
 void SkipCommandBlock(std::wistream& stream) {
     std::wstring line;
+    int depth = 1;
     while (std::getline(stream, line)) {
-        if (Trim(line) == L"}") {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine)) {
+            continue;
+        }
+        if (trimmedLine == L"}") {
+            --depth;
+            if (depth <= 0) {
+                return;
+            }
+            continue;
+        }
+        if (trimmedLine == L"{" || trimmedLine.ends_with(L"{")) {
+            ++depth;
+        }
+    }
+}
+
+std::vector<std::wstring> ReadNestedCommandBlock(std::wistream& stream) {
+    std::vector<std::wstring> lines;
+    std::wstring line;
+    int depth = 1;
+    while (std::getline(stream, line)) {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine)) {
+            lines.push_back(line);
+            continue;
+        }
+        if (trimmedLine == L"}") {
+            --depth;
+            if (depth <= 0) {
+                break;
+            }
+            lines.push_back(line);
+            continue;
+        }
+
+        if (trimmedLine == L"{" || trimmedLine.ends_with(L"{")) {
+            ++depth;
+        }
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+bool StripTrailingCommandPropertyBlockStart(std::wstring* line) {
+    if (line == nullptr) {
+        return false;
+    }
+
+    std::wstring trimmedLine = Trim(*line);
+    if (trimmedLine.empty() || trimmedLine == L"{") {
+        return false;
+    }
+    if (!trimmedLine.ends_with(L"{")) {
+        return false;
+    }
+
+    trimmedLine.pop_back();
+    *line = Trim(trimmedLine);
+    return true;
+}
+
+std::optional<std::pair<std::wstring, std::wstring>> ParseCommandPropertyLine(std::wstring_view line) {
+    const std::wstring trimmedLine = Trim(line);
+    const size_t colonIndex = trimmedLine.find(L':');
+    const size_t equalsIndex = trimmedLine.find(L'=');
+    size_t separatorIndex = std::wstring::npos;
+    if (colonIndex == std::wstring::npos) {
+        separatorIndex = equalsIndex;
+    } else if (equalsIndex == std::wstring::npos) {
+        separatorIndex = colonIndex;
+    } else {
+        separatorIndex = (std::min)(colonIndex, equalsIndex);
+    }
+
+    if (separatorIndex == std::wstring::npos || separatorIndex == 0) {
+        return std::nullopt;
+    }
+
+    std::wstring key = Lowercase(Trim(trimmedLine.substr(0, separatorIndex)));
+    std::wstring value = Trim(trimmedLine.substr(separatorIndex + 1));
+    if (key.empty()) {
+        return std::nullopt;
+    }
+    return std::make_pair(std::move(key), std::move(value));
+}
+
+std::optional<RunningProcessPolicy> ParseRunningProcessPolicy(std::wstring_view text) {
+    const std::wstring value = Lowercase(Trim(text));
+    if (value == L"launch" || value == L"start" || value == L"normal" || value == L"parallel") {
+        return RunningProcessPolicy::Launch;
+    }
+    if (value == L"restart" || value == L"terminate" || value == L"terminate_previous" || value == L"kill_previous") {
+        return RunningProcessPolicy::Restart;
+    }
+    if (value == L"queue" || value == L"wait" || value == L"wait_previous") {
+        return RunningProcessPolicy::Queue;
+    }
+    return std::nullopt;
+}
+
+void ApplyCommandProperty(LaunchItem& item, const std::wstring& key, const std::wstring& rawValue) {
+    const std::wstring value = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(rawValue)));
+    if (key == L"command_line" || key == L"command") {
+        item.commandLine = value;
+        item.description = item.commandLine;
+    } else if (key == L"working_directory" || key == L"cwd") {
+        item.workingDirectory = value;
+    } else if (key == L"show_window") {
+        if (!value.empty()) {
+            item.showCommand = _wtoi(value.c_str());
+        }
+    } else if (key == L"priority_class") {
+        if (!value.empty()) {
+            item.priorityClass = static_cast<DWORD>(_wtoi(value.c_str()));
+        }
+    } else if (key == L"on_running" || key == L"running_policy" || key == L"previous_process") {
+        if (const std::optional<RunningProcessPolicy> policy = ParseRunningProcessPolicy(value)) {
+            item.runningProcessPolicy = *policy;
+        }
+    }
+}
+
+void ApplyCommandPropertyBlock(LaunchItem& item, const std::vector<std::wstring>& lines, size_t* index) {
+    if (index == nullptr) {
+        return;
+    }
+
+    while (*index < lines.size()) {
+        const std::wstring propertyLine = Trim(lines[*index]);
+        ++(*index);
+        if (propertyLine == L"}") {
             return;
         }
+        if (IsCommandCommentLine(propertyLine)) {
+            continue;
+        }
+
+        const std::optional<std::pair<std::wstring, std::wstring>> property = ParseCommandPropertyLine(propertyLine);
+        if (!property) {
+            continue;
+        }
+        ApplyCommandProperty(item, property->first, property->second);
     }
 }
 
@@ -2228,11 +2411,90 @@ bool CronTaskMatchesTime(const CronTask& task, const SYSTEMTIME& time) {
     return minuteMatches && hourMatches && monthMatches && dayMatches;
 }
 
-bool LaunchCronTask(const CronTask& task) {
-    if (task.item.inlineBatchScript.empty()) {
-        return LaunchProcessCommand(task.item.commandLine, task.item.workingDirectory, task.item.showCommand, task.item.priorityClass);
+void CloseProcessHandle(HANDLE* process) {
+    if (process != nullptr && *process != nullptr) {
+        CloseHandle(*process);
+        *process = nullptr;
     }
-    return LaunchInlineBatchScript(task.item);
+}
+
+bool IsProcessStillRunning(HANDLE process) {
+    return process != nullptr && WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+}
+
+void RefreshCronTaskProcessState(CronTask& task) {
+    if (task.runningProcess != nullptr && !IsProcessStillRunning(task.runningProcess)) {
+        CloseProcessHandle(&task.runningProcess);
+    }
+}
+
+void CloseCronTaskProcessHandles() {
+    for (CronTask& task : g_state.cronTasks) {
+        CloseProcessHandle(&task.runningProcess);
+        task.queuedLaunchCount = 0;
+    }
+}
+
+bool LaunchCronTask(CronTask& task) {
+    HANDLE launchedProcess = nullptr;
+    const bool shouldTrackProcess = task.item.runningProcessPolicy != RunningProcessPolicy::Launch;
+    HANDLE* launchedProcessTarget = shouldTrackProcess ? &launchedProcess : nullptr;
+    bool launched = false;
+    if (task.item.inlineBatchScript.empty()) {
+        launched = LaunchProcessCommand(
+            task.item.commandLine,
+            task.item.workingDirectory,
+            task.item.showCommand,
+            task.item.priorityClass,
+            0,
+            launchedProcessTarget);
+    } else {
+        launched = LaunchInlineBatchScript(task.item, launchedProcessTarget);
+    }
+    if (!launched) {
+        CloseProcessHandle(&launchedProcess);
+        return false;
+    }
+
+    if (shouldTrackProcess) {
+        CloseProcessHandle(&task.runningProcess);
+        task.runningProcess = launchedProcess;
+    }
+    return true;
+}
+
+void RunQueuedCronLaunches(CronTask& task) {
+    while (task.queuedLaunchCount > 0) {
+        RefreshCronTaskProcessState(task);
+        if (IsProcessStillRunning(task.runningProcess)) {
+            return;
+        }
+
+        --task.queuedLaunchCount;
+        if (!LaunchCronTask(task)) {
+            task.queuedLaunchCount = 0;
+            return;
+        }
+    }
+}
+
+void RequestCronTaskLaunch(CronTask& task) {
+    RefreshCronTaskProcessState(task);
+    if (!IsProcessStillRunning(task.runningProcess)) {
+        LaunchCronTask(task);
+        return;
+    }
+
+    if (task.item.runningProcessPolicy == RunningProcessPolicy::Launch) {
+        LaunchCronTask(task);
+    } else if (task.item.runningProcessPolicy == RunningProcessPolicy::Restart) {
+        TerminateProcess(task.runningProcess, 1);
+        WaitForSingleObject(task.runningProcess, kCronRestartTerminateWaitMs);
+        CloseProcessHandle(&task.runningProcess);
+        LaunchCronTask(task);
+    } else if (task.item.runningProcessPolicy == RunningProcessPolicy::Queue) {
+        ++task.queuedLaunchCount;
+    }
 }
 
 void LoadCommandItems() {
@@ -2317,6 +2579,7 @@ void LoadCommandItems() {
 }
 
 void LoadCronTasks() {
+    CloseCronTaskProcessHandles();
     g_state.cronTasks.clear();
 
     std::wifstream stream(FindConfigPath(kCommandFileName));
@@ -2332,15 +2595,14 @@ void LoadCronTasks() {
             continue;
         }
 
-        while (std::getline(stream, line)) {
-            const std::wstring cronLine = Trim(line);
-            if (cronLine == L"}") {
-                break;
-            }
+        const std::vector<std::wstring> cronLines = ReadNestedCommandBlock(stream);
+        for (size_t index = 0; index < cronLines.size(); ++index) {
+            std::wstring cronLine = Trim(cronLines[index]);
             if (IsCommandCommentLine(cronLine)) {
                 continue;
             }
 
+            const bool hasPropertyBlock = StripTrailingCommandPropertyBlockStart(&cronLine);
             const std::optional<CronLineParts> parsedLine = ParseCronLineParts(cronLine);
             if (!parsedLine) {
                 continue;
@@ -2358,6 +2620,13 @@ void LoadCronTasks() {
             const std::vector<std::wstring> commandFields = SplitStartupCommandFields(parsedLine->command);
             if (!ApplyCommandOptionsFromFields(task.item, commandFields, 0)) {
                 continue;
+            }
+            if (hasPropertyBlock) {
+                ++index;
+                ApplyCommandPropertyBlock(task.item, cronLines, &index);
+            } else if (index + 1 < cronLines.size() && Trim(cronLines[index + 1]) == L"{") {
+                index += 2;
+                ApplyCommandPropertyBlock(task.item, cronLines, &index);
             }
 
             g_state.cronTasks.push_back(std::move(task));
@@ -2379,19 +2648,25 @@ void RunStartupCommands() {
             continue;
         }
 
-        while (std::getline(stream, line)) {
-            const std::wstring startupLine = Trim(line);
-            if (startupLine == L"}") {
-                break;
-            }
+        const std::vector<std::wstring> startupLines = ReadNestedCommandBlock(stream);
+        for (size_t index = 0; index < startupLines.size(); ++index) {
+            std::wstring startupLine = Trim(startupLines[index]);
             if (IsCommandCommentLine(startupLine)) {
                 continue;
             }
 
+            const bool hasPropertyBlock = StripTrailingCommandPropertyBlockStart(&startupLine);
             LaunchItem item {};
             const std::vector<std::wstring> fields = SplitStartupCommandFields(startupLine);
             if (!ApplyCommandOptionsFromFields(item, fields, 0)) {
                 continue;
+            }
+            if (hasPropertyBlock) {
+                ++index;
+                ApplyCommandPropertyBlock(item, startupLines, &index);
+            } else if (index + 1 < startupLines.size() && Trim(startupLines[index + 1]) == L"{") {
+                index += 2;
+                ApplyCommandPropertyBlock(item, startupLines, &index);
             }
 
             if (item.inlineBatchScript.empty()) {
@@ -2413,6 +2688,7 @@ void RunCronTasks() {
     const std::wstring minuteKey = NormalizeCronMinuteKey(localTime);
 
     for (CronTask& task : g_state.cronTasks) {
+        RunQueuedCronLaunches(task);
         if (!CronTaskMatchesTime(task, localTime)) {
             continue;
         }
@@ -2420,7 +2696,7 @@ void RunCronTasks() {
             continue;
         }
 
-        LaunchCronTask(task);
+        RequestCronTaskLaunch(task);
         task.lastRunMinuteKey = minuteKey;
     }
 }
@@ -3369,6 +3645,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
+    CloseCronTaskProcessHandles();
     if (g_state.searchFont != nullptr) {
         DeleteObject(g_state.searchFont);
         g_state.searchFont = nullptr;
