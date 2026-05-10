@@ -75,6 +75,7 @@ enum class ItemSourceKind : int {
 
 enum class RunningProcessPolicy {
     Launch,
+    Skip,
     Restart,
     Queue,
 };
@@ -2058,6 +2059,9 @@ std::optional<RunningProcessPolicy> ParseRunningProcessPolicy(std::wstring_view 
     if (value == L"launch" || value == L"start" || value == L"normal" || value == L"parallel") {
         return RunningProcessPolicy::Launch;
     }
+    if (value == L"skip" || value == L"ignore" || value == L"do_not_start" || value == L"no_start") {
+        return RunningProcessPolicy::Skip;
+    }
     if (value == L"restart" || value == L"terminate" || value == L"terminate_previous" || value == L"kill_previous") {
         return RunningProcessPolicy::Restart;
     }
@@ -2487,6 +2491,8 @@ void RequestCronTaskLaunch(CronTask& task) {
 
     if (task.item.runningProcessPolicy == RunningProcessPolicy::Launch) {
         LaunchCronTask(task);
+    } else if (task.item.runningProcessPolicy == RunningProcessPolicy::Skip) {
+        return;
     } else if (task.item.runningProcessPolicy == RunningProcessPolicy::Restart) {
         TerminateProcess(task.runningProcess, 1);
         WaitForSingleObject(task.runningProcess, kCronRestartTerminateWaitMs);
