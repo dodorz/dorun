@@ -11,4 +11,4 @@ Rules:
 - After each commit, create a Git tag named with the full version, using the `vmajor.minor.patch.build` format.
 - Keep `src/version.h` and `src/DoRun.rc` in sync when the build number changes.
 
-Current version: `0.1.4.13`
+Current version: `0.1.4.14`
