@@ -154,6 +154,7 @@ struct AppState {
     LauncherAppearanceConfig launcherAppearance {};
     EditorConfig editorConfig {};
     std::unordered_map<std::wstring, std::wstring> commandVariables;
+    std::unordered_map<std::wstring, LaunchItem> commandItemsByName;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     std::vector<CronTask> cronTasks;
     SearchQueryState lastSearch {};
@@ -726,6 +727,10 @@ std::wstring ExpandCommandVariables(std::wstring_view text) {
 }
 
 std::wstring NormalizeHistoryField(std::wstring_view text) {
+    return Lowercase(Trim(text));
+}
+
+std::wstring NormalizeCommandNameKey(std::wstring_view text) {
     return Lowercase(Trim(text));
 }
 
@@ -2071,11 +2076,33 @@ std::optional<RunningProcessPolicy> ParseRunningProcessPolicy(std::wstring_view 
     return std::nullopt;
 }
 
+std::wstring DecodeCommandConfigValue(std::wstring_view value) {
+    return ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(std::wstring(value))));
+}
+
+bool TryApplyCommandItemReference(LaunchItem& item, std::wstring_view commandName) {
+    const std::wstring resolvedName = DecodeCommandConfigValue(commandName);
+    const std::wstring key = NormalizeCommandNameKey(resolvedName);
+    if (key.empty()) {
+        return false;
+    }
+
+    const auto it = g_state.commandItemsByName.find(key);
+    if (it == g_state.commandItemsByName.end()) {
+        return false;
+    }
+
+    item = it->second;
+    return true;
+}
+
 void ApplyCommandProperty(LaunchItem& item, const std::wstring& key, const std::wstring& rawValue) {
-    const std::wstring value = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(rawValue)));
+    const std::wstring value = DecodeCommandConfigValue(rawValue);
     if (key == L"command_line" || key == L"command") {
-        item.commandLine = value;
-        item.description = item.commandLine;
+        if (!TryApplyCommandItemReference(item, rawValue)) {
+            item.commandLine = value;
+            item.description = item.commandLine;
+        }
     } else if (key == L"working_directory" || key == L"cwd") {
         item.workingDirectory = value;
     } else if (key == L"show_window") {
@@ -2175,11 +2202,13 @@ bool ApplyCommandOptionsFromFields(LaunchItem& item, const std::vector<std::wstr
         return false;
     }
 
-    item.commandLine = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[commandFieldIndex])));
-    item.description = item.commandLine;
+    if (!TryApplyCommandItemReference(item, fields[commandFieldIndex])) {
+        item.commandLine = DecodeCommandConfigValue(fields[commandFieldIndex]);
+        item.description = item.commandLine;
+    }
     const size_t workingDirectoryFieldIndex = commandFieldIndex + 1;
     if (fields.size() > workingDirectoryFieldIndex) {
-        item.workingDirectory = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[workingDirectoryFieldIndex])));
+        item.workingDirectory = DecodeCommandConfigValue(fields[workingDirectoryFieldIndex]);
     }
     const size_t showCommandFieldIndex = commandFieldIndex + 2;
     if (fields.size() > showCommandFieldIndex && !fields[showCommandFieldIndex].empty()) {
@@ -2503,7 +2532,8 @@ void RequestCronTaskLaunch(CronTask& task) {
     }
 }
 
-void LoadCommandItems() {
+void LoadCommandItems(bool appendToResultItems = true) {
+    g_state.commandItemsByName.clear();
     std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
         return;
@@ -2580,7 +2610,13 @@ void LoadCommandItems() {
 
         PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, BuildCommandIdentity(item), item.workingDirectory);
-        g_state.items.push_back(std::move(item));
+        const std::wstring nameKey = NormalizeCommandNameKey(item.name);
+        if (!nameKey.empty()) {
+            g_state.commandItemsByName.insert_or_assign(nameKey, item);
+        }
+        if (appendToResultItems) {
+            g_state.items.push_back(std::move(item));
+        }
     }
 }
 
@@ -3308,6 +3344,7 @@ bool LaunchItemByIndex(size_t index) {
             LoadHistoryConfig();
             LoadLauncherAppearanceConfig();
             LoadCommandVariables();
+            LoadCommandItems(false);
             LoadCronTasks();
             UpdateUiFont(g_state.dpi);
             RegisterLauncherHotkey();
@@ -3627,6 +3664,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadLauncherAppearanceConfig();
     InitializeDpi();
     LoadCommandVariables();
+    LoadCommandItems(false);
     LoadCronTasks();
 
     if (!InitializeWindows()) {
