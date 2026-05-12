@@ -2379,7 +2379,7 @@ bool ParseCronFieldSpec(std::wstring_view text, int minValue, int maxValue, bool
                     return false;
                 }
                 rangeStart = *normalized;
-                rangeEnd = maxValue;
+                rangeEnd = stepPart.empty() ? rangeStart : maxValue;
             } else {
                 const std::wstring startPart = Trim(basePart.substr(0, dashIndex));
                 const std::wstring endPart = Trim(basePart.substr(dashIndex + 1));
