@@ -78,6 +78,7 @@ enum class RunningProcessPolicy {
     Skip,
     Restart,
     Queue,
+    QueueOnce,
 };
 
 struct LaunchItem {
@@ -2073,6 +2074,9 @@ std::optional<RunningProcessPolicy> ParseRunningProcessPolicy(std::wstring_view 
     if (value == L"queue" || value == L"wait" || value == L"wait_previous") {
         return RunningProcessPolicy::Queue;
     }
+    if (value == L"queue_once" || value == L"queueonce" || value == L"wait_once" || value == L"wait_once_previous") {
+        return RunningProcessPolicy::QueueOnce;
+    }
     return std::nullopt;
 }
 
@@ -2527,6 +2531,10 @@ void RequestCronTaskLaunch(CronTask& task) {
         WaitForSingleObject(task.runningProcess, kCronRestartTerminateWaitMs);
         CloseProcessHandle(&task.runningProcess);
         LaunchCronTask(task);
+    } else if (task.item.runningProcessPolicy == RunningProcessPolicy::QueueOnce) {
+        if (task.queuedLaunchCount == 0) {
+            task.queuedLaunchCount = 1;
+        }
     } else if (task.item.runningProcessPolicy == RunningProcessPolicy::Queue) {
         ++task.queuedLaunchCount;
     }
