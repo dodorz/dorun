@@ -1,0 +1,92 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*.*.*.*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and release gate
+        id: version
+        shell: pwsh
+        run: |
+          $isRelease = "false"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $version = $env:GITHUB_REF_NAME
+            if ($version -notmatch "^v\d+\.\d+\.\d+\.\d+$") {
+              throw "Version tag must match vmajor.minor.patch.build: $version"
+            }
+
+            $currentSeries = ($version -replace "^v", "") -replace "\.\d+$", ""
+            $currentCommit = git rev-list -n 1 $version
+            $previousTag = git tag --merged $currentCommit --sort=-version:refname |
+              Where-Object {
+                $_ -match "^v\d+\.\d+\.\d+\.\d+$" -and
+                (git rev-list -n 1 $_) -ne $currentCommit
+              } |
+              Select-Object -First 1
+
+            if (-not $previousTag) {
+              $isRelease = "true"
+            } else {
+              $previousSeries = ($previousTag -replace "^v", "") -replace "\.\d+$", ""
+              if ($currentSeries -ne $previousSeries) {
+                $isRelease = "true"
+              }
+            }
+          } else {
+            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build static release
+        shell: cmd
+        run: build.bat StaticRelease x64
+
+      - name: Build dynamic release
+        shell: cmd
+        run: build.bat Release x64
+
+      - name: Package executables
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build\StaticRelease\DoRun.exe "dist\DoRun-$version-windows-x64-static.exe"
+          Copy-Item build\Release\DoRun.exe "dist\DoRun-$version-windows-x64.exe"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoRun-${{ steps.version.outputs.version }}-windows-x64
+          path: dist/*.exe
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' && steps.version.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DoRun ${{ steps.version.outputs.version }}
+          files: dist/*.exe
