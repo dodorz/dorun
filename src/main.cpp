@@ -167,6 +167,7 @@ struct ScanDirectoryConfig {
 struct AppState {
     HINSTANCE instance = nullptr;
     HHOOK keyboardHook = nullptr;
+    HANDLE singletonMutex = nullptr;
     HWND hostWindow = nullptr;
     HWND launcherWindow = nullptr;
     HWND searchEdit = nullptr;
@@ -205,12 +206,15 @@ struct AppState {
     bool pendingHistoryRefresh = false;
     ULONGLONG lastItemsRefreshTick = 0;
     ULONGLONG lastHistoryRefreshTick = 0;
+    bool startupMode = false;
 };
 
 AppState g_state {};
 
 constexpr wchar_t kHostClassName[] = L"DoRun.HostWindow";
 constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
+constexpr wchar_t kSingletonMutexName[] = L"Local\\DoRun.Singleton";
+constexpr wchar_t kSingletonHostWindowTitle[] = L"DoRun.SingletonHost";
 constexpr wchar_t kAppDirectoryName[] = L"DoRun";
 constexpr wchar_t kConfigFileName[] = L"DoRun.yaml";
 constexpr wchar_t kCommandFileName[] = L"Command.conf";
@@ -226,6 +230,7 @@ constexpr DWORD kCronRestartTerminateWaitMs = 5000;
 constexpr ULONG_PTR kInjectedHotkeyExtraInfo = 0x44524E484B455955ULL;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
+constexpr UINT kMessageSingletonShowLauncher = WM_APP + 3;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
@@ -283,6 +288,7 @@ void ShowHotkeyRegistrationFailures();
 void ConfigureKeyboardHook();
 void ReloadAllConfiguration(bool hideLauncherOnSuccess);
 void AppendHotkeyDebugLog(std::wstring_view line);
+bool NotifyExistingInstanceAndExit();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(
     std::wstring_view commandLineText,
@@ -3424,6 +3430,10 @@ void StartConfigWatchTimer() {
 }
 
 bool ShouldRunStartupCommands() {
+    if (g_state.startupMode) {
+        return true;
+    }
+
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     if (arguments == nullptr) {
@@ -3440,7 +3450,25 @@ bool ShouldRunStartupCommands() {
     }
 
     LocalFree(arguments);
+    g_state.startupMode = shouldRun;
     return shouldRun;
+}
+
+bool NotifyExistingInstanceAndExit() {
+    g_state.singletonMutex = CreateMutexW(nullptr, FALSE, kSingletonMutexName);
+    if (g_state.singletonMutex == nullptr) {
+        return false;
+    }
+
+    if (GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+
+    const HWND existingHostWindow = FindWindowW(kHostClassName, kSingletonHostWindowTitle);
+    if (existingHostWindow != nullptr && !g_state.startupMode) {
+        PostMessageW(existingHostWindow, kMessageSingletonShowLauncher, 0, 0);
+    }
+    return true;
 }
 
 void LoadBuiltinCommandItems() {
@@ -4273,6 +4301,10 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         }
         return 0;
     }
+    if (message == kMessageSingletonShowLauncher) {
+        ShowLauncher();
+        return 0;
+    }
     if (message == kMessageRefreshLauncherData) {
         if (ShouldDeferRefreshForActiveTyping()) {
             g_state.refreshScheduled = false;
@@ -4315,7 +4347,19 @@ bool InitializeWindows() {
         return false;
     }
 
-    g_state.hostWindow = CreateWindowExW(0, kHostClassName, L"DoRunHost", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, g_state.instance, nullptr);
+    g_state.hostWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        kHostClassName,
+        kSingletonHostWindowTitle,
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        nullptr,
+        nullptr,
+        g_state.instance,
+        nullptr);
     if (g_state.hostWindow == nullptr) {
         return false;
     }
@@ -4347,6 +4391,13 @@ void InitializeDpi() {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_state.instance = instance;
+    g_state.startupMode = false;
+    const bool startupMode = ShouldRunStartupCommands();
+    g_state.startupMode = startupMode;
+    if (NotifyExistingInstanceAndExit()) {
+        return 0;
+    }
+
     const HRESULT comInitResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     const bool comInitialized = SUCCEEDED(comInitResult);
 
@@ -4377,7 +4428,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     RegisterManagedHotkeys();
     ConfigureKeyboardHook();
     ShowHotkeyRegistrationFailures();
-    if (ShouldRunStartupCommands()) {
+    if (g_state.startupMode) {
         RunStartupCommands();
     }
     RunCronTasks();
@@ -4409,6 +4460,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     if (comInitialized) {
         CoUninitialize();
+    }
+    if (g_state.singletonMutex != nullptr) {
+        CloseHandle(g_state.singletonMutex);
+        g_state.singletonMutex = nullptr;
     }
     return static_cast<int>(message.wParam);
 }
