@@ -34,6 +34,7 @@ namespace {
 struct HotkeyConfig {
     UINT modifiers = MOD_ALT;
     UINT vk = VK_SPACE;
+    bool debugLoggingEnabled = false;
 };
 
 struct HistoryConfig {
@@ -143,6 +144,13 @@ struct SearchQueryState {
     bool valid = false;
 };
 
+struct MonitoredConfigFile {
+    const wchar_t* fileName = nullptr;
+    std::wstring path;
+    std::filesystem::file_time_type lastWriteTime {};
+    bool exists = false;
+};
+
 struct BuiltinCommandDefinition {
     const wchar_t* name;
     const wchar_t* description;
@@ -184,6 +192,7 @@ struct AppState {
     std::vector<CronTask> cronTasks;
     std::vector<ManagedHotkey> managedHotkeys;
     std::vector<HotkeyRegistrationFailure> hotkeyRegistrationFailures;
+    std::array<MonitoredConfigFile, 2> monitoredConfigFiles {};
     SearchQueryState lastSearch {};
     ULONGLONG lastSearchInputTick = 0;
     bool deferredRefreshArmed = false;
@@ -208,9 +217,11 @@ constexpr wchar_t kCommandFileName[] = L"Command.conf";
 constexpr UINT_PTR kVisibilityTimerId = 1;
 constexpr UINT_PTR kDeferredRefreshTimerId = 2;
 constexpr UINT_PTR kCronTimerId = 3;
+constexpr UINT_PTR kConfigWatchTimerId = 4;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
 constexpr UINT kCronTimerIntervalMs = 30 * 1000;
+constexpr UINT kConfigWatchTimerIntervalMs = 1000;
 constexpr DWORD kCronRestartTerminateWaitMs = 5000;
 constexpr ULONG_PTR kInjectedHotkeyExtraInfo = 0x44524E484B455955ULL;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
@@ -270,6 +281,8 @@ std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey);
 void AddHotkeyRegistrationFailure(std::wstring label, std::wstring spec, DWORD errorCode);
 void ShowHotkeyRegistrationFailures();
 void ConfigureKeyboardHook();
+void ReloadAllConfiguration(bool hideLauncherOnSuccess);
+void AppendHotkeyDebugLog(std::wstring_view line);
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(
     std::wstring_view commandLineText,
@@ -801,6 +814,14 @@ std::wstring GetFilesystemCachePath() {
         return (std::filesystem::path(GetModuleDirectory()) / L"filesystem-cache.txt").wstring();
     }
     return (std::filesystem::path(localAppDataDirectory) / L"filesystem-cache.txt").wstring();
+}
+
+std::wstring GetHotkeyDebugLogPath() {
+    const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
+    if (localAppDataDirectory.empty()) {
+        return (std::filesystem::path(GetModuleDirectory()) / L"hotkey-debug.log").wstring();
+    }
+    return (std::filesystem::path(localAppDataDirectory) / L"hotkey-debug.log").wstring();
 }
 
 std::wstring EscapeCacheField(std::wstring_view value) {
@@ -1353,6 +1374,7 @@ void EnsureDefaultHotkey() {
 
 void LoadHotkeyConfig() {
     EnsureDefaultHotkey();
+    g_state.hotkey.debugLoggingEnabled = false;
 
     const std::wstring configPath = FindConfigPath(kConfigFileName);
     const std::wstring content = LoadUtf8TextFile(configPath);
@@ -1365,6 +1387,9 @@ void LoadHotkeyConfig() {
     }
     if (const std::optional<UINT> vk = ParseYamlUInt(content, L"HOTKEY_VK")) {
         g_state.hotkey.vk = *vk;
+    }
+    if (const std::optional<bool> debugLoggingEnabled = ParseYamlBool(content, L"HOTKEY_DEBUG_LOG")) {
+        g_state.hotkey.debugLoggingEnabled = *debugLoggingEnabled;
     }
     if (g_state.hotkey.vk == 0U) {
         g_state.hotkey.vk = VK_SPACE;
@@ -1494,6 +1519,9 @@ void RegisterLauncherHotkey() {
     g_state.launcherHotkeyArmed = false;
     if (RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk) == FALSE) {
         g_state.launcherHotkeyBackend = HotkeyBackend::KeyboardHook;
+        AppendHotkeyDebugLog(L"Launcher hotkey fell back to keyboard hook: " + FormatHotkeyConfig(g_state.hotkey));
+    } else {
+        AppendHotkeyDebugLog(L"Launcher hotkey registered via RegisterHotKey: " + FormatHotkeyConfig(g_state.hotkey));
     }
 }
 
@@ -1522,6 +1550,9 @@ void RegisterManagedHotkeys() {
         hotkey.armed = false;
         if (RegisterHotKey(g_state.hostWindow, hotkey.id, hotkey.hotkey.modifiers, hotkey.hotkey.vk) == FALSE) {
             hotkey.backend = HotkeyBackend::KeyboardHook;
+            AppendHotkeyDebugLog(L"Managed hotkey fell back to keyboard hook: " + hotkey.spec + L" -> " + hotkey.item.commandLine);
+        } else {
+            AppendHotkeyDebugLog(L"Managed hotkey registered via RegisterHotKey: " + hotkey.spec + L" -> " + hotkey.item.commandLine);
         }
     }
 }
@@ -1547,6 +1578,43 @@ void AddKeyboardHookRegistrationFailures(DWORD errorCode) {
             AddHotkeyRegistrationFailure(L"Managed hotkey", hotkey.spec, errorCode);
         }
     }
+}
+
+MonitoredConfigFile BuildMonitoredConfigFile(const wchar_t* fileName) {
+    MonitoredConfigFile file {};
+    file.fileName = fileName;
+    file.path = FindConfigPath(fileName);
+
+    std::error_code error;
+    file.exists = std::filesystem::exists(file.path, error);
+    if (!error && file.exists) {
+        file.lastWriteTime = std::filesystem::last_write_time(file.path, error);
+        if (error) {
+            file.exists = false;
+            file.lastWriteTime = {};
+        }
+    }
+    return file;
+}
+
+void RefreshMonitoredConfigFiles() {
+    g_state.monitoredConfigFiles[0] = BuildMonitoredConfigFile(kConfigFileName);
+    g_state.monitoredConfigFiles[1] = BuildMonitoredConfigFile(kCommandFileName);
+}
+
+bool DidMonitoredConfigFilesChange() {
+    for (MonitoredConfigFile& monitored : g_state.monitoredConfigFiles) {
+        MonitoredConfigFile current = BuildMonitoredConfigFile(monitored.fileName);
+        const bool changed =
+            current.path != monitored.path ||
+            current.exists != monitored.exists ||
+            (current.exists && monitored.exists && current.lastWriteTime != monitored.lastWriteTime);
+        if (changed) {
+            monitored = std::move(current);
+            return true;
+        }
+    }
+    return false;
 }
 
 void InjectWindowsKeyUp(DWORD vkCode) {
@@ -1592,6 +1660,7 @@ bool HandleHookHotkeyKeyDown(DWORD vkCode) {
         suppress = true;
         if (!g_state.launcherHotkeyArmed) {
             g_state.launcherHotkeyArmed = true;
+            AppendHotkeyDebugLog(L"Keyboard hook matched launcher hotkey: " + FormatHotkeyConfig(g_state.hotkey));
             PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_LAUNCH, 0);
         }
         if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
@@ -1610,6 +1679,7 @@ bool HandleHookHotkeyKeyDown(DWORD vkCode) {
         suppress = true;
         if (!hotkey.armed) {
             hotkey.armed = true;
+            AppendHotkeyDebugLog(L"Keyboard hook matched managed hotkey: " + hotkey.spec + L" -> " + hotkey.item.commandLine);
             PostMessageW(g_state.hostWindow, WM_HOTKEY, hotkey.id, 0);
         }
         if ((hotkey.hotkey.modifiers & MOD_WIN) != 0U) {
@@ -1647,12 +1717,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
 void ConfigureKeyboardHook() {
     UninstallKeyboardHook();
     if (!AnyHotkeysUseKeyboardHook()) {
+        AppendHotkeyDebugLog(L"Keyboard hook not needed.");
         return;
     }
 
     g_state.keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_state.instance, 0);
     if (g_state.keyboardHook == nullptr) {
         AddKeyboardHookRegistrationFailures(GetLastError());
+        AppendHotkeyDebugLog(L"Failed to install keyboard hook.");
+    } else {
+        AppendHotkeyDebugLog(L"Installed low-level keyboard hook.");
     }
 }
 
@@ -1847,6 +1921,20 @@ bool EnsureParentDirectoryForFile(const std::wstring& path) {
     }
     std::filesystem::create_directories(directory, error);
     return !error;
+}
+
+void AppendUtf8TextFile(const std::wstring& path, std::wstring_view content) {
+    if (!EnsureParentDirectoryForFile(path)) {
+        return;
+    }
+
+    std::wofstream stream(path, std::ios::app);
+    if (!stream.is_open()) {
+        return;
+    }
+
+    stream.imbue(std::locale(".UTF-8"));
+    stream << content;
 }
 
 bool EnsureFileExists(const std::wstring& path) {
@@ -2111,6 +2199,32 @@ std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey) {
     return text;
 }
 
+void AppendHotkeyDebugLog(std::wstring_view line) {
+    if (!g_state.hotkey.debugLoggingEnabled) {
+        return;
+    }
+
+    SYSTEMTIME localTime {};
+    GetLocalTime(&localTime);
+
+    wchar_t prefix[64] {};
+    swprintf_s(
+        prefix,
+        L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+        localTime.wYear,
+        localTime.wMonth,
+        localTime.wDay,
+        localTime.wHour,
+        localTime.wMinute,
+        localTime.wSecond,
+        localTime.wMilliseconds);
+
+    std::wstring message = prefix;
+    message += line;
+    message += L"\n";
+    AppendUtf8TextFile(GetHotkeyDebugLogPath(), message);
+}
+
 std::wstring DescribeSystemError(DWORD errorCode) {
     if (errorCode == 0) {
         return L"Unknown error.";
@@ -2216,6 +2330,9 @@ bool LaunchProcessCommand(
     const DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | priorityClass | extraCreationFlags;
     const BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, creationFlags, nullptr, workingDirectory, &startupInfo, &processInfo);
     if (ok == FALSE) {
+        if (showCommand == SW_HIDE) {
+            return false;
+        }
         SHELLEXECUTEINFOW executeInfo {};
         executeInfo.cbSize = sizeof(executeInfo);
         executeInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -3137,9 +3254,15 @@ void LoadCronTasks() {
             if (hasPropertyBlock) {
                 ++index;
                 ApplyCommandPropertyBlock(task.item, cronLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             } else if (index + 1 < cronLines.size() && Trim(cronLines[index + 1]) == L"{") {
                 index += 2;
                 ApplyCommandPropertyBlock(task.item, cronLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             }
 
             g_state.cronTasks.push_back(std::move(task));
@@ -3193,9 +3316,15 @@ void LoadManagedHotkeys() {
             if (hasPropertyBlock) {
                 ++index;
                 ApplyCommandPropertyBlock(hotkeyEntry.item, hotkeyLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             } else if (index + 1 < hotkeyLines.size() && Trim(hotkeyLines[index + 1]) == L"{") {
                 index += 2;
                 ApplyCommandPropertyBlock(hotkeyEntry.item, hotkeyLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             }
 
             PopulateSearchFields(hotkeyEntry.item);
@@ -3203,6 +3332,7 @@ void LoadManagedHotkeys() {
                 hotkeyEntry.item.sourceKind,
                 BuildCommandIdentity(hotkeyEntry.item),
                 hotkeyEntry.item.workingDirectory);
+            AppendHotkeyDebugLog(L"Loaded managed hotkey: " + hotkeyEntry.spec + L" -> " + hotkeyEntry.item.commandLine);
             g_state.managedHotkeys.push_back(std::move(hotkeyEntry));
         }
     }
@@ -3238,9 +3368,15 @@ void RunStartupCommands() {
             if (hasPropertyBlock) {
                 ++index;
                 ApplyCommandPropertyBlock(item, startupLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             } else if (index + 1 < startupLines.size() && Trim(startupLines[index + 1]) == L"{") {
                 index += 2;
                 ApplyCommandPropertyBlock(item, startupLines, &index);
+                if (index > 0) {
+                    --index;
+                }
             }
 
             if (item.inlineBatchScript.empty()) {
@@ -3278,6 +3414,12 @@ void RunCronTasks() {
 void StartCronTimer() {
     if (g_state.hostWindow != nullptr) {
         SetTimer(g_state.hostWindow, kCronTimerId, kCronTimerIntervalMs, nullptr);
+    }
+}
+
+void StartConfigWatchTimer() {
+    if (g_state.hostWindow != nullptr) {
+        SetTimer(g_state.hostWindow, kConfigWatchTimerId, kConfigWatchTimerIntervalMs, nullptr);
     }
 }
 
@@ -3859,7 +4001,35 @@ void RecordSuccessfulLaunch(const LaunchItem& item) {
     }
 }
 
+void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
+    LoadHotkeyConfig();
+    AppendHotkeyDebugLog(L"Reloading configuration.");
+    LoadHistoryConfig();
+    LoadLauncherAppearanceConfig();
+    LoadCommandVariables();
+    LoadCommandItems(false);
+    LoadCronTasks();
+    LoadManagedHotkeys();
+    RefreshMonitoredConfigFiles();
+    UpdateUiFont(g_state.dpi);
+    g_state.hotkeyRegistrationFailures.clear();
+    RegisterLauncherHotkey();
+    RegisterManagedHotkeys();
+    ConfigureKeyboardHook();
+    ShowHotkeyRegistrationFailures();
+    ApplyLauncherAppearance();
+    ApplyFont(g_state.searchEdit, g_state.searchFont);
+    ApplyFont(g_state.resultList, g_state.resultFont);
+    ApplyFont(g_state.descriptionText, g_state.descriptionFont);
+    LayoutLauncher();
+    RequestLauncherDataRefresh(true, true);
+    if (hideLauncherOnSuccess) {
+        HideLauncher();
+    }
+}
+
 bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
+    AppendHotkeyDebugLog(L"Launching item: " + item.name + L" | command=" + item.commandLine);
     if (item.sourceKind == ItemSourceKind::Synthetic) {
         const std::wstring command = Lowercase(item.commandLine);
         bool success = false;
@@ -3867,26 +4037,7 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
             PostMessageW(g_state.hostWindow, WM_CLOSE, 0, 0);
             success = true;
         } else if (command == L"builtin:reload") {
-            LoadHotkeyConfig();
-            LoadHistoryConfig();
-            LoadLauncherAppearanceConfig();
-            LoadCommandVariables();
-            LoadCommandItems(false);
-            LoadCronTasks();
-            LoadManagedHotkeys();
-            UpdateUiFont(g_state.dpi);
-            g_state.hotkeyRegistrationFailures.clear();
-            RegisterLauncherHotkey();
-            RegisterManagedHotkeys();
-            ConfigureKeyboardHook();
-            ShowHotkeyRegistrationFailures();
-            ApplyLauncherAppearance();
-            ApplyFont(g_state.searchEdit, g_state.searchFont);
-            ApplyFont(g_state.resultList, g_state.resultFont);
-            ApplyFont(g_state.descriptionText, g_state.descriptionFont);
-            LayoutLauncher();
-            RequestLauncherDataRefresh(true, true);
-            HideLauncher();
+            ReloadAllConfiguration(hideLauncherOnSuccess);
             success = true;
         } else if (command == L"builtin:reboot") {
             const int response = MessageBoxW(
@@ -4100,11 +4251,13 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_HOTKEY) {
         if (wParam == ID_HOTKEY_LAUNCH) {
+            AppendHotkeyDebugLog(L"Received WM_HOTKEY for launcher.");
             ShowLauncher();
             return 0;
         }
         for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
             if (wParam == hotkey.id) {
+                AppendHotkeyDebugLog(L"Received WM_HOTKEY for managed hotkey: " + hotkey.spec);
                 LaunchConfiguredItem(hotkey.item, true);
                 return 0;
             }
@@ -4112,6 +4265,12 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
     if (message == WM_TIMER && wParam == kCronTimerId) {
         RunCronTasks();
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kConfigWatchTimerId) {
+        if (DidMonitoredConfigFilesChange()) {
+            ReloadAllConfiguration(false);
+        }
         return 0;
     }
     if (message == kMessageRefreshLauncherData) {
@@ -4204,6 +4363,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCommandItems(false);
     LoadCronTasks();
     LoadManagedHotkeys();
+    RefreshMonitoredConfigFiles();
 
     if (!InitializeWindows()) {
         if (comInitialized) {
@@ -4222,6 +4382,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     RunCronTasks();
     StartCronTimer();
+    StartConfigWatchTimer();
     RequestLauncherDataRefresh(true, true);
 
     MSG message {};
