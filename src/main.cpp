@@ -81,6 +81,11 @@ enum class RunningProcessPolicy {
     QueueOnce,
 };
 
+enum class HotkeyBackend {
+    RegisterHotKey,
+    KeyboardHook,
+};
+
 struct LaunchItem {
     std::wstring name;
     std::wstring commandLine;
@@ -114,6 +119,21 @@ struct CronTask {
     int queuedLaunchCount = 0;
 };
 
+struct ManagedHotkey {
+    UINT id = 0;
+    std::wstring spec;
+    HotkeyConfig hotkey {};
+    HotkeyBackend backend = HotkeyBackend::RegisterHotKey;
+    bool armed = false;
+    LaunchItem item;
+};
+
+struct HotkeyRegistrationFailure {
+    std::wstring label;
+    std::wstring spec;
+    DWORD errorCode = 0;
+};
+
 struct SearchQueryState {
     std::wstring rawQuery;
     std::wstring normalizedQuery;
@@ -138,6 +158,7 @@ struct ScanDirectoryConfig {
 
 struct AppState {
     HINSTANCE instance = nullptr;
+    HHOOK keyboardHook = nullptr;
     HWND hostWindow = nullptr;
     HWND launcherWindow = nullptr;
     HWND searchEdit = nullptr;
@@ -149,6 +170,9 @@ struct AppState {
     HFONT descriptionFont = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
+    HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    bool launcherHotkeyArmed = false;
+    bool suppressHookWinKeyUp = false;
     std::vector<ScanDirectoryConfig> scanDirectories;
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
@@ -158,6 +182,8 @@ struct AppState {
     std::unordered_map<std::wstring, LaunchItem> commandItemsByName;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
     std::vector<CronTask> cronTasks;
+    std::vector<ManagedHotkey> managedHotkeys;
+    std::vector<HotkeyRegistrationFailure> hotkeyRegistrationFailures;
     SearchQueryState lastSearch {};
     ULONGLONG lastSearchInputTick = 0;
     bool deferredRefreshArmed = false;
@@ -186,6 +212,7 @@ constexpr UINT kVisibilityTimerIntervalMs = 100;
 constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
 constexpr UINT kCronTimerIntervalMs = 30 * 1000;
 constexpr DWORD kCronRestartTerminateWaitMs = 5000;
+constexpr ULONG_PTR kInjectedHotkeyExtraInfo = 0x44524E484B455955ULL;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
@@ -238,6 +265,11 @@ void RequestResultListRebuild();
 void CancelDeferredRefresh();
 void RecordSearchInputActivity();
 void LoadCronTasks();
+void LoadManagedHotkeys();
+std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey);
+void AddHotkeyRegistrationFailure(std::wstring label, std::wstring spec, DWORD errorCode);
+void ShowHotkeyRegistrationFailures();
+void ConfigureKeyboardHook();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
 bool LaunchProcessCommand(
     std::wstring_view commandLineText,
@@ -1425,9 +1457,203 @@ void LoadCommandVariables() {
     }
 }
 
+bool IsModifierDown(UINT genericVk, UINT leftVk, UINT rightVk) {
+    return (GetAsyncKeyState(static_cast<int>(genericVk)) & 0x8000) != 0 ||
+        (GetAsyncKeyState(static_cast<int>(leftVk)) & 0x8000) != 0 ||
+        (GetAsyncKeyState(static_cast<int>(rightVk)) & 0x8000) != 0;
+}
+
+bool IsWindowsKeyDown() {
+    return (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+}
+
+bool AreHotkeyModifiersPressed(UINT modifiers) {
+    const bool ctrlDown = IsModifierDown(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+    const bool altDown = IsModifierDown(VK_MENU, VK_LMENU, VK_RMENU);
+    const bool shiftDown = IsModifierDown(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+    const bool winDown = IsWindowsKeyDown();
+
+    return ctrlDown == ((modifiers & MOD_CONTROL) != 0U) &&
+        altDown == ((modifiers & MOD_ALT) != 0U) &&
+        shiftDown == ((modifiers & MOD_SHIFT) != 0U) &&
+        winDown == ((modifiers & MOD_WIN) != 0U);
+}
+
+bool AnyHotkeysUseKeyboardHook() {
+    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook) {
+        return true;
+    }
+    return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [](const ManagedHotkey& hotkey) {
+        return hotkey.backend == HotkeyBackend::KeyboardHook;
+    });
+}
+
 void RegisterLauncherHotkey() {
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
-    RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk);
+    g_state.launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    g_state.launcherHotkeyArmed = false;
+    if (RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk) == FALSE) {
+        g_state.launcherHotkeyBackend = HotkeyBackend::KeyboardHook;
+    }
+}
+
+void UnregisterManagedHotkeys() {
+    if (g_state.hostWindow == nullptr) {
+        return;
+    }
+
+    for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
+        if (hotkey.id != 0U) {
+            UnregisterHotKey(g_state.hostWindow, hotkey.id);
+        }
+    }
+}
+
+void RegisterManagedHotkeys() {
+    UnregisterManagedHotkeys();
+    if (g_state.hostWindow == nullptr) {
+        return;
+    }
+
+    for (size_t index = 0; index < g_state.managedHotkeys.size(); ++index) {
+        ManagedHotkey& hotkey = g_state.managedHotkeys[index];
+        hotkey.id = ID_HOTKEY_COMMAND_BASE + static_cast<UINT>(index);
+        hotkey.backend = HotkeyBackend::RegisterHotKey;
+        hotkey.armed = false;
+        if (RegisterHotKey(g_state.hostWindow, hotkey.id, hotkey.hotkey.modifiers, hotkey.hotkey.vk) == FALSE) {
+            hotkey.backend = HotkeyBackend::KeyboardHook;
+        }
+    }
+}
+
+void UninstallKeyboardHook() {
+    if (g_state.keyboardHook != nullptr) {
+        UnhookWindowsHookEx(g_state.keyboardHook);
+        g_state.keyboardHook = nullptr;
+    }
+    g_state.launcherHotkeyArmed = false;
+    g_state.suppressHookWinKeyUp = false;
+    for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
+        hotkey.armed = false;
+    }
+}
+
+void AddKeyboardHookRegistrationFailures(DWORD errorCode) {
+    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook) {
+        AddHotkeyRegistrationFailure(L"Launcher hotkey", FormatHotkeyConfig(g_state.hotkey), errorCode);
+    }
+    for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
+        if (hotkey.backend == HotkeyBackend::KeyboardHook) {
+            AddHotkeyRegistrationFailure(L"Managed hotkey", hotkey.spec, errorCode);
+        }
+    }
+}
+
+void InjectWindowsKeyUp(DWORD vkCode) {
+    INPUT input {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vkCode);
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    input.ki.dwExtraInfo = kInjectedHotkeyExtraInfo;
+    SendInput(1, &input, sizeof(input));
+}
+
+bool HandleHookHotkeyKeyRelease(DWORD vkCode) {
+    bool suppress = false;
+    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        g_state.launcherHotkeyArmed &&
+        vkCode == g_state.hotkey.vk) {
+        g_state.launcherHotkeyArmed = false;
+    }
+
+    for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
+        if (hotkey.backend == HotkeyBackend::KeyboardHook &&
+            hotkey.armed &&
+            vkCode == hotkey.hotkey.vk) {
+            hotkey.armed = false;
+        }
+    }
+
+    if (g_state.suppressHookWinKeyUp && (vkCode == VK_LWIN || vkCode == VK_RWIN)) {
+        g_state.suppressHookWinKeyUp = false;
+        InjectWindowsKeyUp(vkCode);
+        suppress = true;
+    }
+
+    return suppress;
+}
+
+bool HandleHookHotkeyKeyDown(DWORD vkCode) {
+    bool suppress = false;
+
+    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        vkCode == g_state.hotkey.vk &&
+        AreHotkeyModifiersPressed(g_state.hotkey.modifiers)) {
+        suppress = true;
+        if (!g_state.launcherHotkeyArmed) {
+            g_state.launcherHotkeyArmed = true;
+            PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_LAUNCH, 0);
+        }
+        if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
+            g_state.suppressHookWinKeyUp = true;
+        }
+    }
+
+    for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
+        if (hotkey.backend != HotkeyBackend::KeyboardHook || vkCode != hotkey.hotkey.vk) {
+            continue;
+        }
+        if (!AreHotkeyModifiersPressed(hotkey.hotkey.modifiers)) {
+            continue;
+        }
+
+        suppress = true;
+        if (!hotkey.armed) {
+            hotkey.armed = true;
+            PostMessageW(g_state.hostWindow, WM_HOTKEY, hotkey.id, 0);
+        }
+        if ((hotkey.hotkey.modifiers & MOD_WIN) != 0U) {
+            g_state.suppressHookWinKeyUp = true;
+        }
+    }
+
+    return suppress;
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code < 0 || lParam == 0) {
+        return CallNextHookEx(g_state.keyboardHook, code, wParam, lParam);
+    }
+
+    const KBDLLHOOKSTRUCT* hookData = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    if (hookData->dwExtraInfo == kInjectedHotkeyExtraInfo) {
+        return CallNextHookEx(g_state.keyboardHook, code, wParam, lParam);
+    }
+    const DWORD vkCode = hookData->vkCode;
+
+    bool suppress = false;
+    if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+        suppress = HandleHookHotkeyKeyRelease(vkCode);
+    } else if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+        suppress = HandleHookHotkeyKeyDown(vkCode);
+    }
+
+    if (suppress) {
+        return 1;
+    }
+    return CallNextHookEx(g_state.keyboardHook, code, wParam, lParam);
+}
+
+void ConfigureKeyboardHook() {
+    UninstallKeyboardHook();
+    if (!AnyHotkeysUseKeyboardHook()) {
+        return;
+    }
+
+    g_state.keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_state.instance, 0);
+    if (g_state.keyboardHook == nullptr) {
+        AddKeyboardHookRegistrationFailures(GetLastError());
+    }
 }
 
 std::wstring NormalizeExtension(std::wstring value) {
@@ -1711,6 +1937,239 @@ bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = n
     const std::wstring commandLine = L"cmd.exe /c " + QuoteCommandLineArgument(batchPath);
     const DWORD extraCreationFlags = item.showCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
     return LaunchProcessCommand(commandLine, item.workingDirectory, item.showCommand, item.priorityClass, extraCreationFlags, launchedProcess);
+}
+
+std::optional<UINT> ParseHotkeyVirtualKey(std::wstring_view text) {
+    const std::wstring value = Uppercase(Trim(text));
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    if (value.size() == 1) {
+        const wchar_t ch = value.front();
+        if ((ch >= L'A' && ch <= L'Z') || (ch >= L'0' && ch <= L'9')) {
+            return static_cast<UINT>(ch);
+        }
+    }
+
+    if (value[0] == L'F' && value.size() <= 3) {
+        const int functionIndex = _wtoi(value.c_str() + 1);
+        if (functionIndex >= 1 && functionIndex <= 24) {
+            return static_cast<UINT>(VK_F1 + functionIndex - 1);
+        }
+    }
+
+    static const std::unordered_map<std::wstring, UINT> kNamedVirtualKeys = {
+        { L"SPACE", VK_SPACE },
+        { L"TAB", VK_TAB },
+        { L"ENTER", VK_RETURN },
+        { L"RETURN", VK_RETURN },
+        { L"ESC", VK_ESCAPE },
+        { L"ESCAPE", VK_ESCAPE },
+        { L"UP", VK_UP },
+        { L"DOWN", VK_DOWN },
+        { L"LEFT", VK_LEFT },
+        { L"RIGHT", VK_RIGHT },
+        { L"HOME", VK_HOME },
+        { L"END", VK_END },
+        { L"PGUP", VK_PRIOR },
+        { L"PRIOR", VK_PRIOR },
+        { L"PAGEUP", VK_PRIOR },
+        { L"PGDN", VK_NEXT },
+        { L"NEXTPAGE", VK_NEXT },
+        { L"PAGEDOWN", VK_NEXT },
+        { L"INSERT", VK_INSERT },
+        { L"INS", VK_INSERT },
+        { L"DELETE", VK_DELETE },
+        { L"DEL", VK_DELETE },
+        { L"BACKSPACE", VK_BACK },
+        { L"BS", VK_BACK },
+        { L"CAPSLOCK", VK_CAPITAL },
+        { L"PRINTSCREEN", VK_SNAPSHOT },
+        { L"PRTSC", VK_SNAPSHOT },
+        { L"SCROLLLOCK", VK_SCROLL },
+        { L"PAUSE", VK_PAUSE },
+        { L"APPS", VK_APPS },
+    };
+
+    const auto it = kNamedVirtualKeys.find(value);
+    if (it == kNamedVirtualKeys.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+bool ParseManagedHotkeySpec(std::wstring_view text, HotkeyConfig* hotkey) {
+    if (hotkey == nullptr) {
+        return false;
+    }
+
+    const std::wstring trimmed = Trim(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    UINT modifiers = 0;
+    size_t index = 0;
+    while (index < trimmed.size()) {
+        const wchar_t ch = trimmed[index];
+        UINT modifier = 0;
+        if (ch == L'^') {
+            modifier = MOD_CONTROL;
+        } else if (ch == L'!') {
+            modifier = MOD_ALT;
+        } else if (ch == L'+') {
+            modifier = MOD_SHIFT;
+        } else if (ch == L'@') {
+            modifier = MOD_WIN;
+        } else {
+            break;
+        }
+        modifiers |= modifier;
+        ++index;
+    }
+
+    const std::optional<UINT> vk = ParseHotkeyVirtualKey(trimmed.substr(index));
+    if (!vk || *vk == 0U) {
+        return false;
+    }
+
+    hotkey->modifiers = modifiers;
+    hotkey->vk = *vk;
+    return true;
+}
+
+std::wstring FormatHotkeyVirtualKey(UINT vk) {
+    if ((vk >= L'A' && vk <= L'Z') || (vk >= L'0' && vk <= L'9')) {
+        return std::wstring(1, static_cast<wchar_t>(vk));
+    }
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        return L"F" + std::to_wstring(vk - VK_F1 + 1);
+    }
+
+    switch (vk) {
+    case VK_SPACE:
+        return L"SPACE";
+    case VK_TAB:
+        return L"TAB";
+    case VK_RETURN:
+        return L"ENTER";
+    case VK_ESCAPE:
+        return L"ESC";
+    case VK_UP:
+        return L"UP";
+    case VK_DOWN:
+        return L"DOWN";
+    case VK_LEFT:
+        return L"LEFT";
+    case VK_RIGHT:
+        return L"RIGHT";
+    case VK_HOME:
+        return L"HOME";
+    case VK_END:
+        return L"END";
+    case VK_PRIOR:
+        return L"PGUP";
+    case VK_NEXT:
+        return L"PGDN";
+    case VK_INSERT:
+        return L"INSERT";
+    case VK_DELETE:
+        return L"DELETE";
+    case VK_BACK:
+        return L"BACKSPACE";
+    case VK_CAPITAL:
+        return L"CAPSLOCK";
+    case VK_SNAPSHOT:
+        return L"PRTSC";
+    case VK_SCROLL:
+        return L"SCROLLLOCK";
+    case VK_PAUSE:
+        return L"PAUSE";
+    case VK_APPS:
+        return L"APPS";
+    default:
+        return L"VK(" + std::to_wstring(vk) + L")";
+    }
+}
+
+std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey) {
+    std::wstring text;
+    if ((hotkey.modifiers & MOD_CONTROL) != 0U) {
+        text += L"^";
+    }
+    if ((hotkey.modifiers & MOD_ALT) != 0U) {
+        text += L"!";
+    }
+    if ((hotkey.modifiers & MOD_SHIFT) != 0U) {
+        text += L"+";
+    }
+    if ((hotkey.modifiers & MOD_WIN) != 0U) {
+        text += L"@";
+    }
+    text += FormatHotkeyVirtualKey(hotkey.vk);
+    return text;
+}
+
+std::wstring DescribeSystemError(DWORD errorCode) {
+    if (errorCode == 0) {
+        return L"Unknown error.";
+    }
+
+    LPWSTR buffer = nullptr;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD length = FormatMessageW(flags, nullptr, errorCode, 0, reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+    std::wstring message;
+    if (length > 0 && buffer != nullptr) {
+        message.assign(buffer, length);
+        while (!message.empty() && (message.back() == L'\r' || message.back() == L'\n' || iswspace(message.back()) != 0)) {
+            message.pop_back();
+        }
+        LocalFree(buffer);
+    }
+    if (message.empty()) {
+        message = L"Error code " + std::to_wstring(errorCode);
+    } else {
+        message += L" (code ";
+        message += std::to_wstring(errorCode);
+        message += L")";
+    }
+    return message;
+}
+
+void AddHotkeyRegistrationFailure(std::wstring label, std::wstring spec, DWORD errorCode) {
+    HotkeyRegistrationFailure failure {};
+    failure.label = std::move(label);
+    failure.spec = std::move(spec);
+    failure.errorCode = errorCode;
+    g_state.hotkeyRegistrationFailures.push_back(std::move(failure));
+}
+
+void ShowHotkeyRegistrationFailures() {
+    if (g_state.hotkeyRegistrationFailures.empty()) {
+        return;
+    }
+
+    std::wstring message = L"Some hotkeys could not be registered.\n\n";
+    for (const HotkeyRegistrationFailure& failure : g_state.hotkeyRegistrationFailures) {
+        message += L"- ";
+        message += failure.label;
+        if (!failure.spec.empty()) {
+            message += L" [";
+            message += failure.spec;
+            message += L"]";
+        }
+        message += L": ";
+        message += DescribeSystemError(failure.errorCode);
+        message += L"\n";
+    }
+    message += L"\nThis usually means the hotkey is already occupied by another program.";
+
+    MessageBoxW(
+        g_state.launcherWindow != nullptr ? g_state.launcherWindow : g_state.hostWindow,
+        message.c_str(),
+        L"DoRun Hotkey Registration",
+        MB_OK | MB_ICONWARNING);
 }
 
 bool RunShellCommand(const wchar_t* file, const wchar_t* parameters, int showCommand = SW_HIDE) {
@@ -2562,6 +3021,10 @@ void LoadCommandItems(bool appendToResultItems = true) {
             SkipCommandBlock(stream);
             continue;
         }
+        if (IsCommandBlockStart(trimmedLine, L"HOTKEY") || IsCommandBlockStart(trimmedLine, L"HOTKEYS")) {
+            SkipCommandBlock(stream);
+            continue;
+        }
 
         std::vector<std::wstring> fields = SplitCommandFields(trimmedLine);
         if (fields.size() < 2) {
@@ -2680,6 +3143,67 @@ void LoadCronTasks() {
             }
 
             g_state.cronTasks.push_back(std::move(task));
+        }
+    }
+}
+
+void LoadManagedHotkeys() {
+    UnregisterManagedHotkeys();
+    g_state.managedHotkeys.clear();
+
+    std::wifstream stream(FindConfigPath(kCommandFileName));
+    if (!stream.is_open()) {
+        return;
+    }
+    stream.imbue(std::locale(".UTF-8"));
+
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        const std::wstring trimmedLine = Trim(line);
+        if (IsCommandCommentLine(trimmedLine) ||
+            (!IsCommandBlockStart(trimmedLine, L"HOTKEY") && !IsCommandBlockStart(trimmedLine, L"HOTKEYS"))) {
+            continue;
+        }
+
+        const std::vector<std::wstring> hotkeyLines = ReadNestedCommandBlock(stream);
+        for (size_t index = 0; index < hotkeyLines.size(); ++index) {
+            std::wstring hotkeyLine = Trim(hotkeyLines[index]);
+            if (IsCommandCommentLine(hotkeyLine)) {
+                continue;
+            }
+
+            const bool hasPropertyBlock = StripTrailingCommandPropertyBlockStart(&hotkeyLine);
+            const std::vector<std::wstring> fields = SplitCommandFields(hotkeyLine);
+            if (fields.size() < 2) {
+                continue;
+            }
+
+            ManagedHotkey hotkeyEntry {};
+            hotkeyEntry.spec = Trim(fields[0]);
+            if (!ParseManagedHotkeySpec(fields[0], &hotkeyEntry.hotkey)) {
+                continue;
+            }
+
+            hotkeyEntry.item.name = L"[Hotkey] " + Trim(fields[0]);
+            hotkeyEntry.item.sourceKind = ItemSourceKind::CommandConf;
+            const std::vector<std::wstring> commandFields(fields.begin() + 1, fields.end());
+            if (!ApplyCommandOptionsFromFields(hotkeyEntry.item, commandFields, 0)) {
+                continue;
+            }
+            if (hasPropertyBlock) {
+                ++index;
+                ApplyCommandPropertyBlock(hotkeyEntry.item, hotkeyLines, &index);
+            } else if (index + 1 < hotkeyLines.size() && Trim(hotkeyLines[index + 1]) == L"{") {
+                index += 2;
+                ApplyCommandPropertyBlock(hotkeyEntry.item, hotkeyLines, &index);
+            }
+
+            PopulateSearchFields(hotkeyEntry.item);
+            hotkeyEntry.item.itemKey = BuildItemKey(
+                hotkeyEntry.item.sourceKind,
+                BuildCommandIdentity(hotkeyEntry.item),
+                hotkeyEntry.item.workingDirectory);
+            g_state.managedHotkeys.push_back(std::move(hotkeyEntry));
         }
     }
 }
@@ -3335,12 +3859,7 @@ void RecordSuccessfulLaunch(const LaunchItem& item) {
     }
 }
 
-bool LaunchItemByIndex(size_t index) {
-    if (index >= g_state.items.size()) {
-        return false;
-    }
-
-    const LaunchItem& item = g_state.items[index];
+bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     if (item.sourceKind == ItemSourceKind::Synthetic) {
         const std::wstring command = Lowercase(item.commandLine);
         bool success = false;
@@ -3354,8 +3873,13 @@ bool LaunchItemByIndex(size_t index) {
             LoadCommandVariables();
             LoadCommandItems(false);
             LoadCronTasks();
+            LoadManagedHotkeys();
             UpdateUiFont(g_state.dpi);
+            g_state.hotkeyRegistrationFailures.clear();
             RegisterLauncherHotkey();
+            RegisterManagedHotkeys();
+            ConfigureKeyboardHook();
+            ShowHotkeyRegistrationFailures();
             ApplyLauncherAppearance();
             ApplyFont(g_state.searchEdit, g_state.searchFont);
             ApplyFont(g_state.resultList, g_state.resultFont);
@@ -3373,9 +3897,6 @@ bool LaunchItemByIndex(size_t index) {
             if (response == IDYES) {
                 success = RunShellCommand(L"shutdown.exe", L"/r /t 0");
             }
-            if (success) {
-                HideLauncher();
-            }
         } else if (command == L"builtin:poweroff") {
             const int response = MessageBoxW(
                 g_state.launcherWindow,
@@ -3385,31 +3906,20 @@ bool LaunchItemByIndex(size_t index) {
             if (response == IDYES) {
                 success = RunShellCommand(L"shutdown.exe", L"/s /t 0");
             }
-            if (success) {
-                HideLauncher();
-            }
         } else if (command == L"builtin:hibernate") {
             success = SuspendSystem(true);
-            if (success) {
-                HideLauncher();
-            }
         } else if (command == L"builtin:standby") {
             success = SuspendSystem(false);
-            if (success) {
-                HideLauncher();
-            }
         } else if (command == L"builtin:config") {
             const std::wstring path = GetWritableConfigPath(kConfigFileName);
             success = EnsureFileExists(path) && OpenPathWithConfiguredEditor(path);
-            if (success) {
-                HideLauncher();
-            }
         } else if (command == L"builtin:cmdconfig") {
             const std::wstring path = GetWritableConfigPath(kCommandFileName);
             success = EnsureFileExists(path) && OpenPathWithConfiguredEditor(path);
-            if (success) {
-                HideLauncher();
-            }
+        }
+
+        if (success && hideLauncherOnSuccess) {
+            HideLauncher();
         }
         return success;
     }
@@ -3423,8 +3933,19 @@ bool LaunchItemByIndex(size_t index) {
     }
 
     RecordSuccessfulLaunch(item);
-    HideLauncher();
+    if (hideLauncherOnSuccess) {
+        HideLauncher();
+    }
     return true;
+}
+
+bool LaunchItemByIndex(size_t index) {
+    if (index >= g_state.items.size()) {
+        return false;
+    }
+
+    const LaunchItem& item = g_state.items[index];
+    return LaunchConfiguredItem(item, true);
 }
 
 void LaunchSelectedItem() {
@@ -3577,9 +4098,17 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
 }
 
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_HOTKEY && wParam == ID_HOTKEY_LAUNCH) {
-        ShowLauncher();
-        return 0;
+    if (message == WM_HOTKEY) {
+        if (wParam == ID_HOTKEY_LAUNCH) {
+            ShowLauncher();
+            return 0;
+        }
+        for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
+            if (wParam == hotkey.id) {
+                LaunchConfiguredItem(hotkey.item, true);
+                return 0;
+            }
+        }
     }
     if (message == WM_TIMER && wParam == kCronTimerId) {
         RunCronTasks();
@@ -3674,6 +4203,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCommandVariables();
     LoadCommandItems(false);
     LoadCronTasks();
+    LoadManagedHotkeys();
 
     if (!InitializeWindows()) {
         if (comInitialized) {
@@ -3682,7 +4212,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    g_state.hotkeyRegistrationFailures.clear();
     RegisterLauncherHotkey();
+    RegisterManagedHotkeys();
+    ConfigureKeyboardHook();
+    ShowHotkeyRegistrationFailures();
     if (ShouldRunStartupCommands()) {
         RunStartupCommands();
     }
@@ -3697,6 +4231,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
+    UnregisterManagedHotkeys();
+    UninstallKeyboardHook();
     CloseCronTaskProcessHandles();
     if (g_state.searchFont != nullptr) {
         DeleteObject(g_state.searchFont);
