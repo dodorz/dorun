@@ -268,6 +268,7 @@ constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
 constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
     { L"/quit", L"Exit DoRun", L"quit" },
     { L"/reload", L"Reload configuration files", L"reload" },
+    { L"/kill", L"Terminate a process by image name", L"kill" },
     { L"/reboot", L"Restart the computer", L"reboot" },
     { L"/poweroff", L"Shut down the computer", L"poweroff" },
     { L"/hibernate", L"Hibernate the computer", L"hibernate" },
@@ -4118,6 +4119,45 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     return true;
 }
 
+bool LaunchBuiltinQueryCommand(std::wstring_view query) {
+    const std::wstring trimmedQuery = Trim(query);
+    if (trimmedQuery.empty() || trimmedQuery.front() != L'/') {
+        return false;
+    }
+
+    std::wstring_view commandText(trimmedQuery);
+    commandText.remove_prefix(1);
+    commandText = Trim(commandText);
+    if (commandText.empty()) {
+        return false;
+    }
+
+    const size_t commandEnd = commandText.find_first_of(L" \t");
+    const std::wstring commandName = Lowercase(std::wstring(commandText.substr(0, commandEnd)));
+    if (commandName != L"kill") {
+        return false;
+    }
+
+    std::wstring_view arguments = commandEnd == std::wstring_view::npos ? std::wstring_view {} : Trim(commandText.substr(commandEnd + 1));
+    if (arguments.empty()) {
+        return false;
+    }
+
+    std::wstring imageName(arguments);
+    if (!imageName.ends_with(L".exe")) {
+        imageName += L".exe";
+    }
+
+    std::wstring parameters = L"/im ";
+    parameters += QuoteCommandLineArgument(imageName);
+    parameters += L" /f";
+    const bool launched = LaunchProcessCommand(L"taskkill.exe " + parameters, L"", SW_HIDE, NORMAL_PRIORITY_CLASS);
+    if (launched) {
+        HideLauncher();
+    }
+    return launched;
+}
+
 bool LaunchItemByIndex(size_t index) {
     if (index >= g_state.items.size()) {
         return false;
@@ -4179,7 +4219,9 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
             return 0;
         }
         if (wParam == VK_RETURN) {
-            LaunchSelectedItem();
+            if (!LaunchBuiltinQueryCommand(GetControlText(g_state.searchEdit))) {
+                LaunchSelectedItem();
+            }
             return 0;
         }
         if (wParam == VK_ESCAPE) {
