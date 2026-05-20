@@ -8,20 +8,31 @@ set "CONFIG=StaticRelease"
 set "PLATFORM=x64"
 set "MSBUILD_EXE="
 set "PROCESS_NAME=DoRun.exe"
+set "BUILD_ALL=1"
 
 if /I "%~1"=="Debug" (
     set "PROFILE=Debug"
     set "CONFIG=Debug"
+    set "BUILD_ALL="
 )
 if /I "%~1"=="Release" (
     set "PROFILE=Release"
     set "CONFIG=Release"
+    set "BUILD_ALL="
 )
 if /I "%~1"=="StaticRelease" (
     set "PROFILE=StaticRelease"
     set "CONFIG=StaticRelease"
+    set "BUILD_ALL="
 )
-if not "%~2"=="" set "PLATFORM=%~2"
+if not "%BUILD_ALL%"=="" (
+    if not "%~1"=="" set "BUILD_ALL="
+)
+if not "%BUILD_ALL%"=="" (
+    if not "%~2"=="" set "PLATFORM=%~2"
+) else (
+    if not "%~2"=="" set "PLATFORM=%~2"
+)
 
 call :find_msbuild
 if errorlevel 1 goto :fail
@@ -30,9 +41,17 @@ call :stop_running_process
 if errorlevel 1 goto :fail
 
 echo Using MSBuild: %MSBUILD_EXE%
-echo Building %PROFILE% (%CONFIG% / %PLATFORM%) from %SOLUTION%
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%scripts\invoke_msbuild.ps1" -Msbuild "%MSBUILD_EXE%" -Solution "%SOLUTION%" -Configuration "%CONFIG%" -Platform "%PLATFORM%"
-if errorlevel 1 goto :fail
+if not "%BUILD_ALL%"=="" (
+    call :build_config Release
+    if errorlevel 1 goto :fail
+    call :build_config Debug
+    if errorlevel 1 goto :fail
+    call :build_config StaticRelease
+    if errorlevel 1 goto :fail
+) else (
+    call :build_config %CONFIG%
+    if errorlevel 1 goto :fail
+)
 
 echo.
 echo Build succeeded.
@@ -70,6 +89,12 @@ exit /b 1
 
 :msbuild_found
 exit /b 0
+
+:build_config
+set "CURRENT_CONFIG=%~1"
+echo Building %CURRENT_CONFIG% (%CURRENT_CONFIG% / %PLATFORM%) from %SOLUTION%
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%scripts\invoke_msbuild.ps1" -Msbuild "%MSBUILD_EXE%" -Solution "%SOLUTION%" -Configuration "%CURRENT_CONFIG%" -Platform "%PLATFORM%"
+exit /b %errorlevel%
 
 :stop_running_process
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
