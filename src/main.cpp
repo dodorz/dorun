@@ -4125,20 +4125,18 @@ bool LaunchBuiltinQueryCommand(std::wstring_view query) {
         return false;
     }
 
-    std::wstring_view commandText(trimmedQuery);
-    commandText.remove_prefix(1);
-    commandText = Trim(commandText);
+    std::wstring commandText = Trim(std::wstring_view(trimmedQuery).substr(1));
     if (commandText.empty()) {
         return false;
     }
 
     const size_t commandEnd = commandText.find_first_of(L" \t");
-    const std::wstring commandName = Lowercase(std::wstring(commandText.substr(0, commandEnd)));
+    const std::wstring commandName = Lowercase(commandText.substr(0, commandEnd));
     if (commandName != L"kill") {
         return false;
     }
 
-    std::wstring_view arguments = commandEnd == std::wstring_view::npos ? std::wstring_view {} : Trim(commandText.substr(commandEnd + 1));
+    const std::wstring arguments = commandEnd == std::wstring::npos ? L"" : Trim(commandText.substr(commandEnd + 1));
     if (arguments.empty()) {
         return false;
     }
@@ -4148,14 +4146,14 @@ bool LaunchBuiltinQueryCommand(std::wstring_view query) {
         imageName += L".exe";
     }
 
-    std::wstring parameters = L"/im ";
-    parameters += QuoteCommandLineArgument(imageName);
-    parameters += L" /f";
-    const bool launched = LaunchProcessCommand(L"taskkill.exe " + parameters, L"", SW_HIDE, NORMAL_PRIORITY_CLASS);
-    if (launched) {
+    std::wstring commandLine = L"%SystemRoot%\\System32\\taskkill.exe /im ";
+    commandLine += QuoteCommandLineArgument(imageName);
+    commandLine += L" /f";
+    if (LaunchProcessCommand(commandLine, L"", SW_HIDE, NORMAL_PRIORITY_CLASS)) {
         HideLauncher();
+        return true;
     }
-    return launched;
+    return false;
 }
 
 bool LaunchItemByIndex(size_t index) {
