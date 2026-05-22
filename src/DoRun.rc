@@ -21,11 +21,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "DoRun\0"
             VALUE "FileDescription", "DoRun Launcher\0"
-            VALUE "FileVersion", "0.2.0.25\0"
+            VALUE "FileVersion", "0.2.0.26\0"
             VALUE "InternalName", "DoRun\0"
             VALUE "OriginalFilename", "DoRun.exe\0"
             VALUE "ProductName", "DoRun\0"
-            VALUE "ProductVersion", "0.2.0.25\0"
+            VALUE "ProductVersion", "0.2.0.26\0"
         END
     END
     BLOCK "VarFileInfo"
