@@ -141,6 +141,7 @@ The GitHub Actions build workflow:
 - accepts version tags with or without a leading `v`
 - only auto-builds pushed version tags when `major.minor.patch` changes
 - skips auto-builds for build-only tag bumps
+- publishes a GitHub Release for manual versioned runs and for pushed tags whose `major.minor.patch` changed
 - packages artifacts as `DoRun-<version>-windows-x64.zip`
 
 ## Versioning
