@@ -1,7 +1,15 @@
 name: Build
 
 on:
+  push:
+    tags:
+      - 'v*.*.*.*'
+      - '*.*.*.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: Optional version tag, with or without leading v
+        required: false
 
 permissions:
   contents: write
@@ -21,28 +29,53 @@ jobs:
         id: version
         shell: pwsh
         run: |
+          $rawVersion = ""
           $isRelease = "false"
+          $shouldBuild = "true"
+          $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and "${{ github.event.inputs.version }}"
+
           if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $version = $env:GITHUB_REF_NAME
-            if ($version -notmatch "^v\d+\.\d+\.\d+\.\d+$") {
-              throw "Version tag must match vmajor.minor.patch.build: $version"
+            $rawVersion = $env:GITHUB_REF_NAME
+          } elseif ("${{ github.event.inputs.version }}") {
+            $rawVersion = "${{ github.event.inputs.version }}"
+          }
+
+          if ($rawVersion) {
+            if ($rawVersion -notmatch "^v?\d+\.\d+\.\d+\.\d+$") {
+              throw "Version tag must match vmajor.minor.patch.build or major.minor.patch.build: $rawVersion"
+            }
+
+            if ($rawVersion -match "^v") {
+              $version = $rawVersion
+            } else {
+              $version = "v$rawVersion"
             }
 
             $currentSeries = ($version -replace "^v", "") -replace "\.\d+$", ""
-            $currentCommit = git rev-list -n 1 $version
-            $previousTag = git tag --merged $currentCommit --sort=-version:refname |
+            $currentCommit = git rev-list -n 1 $version 2>$null
+            if (-not $currentCommit) {
+              $currentCommit = $env:GITHUB_SHA
+            }
+
+            $previousTag = git tag --sort=-version:refname |
               Where-Object {
-                $_ -match "^v\d+\.\d+\.\d+\.\d+$" -and
-                (git rev-list -n 1 $_) -ne $currentCommit
+                $_ -match "^v?\d+\.\d+\.\d+\.\d+$" -and
+                $_ -ne $rawVersion -and
+                $_ -ne $version
               } |
               Select-Object -First 1
 
             if (-not $previousTag) {
               $isRelease = "true"
             } else {
+              if ($previousTag -notmatch "^v") {
+                $previousTag = "v$previousTag"
+              }
               $previousSeries = ($previousTag -replace "^v", "") -replace "\.\d+$", ""
               if ($currentSeries -ne $previousSeries) {
                 $isRelease = "true"
+              } elseif (-not $isManualVersionedBuild) {
+                $shouldBuild = "false"
               }
             }
           } else {
@@ -51,16 +84,26 @@ jobs:
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_build=$shouldBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Skip build for build-only tag bumps
+        if: steps.version.outputs.should_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Skipping build for build-only version change: ${{ steps.version.outputs.version }}"
 
       - name: Build static release
+        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat StaticRelease x64
 
       - name: Build dynamic release
+        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat Release x64
 
       - name: Package executables
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
@@ -70,14 +113,53 @@ jobs:
           Compress-Archive -Path dist\*.exe -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
 
       - name: Upload build artifacts
+        if: steps.version.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DoRun-${{ steps.version.outputs.version }}-windows-x64
           path: dist/*.zip
 
+      - name: Verify manual release tag exists
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        shell: pwsh
+        run: |
+          $rawVersion = "${{ github.event.inputs.version }}"
+          $version = if ($rawVersion -match '^v') { $rawVersion } else { "v$rawVersion" }
+          git rev-parse --verify "$version" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Manual release version tag does not exist locally after checkout: $version"
+          }
+
+          git ls-remote --exit-code --tags origin "$version" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Manual release version tag does not exist on origin: $version"
+          }
+
       - name: Publish GitHub Release
-        if: github.ref_type == 'tag' && steps.version.outputs.is_release == 'true'
+        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.is_release == 'true' && ((github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''))
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.version }}
           name: DoRun ${{ steps.version.outputs.version }}
           files: dist/*.zip
+
+      - name: Note manual dev build
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version == ''
+        shell: pwsh
+        run: |
+          Write-Host "Manual build ran without version input; artifact version falls back to dev-<sha>, and no GitHub Release is created."
+          Write-Host "Set workflow_dispatch input 'version' to create a versioned zip and release."
+
+      - name: Note build-only tag skip
+        if: github.ref_type == 'tag' && steps.version.outputs.should_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Skipped build because only the build segment changed for ${{ steps.version.outputs.version }}"
+          Write-Host "Manual workflow_dispatch with a version input can still force a build if needed."
+
+      - name: Note manual versioned build
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        shell: pwsh
+        run: |
+          Write-Host "Manual versioned build requested for ${{ steps.version.outputs.version }}"
+          Write-Host "This path always builds, even if only the build segment changed."
