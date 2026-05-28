@@ -10,6 +10,7 @@ on:
       version:
         description: Optional version tag, with or without leading v
         required: false
+        type: string
 
 permissions:
   contents: write
@@ -28,38 +29,35 @@ jobs:
       - name: Resolve version and release gate
         id: version
         shell: pwsh
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version || '' }}
         run: |
           $rawVersion = ""
           $isRelease = "false"
           $shouldBuild = "true"
-          $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and "${{ github.event.inputs.version }}"
+          $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)
 
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $rawVersion = $env:GITHUB_REF_NAME
-          } elseif ("${{ github.event.inputs.version }}") {
-            $rawVersion = "${{ github.event.inputs.version }}"
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)) {
+            $rawVersion = $env:MANUAL_VERSION
           }
 
-          if ($rawVersion) {
-            if ($rawVersion -notmatch "^v?\d+\.\d+\.\d+\.\d+$") {
+          if (-not [string]::IsNullOrWhiteSpace($rawVersion)) {
+            if ($rawVersion -notmatch '^v?\d+\.\d+\.\d+\.\d+$') {
               throw "Version tag must match vmajor.minor.patch.build or major.minor.patch.build: $rawVersion"
             }
 
-            if ($rawVersion -match "^v") {
+            if ($rawVersion -match '^v') {
               $version = $rawVersion
             } else {
               $version = "v$rawVersion"
             }
 
-            $currentSeries = ($version -replace "^v", "") -replace "\.\d+$", ""
-            $currentCommit = git rev-list -n 1 $version 2>$null
-            if (-not $currentCommit) {
-              $currentCommit = $env:GITHUB_SHA
-            }
-
+            $currentSeries = ($version -replace '^v', '') -replace '\.\d+$', ''
             $previousTag = git tag --sort=-version:refname |
               Where-Object {
-                $_ -match "^v?\d+\.\d+\.\d+\.\d+$" -and
+                $_ -match '^v?\d+\.\d+\.\d+\.\d+$' -and
                 $_ -ne $rawVersion -and
                 $_ -ne $version
               } |
@@ -68,10 +66,10 @@ jobs:
             if (-not $previousTag) {
               $isRelease = "true"
             } else {
-              if ($previousTag -notmatch "^v") {
+              if ($previousTag -notmatch '^v') {
                 $previousTag = "v$previousTag"
               }
-              $previousSeries = ($previousTag -replace "^v", "") -replace "\.\d+$", ""
+              $previousSeries = ($previousTag -replace '^v', '') -replace '\.\d+$', ''
               if ($currentSeries -ne $previousSeries) {
                 $isRelease = "true"
               } elseif (-not $isManualVersionedBuild) {
@@ -85,12 +83,6 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "should_build=$shouldBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Skip build for build-only tag bumps
-        if: steps.version.outputs.should_build != 'true'
-        shell: pwsh
-        run: |
-          Write-Host "Skipping build for build-only version change: ${{ steps.version.outputs.version }}"
 
       - name: Build static release
         if: steps.version.outputs.should_build == 'true'
@@ -122,8 +114,10 @@ jobs:
       - name: Verify manual release tag exists
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
         shell: pwsh
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
         run: |
-          $rawVersion = "${{ github.event.inputs.version }}"
+          $rawVersion = $env:MANUAL_VERSION
           $version = if ($rawVersion -match '^v') { $rawVersion } else { "v$rawVersion" }
           git rev-parse --verify "$version" *> $null
           if ($LASTEXITCODE -ne 0) {
@@ -136,7 +130,7 @@ jobs:
           }
 
       - name: Publish GitHub Release
-        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.is_release == 'true' && ((github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''))
+        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.is_release == 'true' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''))
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
@@ -156,10 +150,3 @@ jobs:
         run: |
           Write-Host "Skipped build because only the build segment changed for ${{ steps.version.outputs.version }}"
           Write-Host "Manual workflow_dispatch with a version input can still force a build if needed."
-
-      - name: Note manual versioned build
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
-        shell: pwsh
-        run: |
-          Write-Host "Manual versioned build requested for ${{ steps.version.outputs.version }}"
-          Write-Host "This path always builds, even if only the build segment changed."
