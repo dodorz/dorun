@@ -35,6 +35,7 @@ jobs:
           $rawVersion = ""
           $isRelease = "false"
           $shouldBuild = "true"
+          $publishRelease = "false"
           $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)
 
           if ($env:GITHUB_REF_TYPE -eq "tag") {
@@ -76,6 +77,13 @@ jobs:
                 $shouldBuild = "false"
               }
             }
+
+            if ($env:GITHUB_REF_TYPE -eq "tag" -and $isRelease -eq "true") {
+              $publishRelease = "true"
+            }
+            if ($isManualVersionedBuild) {
+              $publishRelease = "true"
+            }
           } else {
             $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
           }
@@ -83,6 +91,7 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "should_build=$shouldBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "publish_release=$publishRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Build static release
         if: steps.version.outputs.should_build == 'true'
@@ -130,7 +139,7 @@ jobs:
           }
 
       - name: Publish GitHub Release
-        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.is_release == 'true' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''))
+        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.publish_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
