@@ -1,16 +1,6 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - master
-      - main
-    tags:
-      - 'v*.*.*.*'
-  pull_request:
-    branches:
-      - master
-      - main
   workflow_dispatch:
 
 permissions:
@@ -77,16 +67,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build\StaticRelease\DoRun.exe "dist\DoRun-$version-windows-x64-static.exe"
           Copy-Item build\Release\DoRun.exe "dist\DoRun-$version-windows-x64.exe"
+          Compress-Archive -Path dist\*.exe -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: DoRun-${{ steps.version.outputs.version }}-windows-x64
-          path: dist/*.exe
+          path: dist/*.zip
 
       - name: Publish GitHub Release
         if: github.ref_type == 'tag' && steps.version.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           name: DoRun ${{ steps.version.outputs.version }}
-          files: dist/*.exe
+          files: dist/*.zip
