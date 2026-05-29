@@ -93,6 +93,7 @@ struct LaunchItem {
     std::wstring description;
     std::wstring inlineBatchScript;
     std::wstring workingDirectory;
+    std::wstring hostFilter;
     std::wstring normalizedName;
     std::wstring normalizedCommandLine;
     std::wstring normalizedCommandBaseName;
@@ -321,6 +322,56 @@ std::wstring Lowercase(std::wstring_view text) {
         return static_cast<wchar_t>(towlower(ch));
     });
     return value;
+}
+
+std::vector<std::wstring> SplitHostFilterTerms(std::wstring_view text) {
+    std::vector<std::wstring> terms;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t separator = text.find(L'|', start);
+        const std::wstring term = Trim(text.substr(start, separator == std::wstring_view::npos ? std::wstring_view::npos : separator - start));
+        if (!term.empty()) {
+            terms.push_back(Lowercase(term));
+        }
+        if (separator == std::wstring_view::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+    return terms;
+}
+
+std::wstring GetComputerNameValue() {
+    std::array<wchar_t, MAX_COMPUTERNAME_LENGTH + 1> buffer {};
+    DWORD length = static_cast<DWORD>(buffer.size());
+    if (GetComputerNameW(buffer.data(), &length) == FALSE || length == 0) {
+        return L"";
+    }
+    return Lowercase(std::wstring_view(buffer.data(), length));
+}
+
+bool DoesCurrentHostMatchFilter(std::wstring_view hostFilter) {
+    const std::wstring trimmedFilter = Trim(hostFilter);
+    if (trimmedFilter.empty()) {
+        return true;
+    }
+
+    bool negate = false;
+    std::wstring_view filterText(trimmedFilter);
+    if (!filterText.empty() && filterText.front() == L'!') {
+        negate = true;
+        filterText.remove_prefix(1);
+        filterText = Trim(filterText);
+    }
+
+    const std::vector<std::wstring> terms = SplitHostFilterTerms(filterText);
+    if (terms.empty()) {
+        return true;
+    }
+
+    const std::wstring currentHost = GetComputerNameValue();
+    const bool matched = std::find(terms.begin(), terms.end(), currentHost) != terms.end();
+    return negate ? !matched : matched;
 }
 
 std::wstring Uppercase(std::wstring_view text) {
@@ -2692,6 +2743,8 @@ void ApplyCommandProperty(LaunchItem& item, const std::wstring& key, const std::
         }
     } else if (key == L"working_directory" || key == L"cwd") {
         item.workingDirectory = value;
+    } else if (key == L"host_filter" || key == L"host" || key == L"hostname") {
+        item.hostFilter = value;
     } else if (key == L"show_window") {
         if (!value.empty()) {
             item.showCommand = _wtoi(value.c_str());
@@ -3056,6 +3109,10 @@ void CloseCronTaskProcessHandles() {
 }
 
 bool LaunchCronTask(CronTask& task) {
+    if (!DoesCurrentHostMatchFilter(task.item.hostFilter)) {
+        return true;
+    }
+
     HANDLE launchedProcess = nullptr;
     const bool shouldTrackProcess = task.item.runningProcessPolicy != RunningProcessPolicy::Launch;
     HANDLE* launchedProcessTarget = shouldTrackProcess ? &launchedProcess : nullptr;
@@ -3384,6 +3441,10 @@ void RunStartupCommands() {
                 if (index > 0) {
                     --index;
                 }
+            }
+
+            if (!DoesCurrentHostMatchFilter(item.hostFilter)) {
+                continue;
             }
 
             if (item.inlineBatchScript.empty()) {
@@ -4058,6 +4119,10 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
 }
 
 bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
+    if (!DoesCurrentHostMatchFilter(item.hostFilter)) {
+        return true;
+    }
+
     AppendHotkeyDebugLog(L"Launching item: " + item.name + L" | command=" + item.commandLine);
     if (item.sourceKind == ItemSourceKind::Synthetic) {
         const std::wstring command = Lowercase(item.commandLine);
