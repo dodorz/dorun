@@ -109,9 +109,14 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build\StaticRelease\DoRun.exe "dist\DoRun-$version-windows-x64-static.exe"
-          Copy-Item build\Release\DoRun.exe "dist\DoRun-$version-windows-x64.exe"
-          Compress-Archive -Path dist\*.exe -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
+          $staticStage = Join-Path dist "static"
+          $dynamicStage = Join-Path dist "dynamic"
+          New-Item -ItemType Directory -Force -Path $staticStage | Out-Null
+          New-Item -ItemType Directory -Force -Path $dynamicStage | Out-Null
+          Copy-Item build\StaticRelease\DoRun.exe (Join-Path $staticStage "DoRun.exe")
+          Copy-Item build\Release\DoRun.exe (Join-Path $dynamicStage "DoRun.exe")
+          Compress-Archive -Path (Join-Path $staticStage "DoRun.exe") -DestinationPath "dist\DoRun-$version-windows-x64-static.zip" -Force
+          Compress-Archive -Path (Join-Path $dynamicStage "DoRun.exe") -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
 
       - name: Upload build artifacts
         if: steps.version.outputs.should_build == 'true'
