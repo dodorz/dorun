@@ -28,10 +28,19 @@ LAUNCHER_RESULT_FONT_SIZE: 0
 # Optional variables that Command.conf can reference as `${NAME}`.
 # Define new variables under `VARS` to avoid conflicts with DoRun settings.
 # For compatibility, old top-level scalar variables still work, but `VARS` wins.
-# `EDITOR` is also used by `/config` and `/cmdconfig`.
+# `EDITOR` is used by `/config` and `/cmdconfig`.
+# `VIEWER` is used by `/view`. When empty, falls back to `EDITOR` then Shell.
+# `VIEWER` can reference `${EDITOR}`, e.g.: '${EDITOR} --view'
+# Runtime variables `${CMD}`, `${CWD}`, and `${CWD_FLAG}` expand at launch time:
+#   - `${CMD}`       → the item's command line (useful in wrapper templates)
+#   - `${CWD}`       → the item's working directory
+#   - `${CWD_FLAG}`  → the directory argument for the terminal (use in Command.conf templates)
+# Define `${CWD_FLAG}` here in VARS; it can reference `${CWD}` which stays as a runtime literal.
 VARS:
   EDITOR: ''
+  VIEWER: ''
   TERMINAL: 'wt.exe'
+  CWD_FLAG: '-d "${CWD}"'
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''

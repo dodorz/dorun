@@ -62,6 +62,10 @@ struct EditorConfig {
     std::wstring commandLine;
 };
 
+struct ViewerConfig {
+    std::wstring commandLine;
+};
+
 struct HistoryInfo {
     double rank = 0.0;
     int runCount = 0;
@@ -188,6 +192,7 @@ struct AppState {
     HistoryConfig historyConfig {};
     LauncherAppearanceConfig launcherAppearance {};
     EditorConfig editorConfig {};
+    ViewerConfig viewerConfig {};
     std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, LaunchItem> commandItemsByName;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
@@ -299,6 +304,8 @@ bool LaunchProcessCommand(
     DWORD priorityClass,
     DWORD extraCreationFlags = 0,
     HANDLE* launchedProcess = nullptr);
+
+std::wstring ExpandRuntimeVariables(std::wstring_view text, std::wstring_view cmd, std::wstring_view cwd);
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
@@ -1523,6 +1530,7 @@ void LoadLauncherAppearanceConfig() {
 
 void LoadCommandVariables() {
     g_state.editorConfig = EditorConfig {};
+    g_state.viewerConfig = ViewerConfig {};
     g_state.commandVariables.clear();
 
     const std::wstring configPath = FindConfigPath(kConfigFileName);
@@ -1536,7 +1544,10 @@ void LoadCommandVariables() {
         g_state.commandVariables.insert_or_assign(std::move(key), std::move(value));
     }
     if (const auto it = g_state.commandVariables.find(L"EDITOR"); it != g_state.commandVariables.end()) {
-        g_state.editorConfig.commandLine = Trim(it->second);
+        g_state.editorConfig.commandLine = Trim(ExpandCommandVariables(it->second));
+    }
+    if (const auto it = g_state.commandVariables.find(L"VIEWER"); it != g_state.commandVariables.end()) {
+        g_state.viewerConfig.commandLine = Trim(ExpandCommandVariables(it->second));
     }
 }
 
@@ -2072,7 +2083,10 @@ std::wstring MakeInlineBatchFilePath() {
 
 bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = nullptr) {
     const std::wstring batchPath = MakeInlineBatchFilePath();
+    const std::wstring rawCommand = item.commandLine;
+    const std::wstring rawWorkingDir = item.workingDirectory;
     std::wstring script = ExpandCommandVariables(item.inlineBatchScript);
+    script = ExpandRuntimeVariables(script, rawCommand, rawWorkingDir);
     if (!script.ends_with(L"\n")) {
         script += L"\n";
     }
@@ -2081,8 +2095,9 @@ bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = n
     }
 
     const std::wstring commandLine = L"cmd.exe /c " + QuoteCommandLineArgument(batchPath);
+    const std::wstring cwdText = ExpandRuntimeVariables(item.workingDirectory, rawCommand, rawWorkingDir);
     const DWORD extraCreationFlags = item.showCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
-    return LaunchProcessCommand(commandLine, item.workingDirectory, item.showCommand, item.priorityClass, extraCreationFlags, launchedProcess);
+    return LaunchProcessCommand(commandLine, cwdText, item.showCommand, item.priorityClass, extraCreationFlags, launchedProcess);
 }
 
 std::optional<UINT> ParseHotkeyVirtualKey(std::wstring_view text) {
@@ -2426,6 +2441,44 @@ bool OpenPathWithConfiguredEditor(const std::wstring& path) {
 
     const std::wstring commandLine = g_state.editorConfig.commandLine + L" " + QuoteCommandLineArgument(path);
     return LaunchProcessCommand(commandLine, L"", SW_SHOWNORMAL, NORMAL_PRIORITY_CLASS);
+}
+
+bool OpenPathWithConfiguredViewer(const std::wstring& path) {
+    if (!g_state.viewerConfig.commandLine.empty()) {
+        const std::wstring commandLine = g_state.viewerConfig.commandLine + L" " + QuoteCommandLineArgument(path);
+        return LaunchProcessCommand(commandLine, L"", SW_SHOWNORMAL, NORMAL_PRIORITY_CLASS);
+    }
+    return OpenPathWithConfiguredEditor(path);
+}
+
+std::wstring ExpandRuntimeVariables(std::wstring_view text, std::wstring_view cmd, std::wstring_view cwd) {
+    std::wstring expanded;
+    expanded.reserve(text.size() + cmd.size() + cwd.size());
+
+    for (size_t index = 0; index < text.size(); ++index) {
+        if (text[index] != L'$' || (index + 1) >= text.size() || text[index + 1] != L'{') {
+            expanded.push_back(text[index]);
+            continue;
+        }
+
+        const size_t end = text.find(L'}', index + 2);
+        if (end == std::wstring_view::npos) {
+            expanded.push_back(text[index]);
+            continue;
+        }
+
+        const std::wstring key = Uppercase(Trim(text.substr(index + 2, end - (index + 2))));
+        if (key == L"CMD") {
+            expanded += cmd;
+        } else if (key == L"CWD") {
+            expanded += cwd;
+        } else {
+            expanded.append(text.substr(index, end - index + 1));
+        }
+        index = end;
+    }
+
+    return expanded;
 }
 
 bool ExecuteSql(sqlite3* database, const char* sql) {
@@ -4170,8 +4223,15 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     }
 
     SetEnglishImeForWindow(g_state.searchEdit);
+    // Capture the pre-expansion command and working directory so that
+    // runtime variables ${CMD} and ${CWD} expand to the concrete values
+    // rather than recursing into themselves.
+    const std::wstring rawCommand = item.commandLine;
+    const std::wstring rawWorkingDir = item.workingDirectory;
+    const std::wstring cmdText = ExpandRuntimeVariables(rawCommand, rawCommand, rawWorkingDir);
+    const std::wstring cwdText = ExpandRuntimeVariables(rawWorkingDir, rawCommand, rawWorkingDir);
     const bool launched = item.inlineBatchScript.empty()
-        ? LaunchProcessCommand(item.commandLine, item.workingDirectory, item.showCommand, item.priorityClass)
+        ? LaunchProcessCommand(cmdText, cwdText, item.showCommand, item.priorityClass)
         : LaunchInlineBatchScript(item);
     if (!launched) {
         return false;
@@ -4197,11 +4257,23 @@ bool LaunchBuiltinQueryCommand(std::wstring_view query) {
 
     const size_t commandEnd = commandText.find_first_of(L" \t");
     const std::wstring commandName = Lowercase(commandText.substr(0, commandEnd));
+    const std::wstring arguments = commandEnd == std::wstring::npos ? L"" : Trim(commandText.substr(commandEnd + 1));
+
+    if (commandName == L"view") {
+        if (arguments.empty()) {
+            return false;
+        }
+        const bool success = OpenPathWithConfiguredViewer(arguments);
+        if (success) {
+            HideLauncher();
+        }
+        return success;
+    }
+
     if (commandName != L"kill") {
         return false;
     }
 
-    const std::wstring arguments = commandEnd == std::wstring::npos ? L"" : Trim(commandText.substr(commandEnd + 1));
     if (arguments.empty()) {
         return false;
     }
