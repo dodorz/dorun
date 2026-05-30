@@ -24,17 +24,22 @@ Main capabilities:
 
 ## Built-in commands
 
-Available built-ins include:
+### Search-box slash commands
 
-- `/quit`
-- `/reload`
-- `/kill`
-- `/reboot`
-- `/poweroff`
-- `/hibernate`
-- `/standby`
-- `/config`
-- `/cmdconfig`
+Type these in the launcher search box and press Enter:
+
+| Command | Description |
+|---|---|
+| `/quit` | Exit DoRun |
+| `/reload` | Reload both config files |
+| `/kill <name>` | Terminate a process by image name |
+| `/view <path>` | Open file with `VIEWER` (falls back to `EDITOR`, then shell) |
+| `/reboot` | Restart the computer |
+| `/poweroff` | Shut down the computer |
+| `/hibernate` | Suspend to disk |
+| `/standby` | Sleep |
+| `/config` | Open `DoRun.yaml` with `EDITOR` |
+| `/cmdconfig` | Open `Command.conf` with `EDITOR` |
 
 ## Configuration files
 
@@ -47,7 +52,47 @@ Built-in commands can open both files directly from the launcher.
 
 ## `DoRun.yaml`
 
-Supported settings include:
+### Custom variables (`VARS`)
+
+Define reusable variables under `VARS`. Command.conf entries reference them as `${NAME}`.
+
+| Variable | Default | Used by | Description |
+|---|---|---|---|
+| `EDITOR` | `''` | `builtin:config`, `builtin:cmdconfig` | Path to text editor. Falls back to shell default. |
+| `VIEWER` | `''` | `/view <path>` | Path to read-only file viewer. Falls back to `EDITOR`, then shell default. Can reference `${EDITOR}`, e.g. `'${EDITOR} --view'`. |
+| `TERMINAL` | `'wt.exe'` | Custom commands | Terminal emulator path. Used in wrapper templates. |
+| `CWD_FLAG` | `'-d "${CWD}"'` | Custom commands | Terminal's working-directory argument. `${CWD}` stays as a literal until launch time. |
+
+Example:
+
+```yaml
+VARS:
+  EDITOR: 'code.cmd --wait'
+  VIEWER: '${EDITOR} --view'
+  TERMINAL: 'wt.exe'
+  CWD_FLAG: '-d "${CWD}"'
+  # Switch to PowerShell:
+  # TERMINAL: 'pwsh.exe'
+  # CWD_FLAG: '-WorkingDirectory "${CWD}"'
+```
+
+### Runtime variables
+
+These expand at **launch time** (after config-load-time `${VARS}` expansion):
+
+| Variable | Description |
+|---|---|
+| `${CMD}` | The item's full `commandLine` |
+| `${CWD}` | The item's `workingDirectory` |
+| `${CWD_FLAG}` | From `VARS.CWD_FLAG`, cascades `${CWD}` through load→runtime |
+
+Use in wrapper templates in Command.conf:
+
+```
+term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
+```
+
+### Supported settings
 
 - `HOTKEY_MODIFIERS`
 - `HOTKEY_VK`
