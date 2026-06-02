@@ -63,6 +63,16 @@ Define reusable variables under `VARS`. Command.conf entries reference them as `
 | `TERMINAL` | `'wt.exe'` | Custom commands | Terminal emulator path. Used in wrapper templates. |
 | `CWD_FLAG` | `'-d "${CWD}"'` | Custom commands | Terminal's working-directory argument. `${CWD}` stays as a literal until launch time. |
 
+Optional alias DSL integration:
+
+```yaml
+ALIASES:
+  FILE: 'C:\~\.config\alias'
+  WINDOWS_LOADER: 'C:\~\.config\LoadAlias.ps1'
+```
+
+When `ALIASES` is configured, DoRun treats the alias definition file as an additional command source. On Windows it uses `WINDOWS_LOADER` to enumerate active alias definitions, and each alias becomes directly runnable from the launcher.
+
 Example:
 
 ```yaml
@@ -71,6 +81,9 @@ VARS:
   VIEWER: '${EDITOR} --view'
   TERMINAL: 'wt.exe'
   CWD_FLAG: '-d "${CWD}"'
+ALIASES:
+  FILE: 'C:\~\.config\alias'
+  WINDOWS_LOADER: 'C:\~\.config\LoadAlias.ps1'
   # Switch to PowerShell:
   # TERMINAL: 'pwsh.exe'
   # CWD_FLAG: '-WorkingDirectory "${CWD}"'
