@@ -56,6 +56,12 @@ struct LauncherAppearanceConfig {
     std::wstring resultFontFamily;
     int searchFontPointSize = 0;
     int resultFontPointSize = 0;
+    COLORREF backgroundColor = RGB(243, 246, 249);
+    COLORREF borderColor = RGB(218, 224, 232);
+    COLORREF textColor = RGB(28, 32, 38);
+    COLORREF subtleTextColor = RGB(104, 113, 126);
+    COLORREF accentColor = RGB(38, 102, 230);
+    COLORREF searchBackgroundColor = RGB(252, 253, 255);
 };
 
 struct EditorConfig {
@@ -199,6 +205,8 @@ struct AppState {
     HFONT searchFont = nullptr;
     HFONT resultFont = nullptr;
     HFONT descriptionFont = nullptr;
+    HBRUSH launcherBackgroundBrush = nullptr;
+    HBRUSH searchBackgroundBrush = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
     HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -316,6 +324,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess);
 void AppendHotkeyDebugLog(std::wstring_view line);
 bool NotifyExistingInstanceAndExit();
 std::wstring QuoteCommandLineArgument(std::wstring_view argument);
+void UpdateLauncherBrushes();
 bool LaunchProcessCommand(
     std::wstring_view commandLineText,
     std::wstring_view workingDirectoryText,
@@ -328,6 +337,17 @@ std::wstring ExpandRuntimeVariables(std::wstring_view text, std::wstring_view cm
 
 int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
+}
+
+COLORREF BlendColor(COLORREF from, COLORREF to, int numerator, int denominator) {
+    if (denominator <= 0) {
+        return from;
+    }
+
+    const int red = (GetRValue(from) * (denominator - numerator) + GetRValue(to) * numerator) / denominator;
+    const int green = (GetGValue(from) * (denominator - numerator) + GetGValue(to) * numerator) / denominator;
+    const int blue = (GetBValue(from) * (denominator - numerator) + GetBValue(to) * numerator) / denominator;
+    return RGB(red, green, blue);
 }
 
 std::wstring Trim(std::wstring_view text) {
@@ -720,6 +740,35 @@ std::optional<std::wstring> ParseYamlString(const std::wstring& content, std::ws
         value = value.substr(1, value.size() - 2);
     }
     return value;
+}
+
+std::optional<COLORREF> ParseYamlColor(const std::wstring& content, std::wstring_view key) {
+    const std::optional<std::wstring> rawValue = ParseYamlString(content, key);
+    if (!rawValue) {
+        return std::nullopt;
+    }
+
+    std::wstring value = Trim(*rawValue);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    if (value.front() == L'#') {
+        value.erase(value.begin());
+    }
+    if (value.size() != 6) {
+        return std::nullopt;
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long parsed = wcstoul(value.c_str(), &end, 16);
+    if (end == nullptr || *end != L'\0' || parsed > 0xFFFFFFUL) {
+        return std::nullopt;
+    }
+
+    const BYTE red = static_cast<BYTE>((parsed >> 16) & 0xFF);
+    const BYTE green = static_cast<BYTE>((parsed >> 8) & 0xFF);
+    const BYTE blue = static_cast<BYTE>(parsed & 0xFF);
+    return RGB(red, green, blue);
 }
 
 std::wstring ParseYamlScalarValue(std::wstring value) {
@@ -1575,9 +1624,8 @@ HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSiz
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
     }
 
-    if (!fontFamily.empty()) {
-        wcsncpy_s(metrics.lfMessageFont.lfFaceName, fontFamily.data(), _TRUNCATE);
-    }
+    const std::wstring_view resolvedFamily = fontFamily.empty() ? std::wstring_view(L"Segoe UI Variable") : fontFamily;
+    wcsncpy_s(metrics.lfMessageFont.lfFaceName, resolvedFamily.data(), _TRUNCATE);
 
     if (pointSize > 0) {
         HDC screenDc = GetDC(nullptr);
@@ -1589,6 +1637,20 @@ HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSiz
     }
 
     return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+void UpdateLauncherBrushes() {
+    if (g_state.launcherBackgroundBrush != nullptr) {
+        DeleteObject(g_state.launcherBackgroundBrush);
+        g_state.launcherBackgroundBrush = nullptr;
+    }
+    if (g_state.searchBackgroundBrush != nullptr) {
+        DeleteObject(g_state.searchBackgroundBrush);
+        g_state.searchBackgroundBrush = nullptr;
+    }
+
+    g_state.launcherBackgroundBrush = CreateSolidBrush(g_state.launcherAppearance.backgroundColor);
+    g_state.searchBackgroundBrush = CreateSolidBrush(g_state.launcherAppearance.searchBackgroundColor);
 }
 
 void ApplyFont(HWND window, HFONT font) {
@@ -1686,11 +1748,13 @@ void ApplyLauncherAppearance() {
 
     if (TryApplyNativeRoundedCorners()) {
         SetWindowRgn(g_state.launcherWindow, nullptr, TRUE);
+        InvalidateRect(g_state.launcherWindow, nullptr, TRUE);
         return;
     }
 
     if (g_state.launcherAppearance.cornerRadius <= 0) {
         SetWindowRgn(g_state.launcherWindow, nullptr, TRUE);
+        InvalidateRect(g_state.launcherWindow, nullptr, TRUE);
         return;
     }
 
@@ -1714,16 +1778,17 @@ void ApplyLauncherAppearance() {
     if (SetWindowRgn(g_state.launcherWindow, region, TRUE) == 0) {
         DeleteObject(region);
     }
+    InvalidateRect(g_state.launcherWindow, nullptr, TRUE);
 }
 
 void LayoutLauncher() {
     RECT workArea {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    const int width = Scale(720);
-    const int margin = Scale(12);
-    const int controlHeight = std::max(Scale(32), MeasureFontTextHeight(g_state.searchFont) + Scale(12));
-    const int descriptionHeight = std::max(Scale(18), MeasureFontTextHeight(g_state.descriptionFont) + Scale(4));
-    int listItemHeight = Scale(30);
+    const int width = Scale(780);
+    const int margin = Scale(16);
+    const int controlHeight = std::max(Scale(40), MeasureFontTextHeight(g_state.searchFont) + Scale(16));
+    const int descriptionHeight = std::max(Scale(22), MeasureFontTextHeight(g_state.descriptionFont) + Scale(6));
+    int listItemHeight = Scale(38);
     if (g_state.resultList != nullptr) {
         const LRESULT measuredHeight = SendMessageW(g_state.resultList, LB_GETITEMHEIGHT, 0, 0);
         if (measuredHeight > 0) {
@@ -1891,6 +1956,25 @@ void LoadLauncherAppearanceConfig() {
     if (const std::optional<int> resultFontPointSize = ParseYamlInt(content, L"LAUNCHER_RESULT_FONT_SIZE")) {
         g_state.launcherAppearance.resultFontPointSize = std::clamp(*resultFontPointSize, 0, 72);
     }
+    if (const std::optional<COLORREF> backgroundColor = ParseYamlColor(content, L"LAUNCHER_BG_COLOR")) {
+        g_state.launcherAppearance.backgroundColor = *backgroundColor;
+    }
+    if (const std::optional<COLORREF> borderColor = ParseYamlColor(content, L"LAUNCHER_BORDER_COLOR")) {
+        g_state.launcherAppearance.borderColor = *borderColor;
+    }
+    if (const std::optional<COLORREF> textColor = ParseYamlColor(content, L"LAUNCHER_TEXT_COLOR")) {
+        g_state.launcherAppearance.textColor = *textColor;
+    }
+    if (const std::optional<COLORREF> subtleTextColor = ParseYamlColor(content, L"LAUNCHER_SUBTLE_TEXT_COLOR")) {
+        g_state.launcherAppearance.subtleTextColor = *subtleTextColor;
+    }
+    if (const std::optional<COLORREF> accentColor = ParseYamlColor(content, L"LAUNCHER_ACCENT_COLOR")) {
+        g_state.launcherAppearance.accentColor = *accentColor;
+    }
+    if (const std::optional<COLORREF> searchBackgroundColor = ParseYamlColor(content, L"LAUNCHER_SEARCH_BG_COLOR")) {
+        g_state.launcherAppearance.searchBackgroundColor = *searchBackgroundColor;
+    }
+    UpdateLauncherBrushes();
 }
 
 void LoadCommandVariables() {
@@ -4830,18 +4914,112 @@ void ShowLauncher() {
     ArmDeferredRefresh();
 }
 
+void PaintLauncherSurface(HDC dc, const RECT& bounds) {
+    if (g_state.launcherBackgroundBrush != nullptr) {
+        FillRect(dc, &bounds, g_state.launcherBackgroundBrush);
+    }
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, g_state.launcherAppearance.borderColor);
+    if (borderPen == nullptr) {
+        return;
+    }
+
+    const HGDIOBJ oldPen = SelectObject(dc, borderPen);
+    const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+    Rectangle(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(borderPen);
+}
+
+void DrawLauncherListItem(const DRAWITEMSTRUCT& drawItem) {
+    if (drawItem.itemID == static_cast<UINT>(-1)) {
+        return;
+    }
+
+    wchar_t text[512] {};
+    if (SendMessageW(drawItem.hwndItem, LB_GETTEXT, drawItem.itemID, reinterpret_cast<LPARAM>(text)) == LB_ERR) {
+        return;
+    }
+
+    RECT bounds = drawItem.rcItem;
+    const bool selected = (drawItem.itemState & ODS_SELECTED) != 0;
+    const bool focused = (drawItem.itemState & ODS_FOCUS) != 0;
+    const COLORREF itemBackground = selected
+        ? BlendColor(g_state.launcherAppearance.accentColor, RGB(255, 255, 255), 3, 20)
+        : g_state.launcherAppearance.backgroundColor;
+    const COLORREF textColor = selected
+        ? g_state.launcherAppearance.accentColor
+        : g_state.launcherAppearance.textColor;
+
+    HBRUSH itemBrush = CreateSolidBrush(itemBackground);
+    if (itemBrush != nullptr) {
+        FillRect(drawItem.hDC, &bounds, itemBrush);
+        DeleteObject(itemBrush);
+    }
+
+    RECT highlightRect = bounds;
+    InflateRect(&highlightRect, -Scale(6), -Scale(3));
+    HBRUSH highlightBrush = CreateSolidBrush(itemBackground);
+    if (highlightBrush != nullptr) {
+        FillRect(drawItem.hDC, &highlightRect, highlightBrush);
+        DeleteObject(highlightBrush);
+    }
+
+    SetBkMode(drawItem.hDC, TRANSPARENT);
+    SetTextColor(drawItem.hDC, textColor);
+
+    const HGDIOBJ oldFont = SelectObject(drawItem.hDC, g_state.resultFont);
+    RECT textRect = highlightRect;
+    textRect.left += Scale(10);
+    textRect.right -= Scale(10);
+    DrawTextW(drawItem.hDC, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (oldFont != nullptr) {
+        SelectObject(drawItem.hDC, oldFont);
+    }
+
+    if (focused) {
+        RECT focusRect = highlightRect;
+        DrawFocusRect(drawItem.hDC, &focusRect);
+    }
+}
+
+void UpdateSearchEditMargins() {
+    if (g_state.searchEdit == nullptr) {
+        return;
+    }
+    const int horizontalPadding = Scale(12);
+    SendMessageW(
+        g_state.searchEdit,
+        EM_SETMARGINS,
+        EC_LEFTMARGIN | EC_RIGHTMARGIN,
+        MAKELPARAM(horizontalPadding, horizontalPadding));
+}
+
 LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE:
         g_state.searchEdit = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
-        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
+        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
         g_state.descriptionText = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DESCRIPTION)), g_state.instance, nullptr);
         ApplyFont(g_state.searchEdit, g_state.searchFont);
         ApplyFont(g_state.resultList, g_state.resultFont);
         ApplyFont(g_state.descriptionText, g_state.descriptionFont);
+        UpdateSearchEditMargins();
         g_state.editProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
         LayoutLauncher();
         return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps {};
+        HDC dc = BeginPaint(window, &ps);
+        RECT clientRect {};
+        GetClientRect(window, &clientRect);
+        PaintLauncherSurface(dc, clientRect);
+        EndPaint(window, &ps);
+        return 0;
+    }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_SEARCH && HIWORD(wParam) == EN_CHANGE) {
             RecordSearchInputActivity();
@@ -4855,6 +5033,40 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_SELCHANGE) {
             UpdateSelectedItemDescription();
             return 0;
+        }
+        break;
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetBkColor(dc, g_state.launcherAppearance.searchBackgroundColor);
+        SetTextColor(dc, g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.searchBackgroundBrush != nullptr ? g_state.searchBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        HWND control = reinterpret_cast<HWND>(lParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, control == g_state.descriptionText ? g_state.launcherAppearance.subtleTextColor : g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.launcherBackgroundBrush != nullptr ? g_state.launcherBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetBkColor(dc, g_state.launcherAppearance.backgroundColor);
+        SetTextColor(dc, g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.launcherBackgroundBrush != nullptr ? g_state.launcherBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_MEASUREITEM:
+        if (wParam == IDC_RESULTS) {
+            auto* measureItem = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            measureItem->itemHeight = static_cast<UINT>(std::max(Scale(38), MeasureFontTextHeight(g_state.resultFont) + Scale(12)));
+            return TRUE;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (wParam == IDC_RESULTS) {
+            DrawLauncherListItem(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
         }
         break;
     case WM_TIMER:
@@ -4889,6 +5101,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         ApplyFont(g_state.searchEdit, g_state.searchFont);
         ApplyFont(g_state.resultList, g_state.resultFont);
         ApplyFont(g_state.descriptionText, g_state.descriptionFont);
+        UpdateSearchEditMargins();
         LayoutLauncher();
         return 0;
     case WM_CLOSE:
@@ -5085,6 +5298,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_state.descriptionFont != nullptr) {
         DeleteObject(g_state.descriptionFont);
         g_state.descriptionFont = nullptr;
+    }
+    if (g_state.launcherBackgroundBrush != nullptr) {
+        DeleteObject(g_state.launcherBackgroundBrush);
+        g_state.launcherBackgroundBrush = nullptr;
+    }
+    if (g_state.searchBackgroundBrush != nullptr) {
+        DeleteObject(g_state.searchBackgroundBrush);
+        g_state.searchBackgroundBrush = nullptr;
     }
     if (comInitialized) {
         CoUninitialize();

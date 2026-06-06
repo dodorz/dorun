@@ -17,6 +17,7 @@ HOTKEY_DEBUG_LOG: false
 # `LAUNCHER_VISIBLE_ITEM_COUNT` controls how many result rows are visible without scrolling.
 # `LAUNCHER_SEARCH_FONT_FAMILY` and `LAUNCHER_RESULT_FONT_FAMILY` override the font face. Leave empty to follow the system default.
 # `LAUNCHER_SEARCH_FONT_SIZE` and `LAUNCHER_RESULT_FONT_SIZE` use point sizes. Set to 0 to follow the system default.
+# Color settings accept `#RRGGBB` or `RRGGBB`.
 LAUNCHER_CORNER_RADIUS: 18
 LAUNCHER_OPACITY: 245
 LAUNCHER_VISIBLE_ITEM_COUNT: 8
@@ -24,6 +25,12 @@ LAUNCHER_SEARCH_FONT_FAMILY: ''
 LAUNCHER_RESULT_FONT_FAMILY: ''
 LAUNCHER_SEARCH_FONT_SIZE: 0
 LAUNCHER_RESULT_FONT_SIZE: 0
+LAUNCHER_BG_COLOR: '#F3F6F9'
+LAUNCHER_BORDER_COLOR: '#DAE0E8'
+LAUNCHER_TEXT_COLOR: '#1C2026'
+LAUNCHER_SUBTLE_TEXT_COLOR: '#68717E'
+LAUNCHER_ACCENT_COLOR: '#2666E6'
+LAUNCHER_SEARCH_BG_COLOR: '#FCFDFF'
 
 # Optional variables that Command.conf can reference as `${NAME}`.
 # Define new variables under `VARS` to avoid conflicts with DoRun settings.
