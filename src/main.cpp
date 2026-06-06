@@ -180,6 +180,12 @@ struct ScanDirectoryConfig {
     bool recursive = true;
 };
 
+struct AliasImportCache {
+    std::wstring dependencySignature;
+    std::vector<LaunchItem> items;
+    bool valid = false;
+};
+
 struct AppState {
     HINSTANCE instance = nullptr;
     HHOOK keyboardHook = nullptr;
@@ -205,6 +211,7 @@ struct AppState {
     EditorConfig editorConfig {};
     ViewerConfig viewerConfig {};
     AliasSupportConfig aliasSupport {};
+    AliasImportCache aliasImportCache {};
     std::unordered_map<std::wstring, std::wstring> commandVariables;
     std::unordered_map<std::wstring, LaunchItem> commandItemsByName;
     std::unordered_map<std::wstring, HistoryInfo> historyByKey;
@@ -1157,6 +1164,56 @@ std::wstring BuildItemKey(ItemSourceKind sourceKind, std::wstring_view commandLi
     return std::to_wstring(static_cast<int>(sourceKind)) + L"\n" +
         NormalizeHistoryField(commandLine) + L"\n" +
         NormalizeHistoryField(workingDirectory);
+}
+
+std::wstring BuildAliasImportDependencySignature() {
+    if (g_state.aliasSupport.sourcePath.empty() || g_state.aliasSupport.windowsLoaderPath.empty()) {
+        return L"";
+    }
+
+    std::vector<std::wstring> dependencyPaths;
+    dependencyPaths.push_back(g_state.aliasSupport.sourcePath);
+    dependencyPaths.push_back(g_state.aliasSupport.windowsLoaderPath);
+
+    const std::filesystem::path sourcePath(g_state.aliasSupport.sourcePath);
+    const std::filesystem::path sourceDirectory = sourcePath.parent_path();
+    if (!sourceDirectory.empty()) {
+        dependencyPaths.push_back((sourceDirectory / L"alias.local").wstring());
+        dependencyPaths.push_back((sourceDirectory / L"ShortcutMap.yaml").wstring());
+    }
+
+    std::sort(dependencyPaths.begin(), dependencyPaths.end());
+    dependencyPaths.erase(std::unique(dependencyPaths.begin(), dependencyPaths.end()), dependencyPaths.end());
+
+    std::wostringstream signature;
+    for (const std::wstring& path : dependencyPaths) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(path, error) && !error;
+        long long tickCount = 0;
+        if (exists) {
+            error.clear();
+            const auto lastWriteTime = std::filesystem::last_write_time(path, error);
+            if (!error) {
+                tickCount = static_cast<long long>(lastWriteTime.time_since_epoch().count());
+            }
+        }
+        signature << path << L'|' << (exists ? 1 : 0) << L'|' << tickCount << L'\n';
+    }
+
+    return signature.str();
+}
+
+void AppendAliasItemsToCollections(const std::vector<LaunchItem>& aliasItems, bool appendToResultItems) {
+    for (const LaunchItem& cachedItem : aliasItems) {
+        LaunchItem item = cachedItem;
+        const std::wstring nameKey = NormalizeCommandNameKey(item.name);
+        if (!nameKey.empty()) {
+            g_state.commandItemsByName.insert_or_assign(nameKey, item);
+        }
+        if (appendToResultItems) {
+            g_state.items.push_back(std::move(item));
+        }
+    }
 }
 
 std::wstring BuildCommandIdentity(const LaunchItem& item) {
@@ -3557,9 +3614,19 @@ void LoadAliasCommandItems(bool appendToResultItems) {
         return;
     }
 
+    const std::wstring dependencySignature = BuildAliasImportDependencySignature();
+    if (g_state.aliasImportCache.valid &&
+        g_state.aliasImportCache.dependencySignature == dependencySignature) {
+        AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
+        return;
+    }
+
     const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
     std::filesystem::create_directories(supportDirectory, error);
     if (error) {
+        if (g_state.aliasImportCache.valid) {
+            AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
+        }
         return;
     }
 
@@ -3573,11 +3640,15 @@ void LoadAliasCommandItems(bool appendToResultItems) {
         QuoteCommandLineArgument(listFilePath) +
         L"\"";
     if (!RunProcessAndWaitHidden(commandLine, std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring())) {
+        if (g_state.aliasImportCache.valid) {
+            AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
+        }
         return;
     }
 
     std::wstringstream stream(LoadUtf8TextFile(listFilePath));
     std::wstring line;
+    std::vector<LaunchItem> importedItems;
     while (std::getline(stream, line)) {
         const std::wstring trimmedLine = Trim(line);
         if (trimmedLine.empty()) {
@@ -3602,14 +3673,13 @@ void LoadAliasCommandItems(bool appendToResultItems) {
 
         PopulateSearchFields(item);
         item.itemKey = BuildItemKey(item.sourceKind, BuildCommandIdentity(item), item.workingDirectory);
-        const std::wstring nameKey = NormalizeCommandNameKey(item.name);
-        if (!nameKey.empty()) {
-            g_state.commandItemsByName.insert_or_assign(nameKey, item);
-        }
-        if (appendToResultItems) {
-            g_state.items.push_back(std::move(item));
-        }
+        importedItems.push_back(std::move(item));
     }
+
+    g_state.aliasImportCache.dependencySignature = dependencySignature;
+    g_state.aliasImportCache.items = importedItems;
+    g_state.aliasImportCache.valid = true;
+    AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
 }
 
 void LoadCommandItems(bool appendToResultItems = true) {
