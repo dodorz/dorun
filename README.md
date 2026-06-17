@@ -18,6 +18,7 @@ Main capabilities:
 - Built-in slash commands such as `/reload`, `/kill`, `/config`, and `/cmdconfig`.
 - Managed hotkeys that launch specific commands directly.
 - `STARTUP` tasks that run when DoRun starts in startup mode.
+- Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
 - `CRON` tasks for scheduled launches.
 - Usage history stored in SQLite with ranking, decay, pruning, recency, and optional fuzzy matching.
 - Live config reload support for `DoRun.yaml` and `Command.conf`.
@@ -155,9 +156,10 @@ Default indexed file types are `.exe` and `.lnk`, with optional `PATHEXT` suppor
 
 `Command.conf` supports several command blocks:
 
-- `STARTUP`
+- `STARTUP` — run with `-startup` or `-run STARTUP`
 - `CRON`
 - `HOTKEY` or `HOTKEYS`
+- Named groups (e.g. `WORK{...}`) — run with `-run WORK`
 
 Commands support launch options such as:
 
