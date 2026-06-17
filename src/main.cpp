@@ -1614,7 +1614,7 @@ HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSiz
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
     }
 
-    const std::wstring_view resolvedFamily = fontFamily.empty() ? std::wstring_view(L"Segoe UI Variable") : fontFamily;
+    const std::wstring_view resolvedFamily = fontFamily.empty() ? std::wstring_view(L"Segoe UI") : fontFamily;
     wcsncpy_s(metrics.lfMessageFont.lfFaceName, resolvedFamily.data(), _TRUNCATE);
 
     if (pointSize > 0) {
