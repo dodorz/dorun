@@ -340,17 +340,6 @@ int Scale(int value) {
     return MulDiv(value, g_state.dpi, USER_DEFAULT_SCREEN_DPI);
 }
 
-COLORREF BlendColor(COLORREF from, COLORREF to, int numerator, int denominator) {
-    if (denominator <= 0) {
-        return from;
-    }
-
-    const int red = (GetRValue(from) * (denominator - numerator) + GetRValue(to) * numerator) / denominator;
-    const int green = (GetGValue(from) * (denominator - numerator) + GetGValue(to) * numerator) / denominator;
-    const int blue = (GetBValue(from) * (denominator - numerator) + GetBValue(to) * numerator) / denominator;
-    return RGB(red, green, blue);
-}
-
 std::wstring Trim(std::wstring_view text) {
     size_t start = 0;
     while (start < text.size() && iswspace(text[start]) != 0) {
@@ -4952,58 +4941,6 @@ void PaintLauncherSurface(HDC dc, const RECT& bounds) {
     DeleteObject(borderPen);
 }
 
-void DrawLauncherListItem(const DRAWITEMSTRUCT& drawItem) {
-    if (drawItem.itemID == static_cast<UINT>(-1)) {
-        return;
-    }
-
-    wchar_t text[512] {};
-    if (SendMessageW(drawItem.hwndItem, LB_GETTEXT, drawItem.itemID, reinterpret_cast<LPARAM>(text)) == LB_ERR) {
-        return;
-    }
-
-    RECT bounds = drawItem.rcItem;
-    const bool selected = (drawItem.itemState & ODS_SELECTED) != 0;
-    const bool focused = (drawItem.itemState & ODS_FOCUS) != 0;
-    const COLORREF itemBackground = selected
-        ? BlendColor(g_state.launcherAppearance.accentColor, RGB(255, 255, 255), 3, 20)
-        : g_state.launcherAppearance.backgroundColor;
-    const COLORREF textColor = selected
-        ? g_state.launcherAppearance.accentColor
-        : g_state.launcherAppearance.textColor;
-
-    HBRUSH itemBrush = CreateSolidBrush(itemBackground);
-    if (itemBrush != nullptr) {
-        FillRect(drawItem.hDC, &bounds, itemBrush);
-        DeleteObject(itemBrush);
-    }
-
-    RECT highlightRect = bounds;
-    InflateRect(&highlightRect, -Scale(6), -Scale(3));
-    HBRUSH highlightBrush = CreateSolidBrush(itemBackground);
-    if (highlightBrush != nullptr) {
-        FillRect(drawItem.hDC, &highlightRect, highlightBrush);
-        DeleteObject(highlightBrush);
-    }
-
-    SetBkMode(drawItem.hDC, TRANSPARENT);
-    SetTextColor(drawItem.hDC, textColor);
-
-    const HGDIOBJ oldFont = SelectObject(drawItem.hDC, g_state.resultFont);
-    RECT textRect = highlightRect;
-    textRect.left += Scale(10);
-    textRect.right -= Scale(10);
-    DrawTextW(drawItem.hDC, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    if (oldFont != nullptr) {
-        SelectObject(drawItem.hDC, oldFont);
-    }
-
-    if (focused) {
-        RECT focusRect = highlightRect;
-        DrawFocusRect(drawItem.hDC, &focusRect);
-    }
-}
-
 void UpdateSearchEditMargins() {
     if (g_state.searchEdit == nullptr) {
         return;
@@ -5020,7 +4957,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     switch (message) {
     case WM_CREATE:
         g_state.searchEdit = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH)), g_state.instance, nullptr);
-        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
+        g_state.resultList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESULTS)), g_state.instance, nullptr);
         g_state.descriptionText = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DESCRIPTION)), g_state.instance, nullptr);
         ApplyFont(g_state.searchEdit, g_state.searchFont);
         ApplyFont(g_state.resultList, g_state.resultFont);
@@ -5076,19 +5013,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         SetTextColor(dc, g_state.launcherAppearance.textColor);
         return reinterpret_cast<LRESULT>(g_state.launcherBackgroundBrush != nullptr ? g_state.launcherBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     }
-    case WM_MEASUREITEM:
-        if (wParam == IDC_RESULTS) {
-            auto* measureItem = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-            measureItem->itemHeight = static_cast<UINT>(std::max(Scale(38), MeasureFontTextHeight(g_state.resultFont) + Scale(12)));
-            return TRUE;
-        }
-        break;
-    case WM_DRAWITEM:
-        if (wParam == IDC_RESULTS) {
-            DrawLauncherListItem(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
-            return TRUE;
-        }
-        break;
+
     case WM_TIMER:
         if (wParam == kVisibilityTimerId) {
             const HWND foregroundWindow = GetForegroundWindow();
