@@ -240,6 +240,7 @@ struct AppState {
     ULONGLONG lastItemsRefreshTick = 0;
     ULONGLONG lastHistoryRefreshTick = 0;
     bool startupMode = false;
+    std::wstring groupRunName;
 };
 
 AppState g_state {};
@@ -3794,6 +3795,10 @@ void LoadCommandItems(bool appendToResultItems = true) {
             SkipCommandBlock(stream);
             continue;
         }
+        if (trimmedLine.ends_with(L"{") && !IsCommandCommentLine(trimmedLine)) {
+            SkipCommandBlock(stream);
+            continue;
+        }
 
         std::vector<std::wstring> fields = SplitCommandFields(trimmedLine);
         if (fields.size() < 2) {
@@ -3990,7 +3995,11 @@ void LoadManagedHotkeys() {
     }
 }
 
-void RunStartupCommands() {
+void RunNamedGroup(const std::wstring& groupName) {
+    if (groupName.empty()) {
+        return;
+    }
+
     std::wifstream stream(FindConfigPath(kCommandFileName));
     if (!stream.is_open()) {
         return;
@@ -4000,7 +4009,7 @@ void RunStartupCommands() {
     std::wstring line;
     while (std::getline(stream, line)) {
         const std::wstring trimmedLine = Trim(line);
-        if (IsCommandCommentLine(trimmedLine) || !IsCommandBlockStart(trimmedLine, L"STARTUP")) {
+        if (IsCommandCommentLine(trimmedLine) || !IsCommandBlockStart(trimmedLine, groupName)) {
             continue;
         }
 
@@ -4044,6 +4053,10 @@ void RunStartupCommands() {
     }
 }
 
+void RunStartupCommands() {
+    RunNamedGroup(L"STARTUP");
+}
+
 void RunCronTasks() {
     if (g_state.cronTasks.empty()) {
         return;
@@ -4079,11 +4092,12 @@ void StartConfigWatchTimer() {
     }
 }
 
-bool ShouldRunStartupCommands() {
-    if (g_state.startupMode) {
-        return true;
-    }
+bool IsReservedGroupName(std::wstring_view name) {
+    const std::wstring lower = Lowercase(name);
+    return lower == L"startup" || lower == L"cron" || lower == L"hotkey" || lower == L"hotkeys";
+}
 
+bool ParseRunArgument() {
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     if (arguments == nullptr) {
@@ -4095,6 +4109,12 @@ bool ShouldRunStartupCommands() {
         std::wstring_view argument(arguments[index]);
         if (argument == L"/startup" || argument == L"-startup" || argument == L"--startup") {
             shouldRun = true;
+            g_state.groupRunName = L"STARTUP";
+            break;
+        }
+        if (argument == L"-run" && index + 1 < argumentCount) {
+            g_state.groupRunName = arguments[index + 1];
+            shouldRun = !g_state.groupRunName.empty();
             break;
         }
     }
@@ -5233,8 +5253,12 @@ void InitializeDpi() {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_state.instance = instance;
     g_state.startupMode = false;
-    const bool startupMode = ShouldRunStartupCommands();
-    g_state.startupMode = startupMode;
+    const bool runMode = ParseRunArgument();
+    g_state.startupMode = runMode;
+    if (runMode && IsReservedGroupName(g_state.groupRunName)) {
+        MessageBoxW(nullptr, (L"Reserved group name: " + g_state.groupRunName).c_str(), L"DoRun", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     if (NotifyExistingInstanceAndExit()) {
         return 0;
     }
@@ -5270,7 +5294,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     ConfigureKeyboardHook();
     ShowHotkeyRegistrationFailures();
     if (g_state.startupMode) {
-        RunStartupCommands();
+        RunNamedGroup(g_state.groupRunName);
     }
     RunCronTasks();
     StartCronTimer();
