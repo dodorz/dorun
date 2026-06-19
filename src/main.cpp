@@ -3784,22 +3784,11 @@ void LoadCommandItems(bool appendToResultItems = true) {
             SkipCommandBlock(stream);
             continue;
         }
-        if (trimmedLine.ends_with(L"{") && !IsCommandCommentLine(trimmedLine)) {
-            SkipCommandBlock(stream);
-            continue;
-        }
 
         std::vector<std::wstring> fields = SplitCommandFields(trimmedLine);
-        if (fields.size() < 2) {
-            continue;
-        }
-
-        LaunchItem item {};
-        item.name = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[0])));
-        item.sourceKind = ItemSourceKind::CommandConf;
 
         bool startsInlineBatch = false;
-        if (fields[1].empty() && trimmedLine.ends_with(L"{") && !fields.empty()) {
+        if (fields.size() >= 2 && fields[1].empty() && trimmedLine.ends_with(L"{")) {
             if (fields.back() == L"{") {
                 fields.pop_back();
                 startsInlineBatch = true;
@@ -3809,6 +3798,19 @@ void LoadCommandItems(bool appendToResultItems = true) {
                 startsInlineBatch = true;
             }
         }
+
+        if (!startsInlineBatch && trimmedLine.ends_with(L"{") && !IsCommandCommentLine(trimmedLine)) {
+            SkipCommandBlock(stream);
+            continue;
+        }
+
+        if (fields.size() < 2) {
+            continue;
+        }
+
+        LaunchItem item {};
+        item.name = ExpandCommandVariables(UnescapeCommandField(StripOuterQuotes(fields[0])));
+        item.sourceKind = ItemSourceKind::CommandConf;
 
         if (startsInlineBatch) {
             if (fields.size() > 2 && !fields[2].empty()) {
