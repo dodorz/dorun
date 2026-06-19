@@ -56,13 +56,12 @@ jobs:
             }
 
             $currentSeries = ($version -replace '^v', '') -replace '\.\d+$', ''
-            $previousTag = git tag --sort=-version:refname |
-              Where-Object {
-                $_ -match '^v?\d+\.\d+\.\d+\.\d+$' -and
-                $_ -ne $rawVersion -and
-                $_ -ne $version
-              } |
-              Select-Object -First 1
+            $previousTag = ""
+            try {
+              $previousTag = (git describe --tags --abbrev=0 HEAD~1 2>$null) ?? ""
+            } catch {
+              $previousTag = ""
+            }
 
             if (-not $previousTag) {
               $isRelease = "true"
