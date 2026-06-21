@@ -4085,7 +4085,7 @@ void StartConfigWatchTimer() {
 
 bool IsReservedGroupName(std::wstring_view name) {
     const std::wstring lower = Lowercase(name);
-    return lower == L"startup" || lower == L"cron" || lower == L"hotkey" || lower == L"hotkeys";
+    return lower == L"cron" || lower == L"hotkey" || lower == L"hotkeys";
 }
 
 bool ParseRunArgument() {
