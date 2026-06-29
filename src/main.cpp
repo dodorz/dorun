@@ -265,9 +265,13 @@ constexpr ULONG_PTR kInjectedHotkeyExtraInfo = 0x44524E484B455955ULL;
 constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr UINT kMessageSingletonShowLauncher = WM_APP + 3;
+constexpr UINT kMessageSingletonRunGroup = WM_APP + 4;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
+constexpr UINT_PTR kSearchDebounceTimerId = 5;
+constexpr UINT kSearchDebounceDelayMs = 30;
+constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
 
@@ -1438,7 +1442,7 @@ bool IsSubsequenceMatch(std::wstring_view text, std::wstring_view query) {
 
     size_t queryIndex = 0;
     for (const wchar_t ch : text) {
-        if (towlower(ch) == towlower(query[queryIndex])) {
+        if (ch == query[queryIndex]) {
             ++queryIndex;
             if (queryIndex == query.size()) {
                 return true;
@@ -1800,6 +1804,7 @@ void LayoutLauncher() {
 void HideLauncher() {
     if (g_state.launcherWindow != nullptr) {
         KillTimer(g_state.launcherWindow, kVisibilityTimerId);
+        KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
     }
     CancelDeferredRefresh();
     ShowWindow(g_state.launcherWindow, SW_HIDE);
@@ -4126,8 +4131,15 @@ bool NotifyExistingInstanceAndExit() {
     }
 
     const HWND existingHostWindow = FindWindowW(kHostClassName, kSingletonHostWindowTitle);
-    if (existingHostWindow != nullptr && !g_state.startupMode) {
-        PostMessageW(existingHostWindow, kMessageSingletonShowLauncher, 0, 0);
+    if (existingHostWindow != nullptr) {
+        if (g_state.startupMode && !g_state.groupRunName.empty()) {
+            const ATOM atom = GlobalAddAtomW(g_state.groupRunName.c_str());
+            if (atom != 0) {
+                PostMessageW(existingHostWindow, kMessageSingletonRunGroup, 0, static_cast<LPARAM>(atom));
+            }
+        } else {
+            PostMessageW(existingHostWindow, kMessageSingletonShowLauncher, 0, 0);
+        }
     }
     return true;
 }
@@ -4561,7 +4573,9 @@ void RebuildResultList() {
         return _wcsicmp(lhsItem.name.c_str(), rhsItem.name.c_str()) < 0;
     });
 
-    for (const RankedResult& result : rankedResults) {
+    const size_t displayLimit = (std::min)(rankedResults.size(), kMaxDisplayedResults);
+    for (size_t di = 0; di < displayLimit; ++di) {
+        const RankedResult& result = rankedResults[di];
         const LaunchItem& item = g_state.items[result.itemIndex];
         const LRESULT inserted = SendMessageW(g_state.resultList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.name.c_str()));
         if (inserted >= 0) {
@@ -4982,7 +4996,8 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_SEARCH && HIWORD(wParam) == EN_CHANGE) {
             RecordSearchInputActivity();
-            RequestResultListRebuild();
+            KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
+            SetTimer(g_state.launcherWindow, kSearchDebounceTimerId, kSearchDebounceDelayMs, nullptr);
             return 0;
         }
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_DBLCLK) {
@@ -5037,6 +5052,11 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
             RequestLauncherDataRefresh(false, false);
             return 0;
         }
+        if (wParam == kSearchDebounceTimerId) {
+            KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
+            RequestResultListRebuild();
+            return 0;
+        }
         break;
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
@@ -5084,6 +5104,9 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         return 0;
     }
     if (message == WM_TIMER && wParam == kConfigWatchTimerId) {
+        if (ShouldDeferRefreshForActiveTyping()) {
+            return 0;
+        }
         if (DidMonitoredConfigFilesChange()) {
             ReloadAllConfiguration(false);
         }
@@ -5091,6 +5114,16 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
     if (message == kMessageSingletonShowLauncher) {
         ShowLauncher();
+        return 0;
+    }
+    if (message == kMessageSingletonRunGroup) {
+        wchar_t groupName[256] {};
+        if (lParam != 0 && GlobalGetAtomNameW(static_cast<ATOM>(lParam), groupName, static_cast<UINT>(std::size(groupName))) > 0) {
+            RunNamedGroup(groupName);
+        }
+        if (lParam != 0) {
+            GlobalDeleteAtom(static_cast<ATOM>(lParam));
+        }
         return 0;
     }
     if (message == kMessageRefreshLauncherData) {
