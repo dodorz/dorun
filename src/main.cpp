@@ -257,7 +257,7 @@ constexpr UINT_PTR kDeferredRefreshTimerId = 2;
 constexpr UINT_PTR kCronTimerId = 3;
 constexpr UINT_PTR kConfigWatchTimerId = 4;
 constexpr UINT kVisibilityTimerIntervalMs = 100;
-constexpr UINT kDeferredRefreshCheckIntervalMs = 120;
+constexpr UINT kDeferredRefreshCheckIntervalMs = 300;
 constexpr UINT kCronTimerIntervalMs = 30 * 1000;
 constexpr UINT kConfigWatchTimerIntervalMs = 1000;
 constexpr DWORD kCronRestartTerminateWaitMs = 5000;
@@ -266,11 +266,12 @@ constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr UINT kMessageSingletonShowLauncher = WM_APP + 3;
 constexpr UINT kMessageSingletonRunGroup = WM_APP + 4;
-constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 500;
+constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 2000;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
+constexpr ULONGLONG kRefreshBlockAfterInputMs = 3000;
 constexpr UINT_PTR kSearchDebounceTimerId = 5;
-constexpr UINT kSearchDebounceDelayMs = 30;
+constexpr UINT kSearchDebounceDelayMs = 50;
 constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
@@ -1577,7 +1578,7 @@ std::optional<SYSTEMTIME> ParseUtcTimestamp(std::wstring_view value) {
     return timestamp;
 }
 
-int ComputeRecencyBonus(const std::wstring& lastRunUtc) {
+int ComputeRecencyBonus(const std::wstring& lastRunUtc, ULONGLONG nowTicks) {
     if (!g_state.historyConfig.recencyEnabled || lastRunUtc.empty()) {
         return 0;
     }
@@ -1587,9 +1588,6 @@ int ComputeRecencyBonus(const std::wstring& lastRunUtc) {
         return 0;
     }
 
-    SYSTEMTIME nowUtc {};
-    GetSystemTime(&nowUtc);
-    const ULONGLONG nowTicks = SystemTimeToUnixLikeTicks(nowUtc);
     const ULONGLONG lastRunTicks = SystemTimeToUnixLikeTicks(*lastRun);
     if (nowTicks <= lastRunTicks) {
         return 30;
@@ -4444,6 +4442,14 @@ bool ShouldDeferRefreshForActiveTyping() {
 
 void RefreshLauncherDataIfNeeded(bool forceItems, bool forceHistory) {
     const ULONGLONG now = GetTickCount64();
+
+    // Block heavy auto-refreshes while user is actively interacting with search
+    if (!forceItems && !forceHistory &&
+        g_state.lastSearchInputTick > 0 &&
+        (now - g_state.lastSearchInputTick) < kRefreshBlockAfterInputMs) {
+        return;
+    }
+
     const bool shouldRefreshItems = forceItems ||
         !g_state.launcherDataLoaded ||
         (now - g_state.lastItemsRefreshTick) >= kItemsRefreshIntervalMs;
@@ -4503,6 +4509,13 @@ void RebuildResultList() {
     const std::wstring normalizedQuery = Lowercase(query);
     std::vector<std::wstring> normalizedTokens = SplitQueryTokens(normalizedQuery);
 
+    ULONGLONG nowTicks = 0;
+    if (g_state.historyConfig.recencyEnabled) {
+        SYSTEMTIME nowUtc {};
+        GetSystemTime(&nowUtc);
+        nowTicks = SystemTimeToUnixLikeTicks(nowUtc);
+    }
+
     SendMessageW(g_state.resultList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_state.resultList, LB_RESETCONTENT, 0, 0);
 
@@ -4547,7 +4560,7 @@ void RebuildResultList() {
             if (const auto it = g_state.historyByKey.find(item.itemKey); it != g_state.historyByKey.end()) {
                 result.rank = it->second.rank;
                 result.lastRunUtc = it->second.lastRunUtc;
-                result.recencyBonus = ComputeRecencyBonus(it->second.lastRunUtc);
+                result.recencyBonus = ComputeRecencyBonus(it->second.lastRunUtc, nowTicks);
             }
         }
         result.finalScore = static_cast<double>(matchScore) * 1000.0 + result.rank * 20.0 + static_cast<double>(result.recencyBonus);
