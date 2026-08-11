@@ -212,6 +212,7 @@ struct AppState {
     HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
     bool launcherHotkeyArmed = false;
     bool suppressHookWinKeyUp = false;
+    DWORD pendingHookWinKey = 0;
     std::vector<ScanDirectoryConfig> scanDirectories;
     std::vector<LaunchItem> items;
     HistoryConfig historyConfig {};
@@ -2005,11 +2006,10 @@ bool IsWindowsKeyDown() {
     return (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
 }
 
-bool AreHotkeyModifiersPressed(UINT modifiers) {
+bool AreHotkeyModifiersPressed(UINT modifiers, bool winDown) {
     const bool ctrlDown = IsModifierDown(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
     const bool altDown = IsModifierDown(VK_MENU, VK_LMENU, VK_RMENU);
     const bool shiftDown = IsModifierDown(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
-    const bool winDown = IsWindowsKeyDown();
 
     return ctrlDown == ((modifiers & MOD_CONTROL) != 0U) &&
         altDown == ((modifiers & MOD_ALT) != 0U) &&
@@ -2017,8 +2017,40 @@ bool AreHotkeyModifiersPressed(UINT modifiers) {
         winDown == ((modifiers & MOD_WIN) != 0U);
 }
 
+bool AreHotkeyModifiersPressed(UINT modifiers) {
+    return AreHotkeyModifiersPressed(modifiers, IsWindowsKeyDown());
+}
+
+bool IsKeyboardModifierKey(DWORD vkCode) {
+    return vkCode == VK_LCONTROL || vkCode == VK_RCONTROL ||
+        vkCode == VK_LMENU || vkCode == VK_RMENU ||
+        vkCode == VK_LSHIFT || vkCode == VK_RSHIFT;
+}
+
+bool AnyHotkeysUseWindowsKey() {
+    if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
+        return true;
+    }
+    return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [](const ManagedHotkey& hotkey) {
+        return (hotkey.hotkey.modifiers & MOD_WIN) != 0U;
+    });
+}
+
+bool IsWindowsHotkeyCandidate(DWORD vkCode) {
+    if ((g_state.hotkey.modifiers & MOD_WIN) != 0U && g_state.hotkey.vk == vkCode) {
+        return true;
+    }
+    return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [vkCode](const ManagedHotkey& hotkey) {
+        return (hotkey.hotkey.modifiers & MOD_WIN) != 0U && hotkey.hotkey.vk == vkCode;
+    });
+}
+
 bool AnyHotkeysUseKeyboardHook() {
-    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook) {
+    // RegisterHotKey delivers WM_HOTKEY but does not consume the Windows-key
+    // input.  A low-level hook is therefore also required for registered
+    // Win+key hotkeys, otherwise releasing Win can open the Start menu.
+    if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook ||
+        AnyHotkeysUseWindowsKey()) {
         return true;
     }
     return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [](const ManagedHotkey& hotkey) {
@@ -2030,7 +2062,13 @@ void RegisterLauncherHotkey() {
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
     g_state.launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
     g_state.launcherHotkeyArmed = false;
-    if (RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk) == FALSE) {
+    if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
+        // The Win key must be swallowed before Explorer sees its key-down
+        // event. RegisterHotKey cannot provide that guarantee, so use the
+        // low-level hook and post WM_HOTKEY ourselves for Win+key bindings.
+        g_state.launcherHotkeyBackend = HotkeyBackend::KeyboardHook;
+        AppendHotkeyDebugLog(L"Launcher Win hotkey uses keyboard hook: " + FormatHotkeyConfig(g_state.hotkey));
+    } else if (RegisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH, g_state.hotkey.modifiers, g_state.hotkey.vk) == FALSE) {
         g_state.launcherHotkeyBackend = HotkeyBackend::KeyboardHook;
         AppendHotkeyDebugLog(L"Launcher hotkey fell back to keyboard hook: " + FormatHotkeyConfig(g_state.hotkey));
     } else {
@@ -2061,7 +2099,12 @@ void RegisterManagedHotkeys() {
         hotkey.id = ID_HOTKEY_COMMAND_BASE + static_cast<UINT>(index);
         hotkey.backend = HotkeyBackend::RegisterHotKey;
         hotkey.armed = false;
-        if (RegisterHotKey(g_state.hostWindow, hotkey.id, hotkey.hotkey.modifiers, hotkey.hotkey.vk) == FALSE) {
+        if ((hotkey.hotkey.modifiers & MOD_WIN) != 0U) {
+            // See RegisterLauncherHotkey: RegisterHotKey does not reliably
+            // prevent Explorer from handling the Windows key itself.
+            hotkey.backend = HotkeyBackend::KeyboardHook;
+            AppendHotkeyDebugLog(L"Managed Win hotkey uses keyboard hook: " + hotkey.spec + L" -> " + hotkey.item.commandLine);
+        } else if (RegisterHotKey(g_state.hostWindow, hotkey.id, hotkey.hotkey.modifiers, hotkey.hotkey.vk) == FALSE) {
             hotkey.backend = HotkeyBackend::KeyboardHook;
             AppendHotkeyDebugLog(L"Managed hotkey fell back to keyboard hook: " + hotkey.spec + L" -> " + hotkey.item.commandLine);
         } else {
@@ -2077,6 +2120,7 @@ void UninstallKeyboardHook() {
     }
     g_state.launcherHotkeyArmed = false;
     g_state.suppressHookWinKeyUp = false;
+    g_state.pendingHookWinKey = 0;
     for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
         hotkey.armed = false;
     }
@@ -2130,17 +2174,24 @@ bool DidMonitoredConfigFilesChange() {
     return false;
 }
 
-void InjectWindowsKeyUp(DWORD vkCode) {
+void InjectWindowsKeyEvent(DWORD vkCode, DWORD flags) {
     INPUT input {};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = static_cast<WORD>(vkCode);
-    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    input.ki.dwFlags = flags;
     input.ki.dwExtraInfo = kInjectedHotkeyExtraInfo;
     SendInput(1, &input, sizeof(input));
 }
 
+void InjectWindowsKeyDown(DWORD vkCode) {
+    InjectWindowsKeyEvent(vkCode, 0);
+}
+
+void InjectWindowsKeyUp(DWORD vkCode) {
+    InjectWindowsKeyEvent(vkCode, KEYEVENTF_KEYUP);
+}
+
 bool HandleHookHotkeyKeyRelease(DWORD vkCode) {
-    bool suppress = false;
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook &&
         g_state.launcherHotkeyArmed &&
         vkCode == g_state.hotkey.vk) {
@@ -2155,21 +2206,37 @@ bool HandleHookHotkeyKeyRelease(DWORD vkCode) {
         }
     }
 
-    if (g_state.suppressHookWinKeyUp && (vkCode == VK_LWIN || vkCode == VK_RWIN)) {
-        g_state.suppressHookWinKeyUp = false;
-        InjectWindowsKeyUp(vkCode);
-        suppress = true;
+    if (vkCode != VK_LWIN && vkCode != VK_RWIN) {
+        return false;
     }
 
-    return suppress;
+    if (g_state.pendingHookWinKey == 0) {
+        return false;
+    }
+
+    const bool matchedHotkey = g_state.suppressHookWinKeyUp;
+    const DWORD pendingWinKey = g_state.pendingHookWinKey;
+    g_state.pendingHookWinKey = 0;
+    g_state.suppressHookWinKeyUp = false;
+    if (!matchedHotkey) {
+        // The physical Win key-down was held back while we waited to see if
+        // this was one of DoRun's Win+key combinations. Replay a complete
+        // press for a plain Win key so normal Start-menu behavior is kept.
+        InjectWindowsKeyDown(pendingWinKey);
+        InjectWindowsKeyUp(pendingWinKey);
+    }
+    // For a matched hotkey, no Win key-down was delivered to Explorer, so do
+    // not inject a key-up: doing so can itself open the Start menu.
+    return true;
 }
 
-bool HandleHookHotkeyKeyDown(DWORD vkCode) {
+bool HandleHookHotkeyKeyDown(DWORD vkCode, bool winDown) {
     bool suppress = false;
+    const bool launcherHotkeyMatches =
+        vkCode == g_state.hotkey.vk && AreHotkeyModifiersPressed(g_state.hotkey.modifiers, winDown);
 
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook &&
-        vkCode == g_state.hotkey.vk &&
-        AreHotkeyModifiersPressed(g_state.hotkey.modifiers)) {
+        launcherHotkeyMatches) {
         suppress = true;
         if (!g_state.launcherHotkeyArmed) {
             g_state.launcherHotkeyArmed = true;
@@ -2185,7 +2252,7 @@ bool HandleHookHotkeyKeyDown(DWORD vkCode) {
         if (hotkey.backend != HotkeyBackend::KeyboardHook || vkCode != hotkey.hotkey.vk) {
             continue;
         }
-        if (!AreHotkeyModifiersPressed(hotkey.hotkey.modifiers)) {
+        if (!AreHotkeyModifiersPressed(hotkey.hotkey.modifiers, winDown)) {
             continue;
         }
 
@@ -2218,7 +2285,41 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
         suppress = HandleHookHotkeyKeyRelease(vkCode);
     } else if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-        suppress = HandleHookHotkeyKeyDown(vkCode);
+        if ((vkCode == VK_LWIN || vkCode == VK_RWIN) &&
+            g_state.pendingHookWinKey == 0 && AnyHotkeysUseWindowsKey()) {
+            // Do not let Explorer see Win-down until we know whether the next
+            // key completes one of DoRun's Win hotkeys. This is the important
+            // difference from merely replacing Win-key-up: Explorer can open
+            // Start from the original Win-down/up pair itself.
+            g_state.pendingHookWinKey = vkCode;
+            return 1;
+        }
+        if (vkCode == VK_LWIN || vkCode == VK_RWIN) {
+            // Ignore auto-repeat or an overlapping second Windows key while
+            // the first one is being resolved.
+            return 1;
+        }
+        if (g_state.pendingHookWinKey != 0 && g_state.suppressHookWinKeyUp) {
+            // A matched Win hotkey owns the whole chord until Win is released.
+            // Do not replay Win-down if another key is pressed meanwhile.
+            return 1;
+        }
+
+        const bool winDown = g_state.pendingHookWinKey != 0 || IsWindowsKeyDown();
+        suppress = HandleHookHotkeyKeyDown(vkCode, winDown);
+        if (g_state.pendingHookWinKey != 0 && !suppress && !IsKeyboardModifierKey(vkCode)) {
+            if (IsWindowsHotkeyCandidate(vkCode)) {
+                // The key belongs to a configured Win hotkey, but an extra
+                // modifier may have made the exact combination invalid. It
+                // must still not leak a Win press to Explorer.
+                g_state.suppressHookWinKeyUp = true;
+                suppress = true;
+            } else {
+                const DWORD pendingWinKey = g_state.pendingHookWinKey;
+                g_state.pendingHookWinKey = 0;
+                InjectWindowsKeyDown(pendingWinKey);
+            }
+        }
     }
 
     if (suppress) {
