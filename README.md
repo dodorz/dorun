@@ -64,15 +64,17 @@ Define reusable variables under `VARS`. Command.conf entries reference them as `
 | `TERMINAL` | `'wt.exe'` | Custom commands | Terminal emulator path. Used in wrapper templates. |
 | `CWD_FLAG` | `'-d "${CWD}"'` | Custom commands | Terminal's working-directory argument. `${CWD}` stays as a literal until launch time. |
 
-Optional alias DSL integration:
+Optional alias DSL integration uses the `aliasc` compiler:
 
 ```yaml
 ALIASES:
   FILE: 'C:\~\.config\alias'
-  WINDOWS_LOADER: 'C:\~\.config\LoadAlias.ps1'
+  # Optional. Defaults to C:\~\Scoop\apps\aliasc\current\aliasc.exe,
+  # then falls back to `scoopx aliasc`.
+  COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
 ```
 
-When `ALIASES` is configured, DoRun treats the alias definition file as an additional command source. On Windows it uses `WINDOWS_LOADER` to enumerate active alias definitions, and each alias becomes directly runnable from the launcher.
+When `ALIASES` is configured, DoRun invokes `aliasc` to compile the source for PowerShell, CMD, and POSIX shells. It imports the names reported by `aliasc list --shell powershell` into the launcher; selecting one runs the corresponding generated PowerShell function. The compiler also includes the adjacent `alias.local` and `ShortcutMap.yaml` files according to its own defaults.
 
 Example:
 
@@ -84,8 +86,9 @@ VARS:
   CWD_FLAG: '-d "${CWD}"'
 ALIASES:
   FILE: 'C:\~\.config\alias'
-  WINDOWS_LOADER: 'C:\~\.config\LoadAlias.ps1'
-  # Switch to PowerShell:
+  COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
+  # Or use the fallback command:
+  # COMPILER: 'scoopx aliasc'
   # TERMINAL: 'pwsh.exe'
   # CWD_FLAG: '-WorkingDirectory "${CWD}"'
 ```

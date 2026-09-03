@@ -49,12 +49,13 @@ VARS:
   TERMINAL: 'wt.exe'
   CWD_FLAG: '-d "${CWD}"'
 
-# Optional alias DSL integration.
-# DoRun imports this file as an additional command source.
-# On Windows, `WINDOWS_LOADER` should point at `LoadAlias.ps1`.
+# Optional alias DSL integration using aliasc.
+# DoRun compiles this file for PowerShell, CMD, and POSIX shells.
+# The compiler defaults to C:\~\Scoop\apps\aliasc\current\aliasc.exe,
+# then falls back to `scoopx aliasc`.
 ALIASES:
   FILE: 'C:\~\.config\alias'
-  WINDOWS_LOADER: 'C:\~\.config\LoadAlias.ps1'
+  COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''
