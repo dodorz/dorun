@@ -74,12 +74,16 @@ struct ViewerConfig {
 
 struct AliasSupportConfig {
     std::wstring sourcePath;
-    std::wstring windowsLoaderPath;
-    std::wstring bashLoaderPath;
-    std::wstring cmdMacroFilePath;
+    std::wstring compilerCommand;
+    std::wstring compilerPath;
+    std::wstring cmdOutputPath;
     std::wstring cmdBootstrapPath;
+    std::wstring powershellOutputPath;
     std::wstring powershellBootstrapPath;
-    std::wstring bashBootstrapPath;
+    std::wstring powershellRunnerPath;
+    std::wstring posixOutputPath;
+    std::wstring posixBootstrapPath;
+    bool compilerReady = false;
 };
 
 struct HistoryInfo {
@@ -989,75 +993,131 @@ std::wstring QuoteForShellScript(std::wstring_view text) {
     return quoted;
 }
 
-std::string ConvertWideToUtf8(std::wstring_view text) {
-    if (text.empty()) {
-        return {};
+std::wstring QuoteForPowerShellScript(std::wstring_view text) {
+    std::wstring quoted;
+    quoted.reserve(text.size() + 2);
+    quoted.push_back(L'\'');
+    for (const wchar_t ch : text) {
+        if (ch == L'\'') {
+            quoted += L"''";
+        } else {
+            quoted.push_back(ch);
+        }
     }
-
-    const int required = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        text.data(),
-        static_cast<int>(text.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
-    if (required <= 0) {
-        return {};
-    }
-
-    std::string utf8(static_cast<size_t>(required), '\0');
-    const int written = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        text.data(),
-        static_cast<int>(text.size()),
-        utf8.data(),
-        required,
-        nullptr,
-        nullptr);
-    if (written <= 0) {
-        return {};
-    }
-
-    utf8.resize(static_cast<size_t>(written));
-    return utf8;
+    quoted.push_back(L'\'');
+    return quoted;
 }
 
-std::wstring Base64EncodeUtf8(std::wstring_view text) {
-    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    const std::string utf8 = ConvertWideToUtf8(text);
-    if (utf8.empty()) {
-        return L"";
+std::wstring GetAliasCompilerCommand() {
+    const std::filesystem::path installedCompiler(L"C:\\~\\Scoop\\apps\\aliasc\\current\\aliasc.exe");
+    std::error_code error;
+    if (std::filesystem::exists(installedCompiler, error) && !error) {
+        return QuoteCommandLineArgument(installedCompiler.wstring());
     }
-
-    std::string encoded;
-    encoded.reserve(((utf8.size() + 2) / 3) * 4);
-
-    for (size_t index = 0; index < utf8.size(); index += 3) {
-        const unsigned char b0 = static_cast<unsigned char>(utf8[index]);
-        const unsigned char b1 = (index + 1 < utf8.size()) ? static_cast<unsigned char>(utf8[index + 1]) : 0;
-        const unsigned char b2 = (index + 2 < utf8.size()) ? static_cast<unsigned char>(utf8[index + 2]) : 0;
-        const unsigned int triple = (static_cast<unsigned int>(b0) << 16) |
-            (static_cast<unsigned int>(b1) << 8) |
-            static_cast<unsigned int>(b2);
-
-        encoded.push_back(kAlphabet[(triple >> 18) & 0x3F]);
-        encoded.push_back(kAlphabet[(triple >> 12) & 0x3F]);
-        encoded.push_back(index + 1 < utf8.size() ? kAlphabet[(triple >> 6) & 0x3F] : '=');
-        encoded.push_back(index + 2 < utf8.size() ? kAlphabet[triple & 0x3F] : '=');
-    }
-
-    return std::wstring(encoded.begin(), encoded.end());
+    return L"scoopx aliasc";
 }
 
-std::wstring MakeAliasRunnerCommandLine(std::wstring_view loaderPath, std::wstring_view aliasBody) {
+std::wstring BuildAliasCompilerArguments(
+    std::wstring_view mode,
+    std::wstring_view shell,
+    std::wstring_view sourcePath,
+    std::wstring_view outputPath = {},
+    std::wstring_view platform = L"windows") {
+    std::wstring arguments = std::wstring(mode) +
+        L" --shell " + std::wstring(shell) +
+        L" --platform " + std::wstring(platform) +
+        L" --distro auto --environment auto --source " +
+        QuoteCommandLineArgument(std::wstring(sourcePath));
+    if (!outputPath.empty()) {
+        arguments += L" --output " + QuoteCommandLineArgument(std::wstring(outputPath));
+    }
+    return arguments;
+}
+
+bool RunAliasCompiler(
+    std::wstring_view compilerCommand,
+    std::wstring_view arguments,
+    std::wstring_view workingDirectory) {
+    const std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments);
+    return RunProcessAndWaitHidden(L"cmd.exe /d /c \"" + command + L"\"", workingDirectory);
+}
+
+bool RunAliasCompilerToFile(
+    std::wstring_view compilerCommand,
+    std::wstring_view arguments,
+    std::wstring_view outputPath,
+    std::wstring_view workingDirectory) {
+    const std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments) +
+        L" > " + QuoteCommandLineArgument(std::wstring(outputPath));
+    return RunProcessAndWaitHidden(L"cmd.exe /d /c \"" + command + L"\"", workingDirectory);
+}
+
+bool CompileAliasArtifacts() {
+    if (!g_state.aliasSupport.compilerReady || g_state.aliasSupport.sourcePath.empty()) {
+        return false;
+    }
+
+    const std::wstring workingDirectory = std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
+    const bool powershellCompiled = RunAliasCompiler(
+        g_state.aliasSupport.compilerCommand,
+        BuildAliasCompilerArguments(
+            L"compile",
+            L"powershell",
+            g_state.aliasSupport.sourcePath,
+            g_state.aliasSupport.powershellOutputPath,
+            L"windows"),
+        workingDirectory);
+    const bool cmdCompiled = RunAliasCompiler(
+        g_state.aliasSupport.compilerCommand,
+        BuildAliasCompilerArguments(
+            L"compile",
+            L"cmd",
+            g_state.aliasSupport.sourcePath,
+            g_state.aliasSupport.cmdOutputPath,
+            L"windows"),
+        workingDirectory);
+    const bool posixCompiled = RunAliasCompiler(
+        g_state.aliasSupport.compilerCommand,
+        BuildAliasCompilerArguments(
+            L"compile",
+            L"posix",
+            g_state.aliasSupport.sourcePath,
+            g_state.aliasSupport.posixOutputPath,
+            L"auto"),
+        workingDirectory);
+
+    if (cmdCompiled) {
+        SaveUtf8TextFile(
+            g_state.aliasSupport.cmdBootstrapPath,
+            L"@echo off\r\ndoskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdOutputPath) + L"\r\n");
+    }
+    if (powershellCompiled) {
+        SaveUtf8TextFile(
+            g_state.aliasSupport.powershellBootstrapPath,
+            L". " + QuoteForPowerShellScript(g_state.aliasSupport.powershellOutputPath) + L"\r\n");
+        SaveUtf8TextFile(
+            g_state.aliasSupport.powershellRunnerPath,
+            L"param(\r\n"
+            L"    [Parameter(Mandatory=$true)][string]$AliasName,\r\n"
+            L"    [Parameter(ValueFromRemainingArguments=$true)][string[]]$AliasArgs\r\n"
+            L")\r\n"
+            L". " + QuoteForPowerShellScript(g_state.aliasSupport.powershellOutputPath) + L"\r\n"
+            L"& $AliasName @AliasArgs\r\n"
+            L"if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }\r\n");
+    }
+    if (posixCompiled) {
+        SaveUtf8TextFile(
+            g_state.aliasSupport.posixBootstrapPath,
+            L". " + QuoteForShellScript(g_state.aliasSupport.posixOutputPath) + L"\n");
+    }
+
+    return powershellCompiled;
+}
+
+std::wstring MakeAliasRunnerCommandLine(std::wstring_view runnerPath, std::wstring_view aliasName) {
     return L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File " +
-        QuoteCommandLineArgument(std::wstring(loaderPath)) +
-        L" -Mode run -SourcePath " +
-        QuoteCommandLineArgument(Base64EncodeUtf8(aliasBody));
+        QuoteCommandLineArgument(std::wstring(runnerPath)) +
+        L" -AliasName " + QuoteCommandLineArgument(std::wstring(aliasName));
 }
 
 void SetAliasCommandVariable(const std::wstring& key, std::wstring value) {
@@ -1069,6 +1129,24 @@ void ClearAliasCommandVariables() {
         L"ALIAS_FILE",
         L"ALIAS_WINDOWS_LOADER",
         L"ALIAS_BASH_LOADER",
+        L"ALIASC_BIN",
+        L"ALIASC_COMPILER",
+        L"ALIASC_CMD_OUTPUT",
+        L"ALIASC_CMD_MACROFILE",
+        L"ALIASC_CMD_BOOTSTRAP",
+        L"ALIASC_CMD_INIT",
+        L"ALIASC_CMD_INNER",
+        L"ALIASC_POWERSHELL_OUTPUT",
+        L"ALIASC_POWERSHELL_BOOTSTRAP",
+        L"ALIASC_POWERSHELL_RUNNER",
+        L"ALIASC_POWERSHELL_INNER",
+        L"ALIASC_PWSH_OUTPUT",
+        L"ALIASC_PWSH_BOOTSTRAP",
+        L"ALIASC_PWSH_INNER",
+        L"ALIASC_POSIX_OUTPUT",
+        L"ALIASC_POSIX_BOOTSTRAP",
+        L"ALIASC_BASH_BOOTSTRAP",
+        L"ALIASC_BASH_INNER",
         L"ALIAS_CMD_MACROFILE",
         L"ALIAS_CMD_BOOTSTRAP",
         L"ALIAS_CMD_INIT",
@@ -1116,12 +1194,26 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
     }
 
     g_state.aliasSupport.sourcePath = sourcePath;
-    g_state.aliasSupport.windowsLoaderPath = ResolveConfiguredPath(
-        getAliasSetting(L"WINDOWS_LOADER", L"ALIAS_WINDOWS_LOADER"),
-        configPath);
-    g_state.aliasSupport.bashLoaderPath = ResolveConfiguredPath(
-        getAliasSetting(L"BASH_LOADER", L"ALIAS_BASH_LOADER"),
-        configPath);
+    const std::wstring configuredCompiler = ExpandEnvironmentVariables(ExpandCommandVariables(
+        getAliasSetting(L"COMPILER", L"ALIASC_BIN")));
+    if (configuredCompiler.empty()) {
+        g_state.aliasSupport.compilerCommand = GetAliasCompilerCommand();
+        error.clear();
+        if (std::filesystem::exists(L"C:\\~\\Scoop\\apps\\aliasc\\current\\aliasc.exe", error) && !error) {
+            g_state.aliasSupport.compilerPath = L"C:\\~\\Scoop\\apps\\aliasc\\current\\aliasc.exe";
+        }
+    } else {
+        const std::wstring trimmedCompiler = Trim(configuredCompiler);
+        const bool looksLikePath = trimmedCompiler.find_first_of(L"\\/") != std::wstring::npos ||
+            Lowercase(trimmedCompiler).ends_with(L".exe");
+        if (looksLikePath) {
+            const std::wstring compilerPath = ResolveConfiguredPath(trimmedCompiler, configPath);
+            g_state.aliasSupport.compilerPath = compilerPath;
+            g_state.aliasSupport.compilerCommand = QuoteCommandLineArgument(compilerPath);
+        } else {
+            g_state.aliasSupport.compilerCommand = trimmedCompiler;
+        }
+    }
 
     const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
     std::filesystem::create_directories(supportDirectory, error);
@@ -1129,72 +1221,60 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         return;
     }
 
-    g_state.aliasSupport.cmdMacroFilePath = (supportDirectory / L"cmd-aliases.mac").wstring();
-    g_state.aliasSupport.cmdBootstrapPath = (supportDirectory / L"cmd-alias-bootstrap.cmd").wstring();
-    g_state.aliasSupport.powershellBootstrapPath = (supportDirectory / L"powershell-alias-bootstrap.ps1").wstring();
-    g_state.aliasSupport.bashBootstrapPath = (supportDirectory / L"bash-alias-bootstrap.sh").wstring();
+    g_state.aliasSupport.cmdOutputPath = (supportDirectory / L"aliasc-cmd.mac").wstring();
+    g_state.aliasSupport.cmdBootstrapPath = (supportDirectory / L"aliasc-cmd-bootstrap.cmd").wstring();
+    g_state.aliasSupport.powershellOutputPath = (supportDirectory / L"aliasc-powershell.ps1").wstring();
+    g_state.aliasSupport.powershellBootstrapPath = (supportDirectory / L"aliasc-powershell-bootstrap.ps1").wstring();
+    g_state.aliasSupport.powershellRunnerPath = (supportDirectory / L"aliasc-powershell-runner.ps1").wstring();
+    g_state.aliasSupport.posixOutputPath = (supportDirectory / L"aliasc-posix.sh").wstring();
+    g_state.aliasSupport.posixBootstrapPath = (supportDirectory / L"aliasc-posix-bootstrap.sh").wstring();
+    g_state.aliasSupport.compilerReady = RunAliasCompiler(
+        g_state.aliasSupport.compilerCommand,
+        L"--version",
+        std::filesystem::path(configPath).parent_path().wstring());
+    if (!g_state.aliasSupport.compilerReady) {
+        return;
+    }
 
     SetAliasCommandVariable(L"ALIAS_FILE", g_state.aliasSupport.sourcePath);
-    if (!g_state.aliasSupport.windowsLoaderPath.empty()) {
-        SetAliasCommandVariable(L"ALIAS_WINDOWS_LOADER", g_state.aliasSupport.windowsLoaderPath);
-    }
-    if (!g_state.aliasSupport.bashLoaderPath.empty()) {
-        SetAliasCommandVariable(L"ALIAS_BASH_LOADER", g_state.aliasSupport.bashLoaderPath);
-    }
+    SetAliasCommandVariable(L"ALIASC_BIN", g_state.aliasSupport.compilerCommand);
+    SetAliasCommandVariable(L"ALIASC_COMPILER", g_state.aliasSupport.compilerCommand);
+    SetAliasCommandVariable(L"ALIASC_CMD_OUTPUT", g_state.aliasSupport.cmdOutputPath);
+    SetAliasCommandVariable(L"ALIASC_CMD_MACROFILE", g_state.aliasSupport.cmdOutputPath);
+    SetAliasCommandVariable(L"ALIASC_CMD_BOOTSTRAP", g_state.aliasSupport.cmdBootstrapPath);
+    SetAliasCommandVariable(L"ALIASC_CMD_INIT", L"doskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdOutputPath));
+    SetAliasCommandVariable(
+        L"ALIASC_CMD_INNER",
+        L"cmd.exe /k call " + QuoteCommandLineArgument(g_state.aliasSupport.cmdBootstrapPath));
+    SetAliasCommandVariable(L"ALIASC_POWERSHELL_OUTPUT", g_state.aliasSupport.powershellOutputPath);
+    SetAliasCommandVariable(L"ALIASC_POWERSHELL_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
+    SetAliasCommandVariable(L"ALIASC_POWERSHELL_RUNNER", g_state.aliasSupport.powershellRunnerPath);
+    SetAliasCommandVariable(L"ALIASC_POWERSHELL_INNER",
+        L"powershell.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
+    SetAliasCommandVariable(L"ALIASC_PWSH_OUTPUT", g_state.aliasSupport.powershellOutputPath);
+    SetAliasCommandVariable(L"ALIASC_PWSH_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
+    SetAliasCommandVariable(L"ALIASC_PWSH_INNER",
+        L"pwsh.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
+    SetAliasCommandVariable(L"ALIASC_POSIX_OUTPUT", g_state.aliasSupport.posixOutputPath);
+    SetAliasCommandVariable(L"ALIASC_POSIX_BOOTSTRAP", g_state.aliasSupport.posixBootstrapPath);
+    SetAliasCommandVariable(L"ALIASC_BASH_BOOTSTRAP", g_state.aliasSupport.posixBootstrapPath);
+    SetAliasCommandVariable(L"ALIASC_BASH_INNER",
+        L"bash --init-file " + QuoteCommandLineArgument(g_state.aliasSupport.posixBootstrapPath) + L" -i");
 
-    if (!g_state.aliasSupport.windowsLoaderPath.empty()) {
-        error.clear();
-        if (std::filesystem::exists(g_state.aliasSupport.windowsLoaderPath, error) && !error) {
-            const std::wstring compileCommand = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File " +
-                QuoteCommandLineArgument(g_state.aliasSupport.windowsLoaderPath) +
-                L" -Mode compile -SourcePath " + QuoteCommandLineArgument(g_state.aliasSupport.sourcePath) +
-                L" -OutputPath " + QuoteCommandLineArgument(g_state.aliasSupport.cmdMacroFilePath);
-            if (RunProcessAndWaitHidden(compileCommand, std::filesystem::path(configPath).parent_path().wstring())) {
-                const std::wstring cmdBootstrap =
-                    L"@echo off\r\n" +
-                    std::wstring(L"doskey /macrofile=") + QuoteCommandLineArgument(g_state.aliasSupport.cmdMacroFilePath) + L"\r\n";
-                if (SaveUtf8TextFile(g_state.aliasSupport.cmdBootstrapPath, cmdBootstrap)) {
-                    SetAliasCommandVariable(L"ALIAS_CMD_MACROFILE", g_state.aliasSupport.cmdMacroFilePath);
-                    SetAliasCommandVariable(L"ALIAS_CMD_BOOTSTRAP", g_state.aliasSupport.cmdBootstrapPath);
-                    SetAliasCommandVariable(
-                        L"ALIAS_CMD_INIT",
-                        L"doskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdMacroFilePath));
-                    SetAliasCommandVariable(
-                        L"ALIAS_CMD_INNER",
-                        L"cmd.exe /k call " + QuoteCommandLineArgument(g_state.aliasSupport.cmdBootstrapPath));
-                }
-            }
-
-            const std::wstring powershellBootstrap =
-                std::wstring(L". ") + QuoteCommandLineArgument(g_state.aliasSupport.windowsLoaderPath) + L" -NoMain\n" +
-                L"Import-PowerShellAliases -SourcePath " + QuoteCommandLineArgument(g_state.aliasSupport.sourcePath) + L"\n";
-            if (SaveUtf8TextFile(g_state.aliasSupport.powershellBootstrapPath, powershellBootstrap)) {
-                SetAliasCommandVariable(L"ALIAS_POWERSHELL_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
-                SetAliasCommandVariable(
-                    L"ALIAS_POWERSHELL_INNER",
-                    L"powershell.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
-                SetAliasCommandVariable(L"ALIAS_PWSH_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
-                SetAliasCommandVariable(
-                    L"ALIAS_PWSH_INNER",
-                    L"pwsh.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
-            }
-        }
-    }
-
-    if (!g_state.aliasSupport.bashLoaderPath.empty()) {
-        error.clear();
-        if (std::filesystem::exists(g_state.aliasSupport.bashLoaderPath, error) && !error) {
-            const std::wstring bashBootstrap =
-                std::wstring(L"ALIAS_FILE=") + QuoteForShellScript(g_state.aliasSupport.sourcePath) + L"\n" +
-                std::wstring(L". ") + QuoteForShellScript(g_state.aliasSupport.bashLoaderPath) + L"\n";
-            if (SaveUtf8TextFile(g_state.aliasSupport.bashBootstrapPath, bashBootstrap)) {
-                SetAliasCommandVariable(L"ALIAS_BASH_BOOTSTRAP", g_state.aliasSupport.bashBootstrapPath);
-                SetAliasCommandVariable(
-                    L"ALIAS_BASH_INNER",
-                    L"bash --init-file " + QuoteCommandLineArgument(g_state.aliasSupport.bashBootstrapPath) + L" -i");
-            }
-        }
-    }
+    // Preserve the old variable names as aliases for templates written before aliasc.
+    SetAliasCommandVariable(L"ALIAS_CMD_MACROFILE", g_state.aliasSupport.cmdOutputPath);
+    SetAliasCommandVariable(L"ALIAS_CMD_BOOTSTRAP", g_state.aliasSupport.cmdBootstrapPath);
+    SetAliasCommandVariable(L"ALIAS_CMD_INIT", L"doskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdOutputPath));
+    SetAliasCommandVariable(L"ALIAS_CMD_INNER", L"cmd.exe /k call " + QuoteCommandLineArgument(g_state.aliasSupport.cmdBootstrapPath));
+    SetAliasCommandVariable(L"ALIAS_POWERSHELL_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
+    SetAliasCommandVariable(L"ALIAS_POWERSHELL_INNER",
+        L"powershell.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
+    SetAliasCommandVariable(L"ALIAS_PWSH_BOOTSTRAP", g_state.aliasSupport.powershellBootstrapPath);
+    SetAliasCommandVariable(L"ALIAS_PWSH_INNER",
+        L"pwsh.exe -NoExit -NoLogo -File " + QuoteCommandLineArgument(g_state.aliasSupport.powershellBootstrapPath));
+    SetAliasCommandVariable(L"ALIAS_BASH_BOOTSTRAP", g_state.aliasSupport.posixBootstrapPath);
+    SetAliasCommandVariable(L"ALIAS_BASH_INNER",
+        L"bash --init-file " + QuoteCommandLineArgument(g_state.aliasSupport.posixBootstrapPath) + L" -i");
 }
 
 std::wstring NormalizeHistoryField(std::wstring_view text) {
@@ -1212,13 +1292,15 @@ std::wstring BuildItemKey(ItemSourceKind sourceKind, std::wstring_view commandLi
 }
 
 std::wstring BuildAliasImportDependencySignature() {
-    if (g_state.aliasSupport.sourcePath.empty() || g_state.aliasSupport.windowsLoaderPath.empty()) {
+    if (g_state.aliasSupport.sourcePath.empty() || g_state.aliasSupport.compilerCommand.empty()) {
         return L"";
     }
 
     std::vector<std::wstring> dependencyPaths;
     dependencyPaths.push_back(g_state.aliasSupport.sourcePath);
-    dependencyPaths.push_back(g_state.aliasSupport.windowsLoaderPath);
+    if (!g_state.aliasSupport.compilerPath.empty()) {
+        dependencyPaths.push_back(g_state.aliasSupport.compilerPath);
+    }
 
     const std::filesystem::path sourcePath(g_state.aliasSupport.sourcePath);
     const std::filesystem::path sourceDirectory = sourcePath.parent_path();
@@ -1231,6 +1313,7 @@ std::wstring BuildAliasImportDependencySignature() {
     dependencyPaths.erase(std::unique(dependencyPaths.begin(), dependencyPaths.end()), dependencyPaths.end());
 
     std::wostringstream signature;
+    signature << L"compiler=" << g_state.aliasSupport.compilerCommand << L'\n';
     for (const std::wstring& path : dependencyPaths) {
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error) && !error;
@@ -3779,7 +3862,9 @@ void RequestCronTaskLaunch(CronTask& task) {
 }
 
 void LoadAliasCommandItems(bool appendToResultItems) {
-    if (g_state.aliasSupport.sourcePath.empty() || g_state.aliasSupport.windowsLoaderPath.empty()) {
+    if (g_state.aliasSupport.sourcePath.empty() ||
+        g_state.aliasSupport.compilerCommand.empty() ||
+        !g_state.aliasSupport.compilerReady) {
         return;
     }
 
@@ -3787,37 +3872,38 @@ void LoadAliasCommandItems(bool appendToResultItems) {
     if (!std::filesystem::exists(g_state.aliasSupport.sourcePath, error) || error) {
         return;
     }
-    error.clear();
-    if (!std::filesystem::exists(g_state.aliasSupport.windowsLoaderPath, error) || error) {
-        return;
-    }
 
     const std::wstring dependencySignature = BuildAliasImportDependencySignature();
     if (g_state.aliasImportCache.valid &&
-        g_state.aliasImportCache.dependencySignature == dependencySignature) {
+        g_state.aliasImportCache.dependencySignature == dependencySignature &&
+        std::filesystem::exists(g_state.aliasSupport.powershellOutputPath, error) && !error &&
+        std::filesystem::exists(g_state.aliasSupport.powershellRunnerPath, error) && !error &&
+        std::filesystem::exists(g_state.aliasSupport.cmdOutputPath, error) && !error &&
+        std::filesystem::exists(g_state.aliasSupport.posixOutputPath, error) && !error) {
         AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
         return;
     }
 
-    const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
-    std::filesystem::create_directories(supportDirectory, error);
-    if (error) {
+    if (!CompileAliasArtifacts()) {
         if (g_state.aliasImportCache.valid) {
             AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
         }
         return;
     }
 
-    const std::wstring listFilePath = (supportDirectory / L"alias-definitions.txt").wstring();
-    const std::wstring commandLine =
-        L"cmd.exe /d /c \"\"powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File " +
-        QuoteCommandLineArgument(g_state.aliasSupport.windowsLoaderPath) +
-        L" -Mode list -SourcePath " +
-        QuoteCommandLineArgument(g_state.aliasSupport.sourcePath) +
-        L" > " +
-        QuoteCommandLineArgument(listFilePath) +
-        L"\"";
-    if (!RunProcessAndWaitHidden(commandLine, std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring())) {
+    const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
+    const std::wstring listFilePath = (supportDirectory / L"aliasc-powershell-list.txt").wstring();
+    const std::wstring listArguments = BuildAliasCompilerArguments(
+        L"list",
+        L"powershell",
+        g_state.aliasSupport.sourcePath,
+        {},
+        L"windows");
+    if (!RunAliasCompilerToFile(
+            g_state.aliasSupport.compilerCommand,
+            listArguments,
+            listFilePath,
+            std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring())) {
         if (g_state.aliasImportCache.valid) {
             AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
         }
@@ -3828,22 +3914,17 @@ void LoadAliasCommandItems(bool appendToResultItems) {
     std::wstring line;
     std::vector<LaunchItem> importedItems;
     while (std::getline(stream, line)) {
-        const std::wstring trimmedLine = Trim(line);
-        if (trimmedLine.empty()) {
-            continue;
-        }
-
-        const size_t separator = trimmedLine.find(L'=');
-        if (separator == std::wstring::npos || separator == 0) {
+        const std::wstring name = Trim(line);
+        if (name.empty()) {
             continue;
         }
 
         LaunchItem item {};
-        item.name = Trim(trimmedLine.substr(0, separator));
+        item.name = name;
         item.commandLine = MakeAliasRunnerCommandLine(
-            g_state.aliasSupport.windowsLoaderPath,
-            Trim(trimmedLine.substr(separator + 1)));
-        item.description = Trim(trimmedLine.substr(separator + 1));
+            g_state.aliasSupport.powershellRunnerPath,
+            name);
+        item.description = L"aliasc PowerShell alias: " + name;
         item.sourceKind = ItemSourceKind::AliasDsl;
         if (item.name.empty() || item.commandLine.empty()) {
             continue;
