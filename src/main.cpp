@@ -4730,9 +4730,14 @@ void RebuildResultList() {
         if (!builtinQuery && item.sourceKind == ItemSourceKind::Synthetic) {
             continue;
         }
-        const int matchScore = ComputeMatchScore(item, normalizedTokens);
+        int matchScore = ComputeMatchScore(item, normalizedTokens);
         if (matchScore < 0) {
-            continue;
+            if (item.sourceKind == ItemSourceKind::AliasDsl && !normalizedTokens.empty() &&
+                Lowercase(item.name) == normalizedTokens.front()) {
+                matchScore = 100;
+            } else {
+                continue;
+            }
         }
 
         RankedResult result {};
@@ -4981,7 +4986,20 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     // Capture the pre-expansion command and working directory so that
     // runtime variables ${CMD} and ${CWD} expand to the concrete values
     // rather than recursing into themselves.
-    const std::wstring rawCommand = item.commandLine;
+    std::wstring rawCommand = item.commandLine;
+    if (item.sourceKind == ItemSourceKind::AliasDsl) {
+        const std::wstring searchQuery = Trim(GetControlText(g_state.searchEdit));
+        const std::wstring lowerQuery = Lowercase(searchQuery);
+        const std::wstring lowerName = Lowercase(item.name);
+        if (lowerQuery.starts_with(lowerName)) {
+            std::wstring_view trailing(searchQuery);
+            trailing.remove_prefix(lowerName.size());
+            const std::wstring trailingArgs = Trim(trailing);
+            if (!trailingArgs.empty()) {
+                rawCommand += L" " + trailingArgs;
+            }
+        }
+    }
     const std::wstring rawWorkingDir = item.workingDirectory;
     const std::wstring cmdText = ExpandRuntimeVariables(rawCommand, rawCommand, rawWorkingDir);
     const std::wstring cwdText = ExpandRuntimeVariables(rawWorkingDir, rawCommand, rawWorkingDir);
