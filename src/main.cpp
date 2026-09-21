@@ -84,6 +84,7 @@ struct AliasSupportConfig {
     std::wstring posixOutputPath;
     std::wstring posixBootstrapPath;
     bool compilerReady = false;
+    int showCommand = SW_SHOWNORMAL;
 };
 
 struct HistoryInfo {
@@ -1215,6 +1216,11 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         }
     }
 
+    const std::wstring showWindowSetting = getAliasSetting(L"SHOW_WINDOW", L"ALIAS_SHOW_WINDOW");
+    if (!showWindowSetting.empty()) {
+        g_state.aliasSupport.showCommand = _wtoi(Trim(showWindowSetting).c_str());
+    }
+
     const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
     std::filesystem::create_directories(supportDirectory, error);
     if (error) {
@@ -1314,6 +1320,7 @@ std::wstring BuildAliasImportDependencySignature() {
 
     std::wostringstream signature;
     signature << L"compiler=" << g_state.aliasSupport.compilerCommand << L'\n';
+    signature << L"show_window=" << g_state.aliasSupport.showCommand << L'\n';
     for (const std::wstring& path : dependencyPaths) {
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error) && !error;
@@ -3926,6 +3933,7 @@ void LoadAliasCommandItems(bool appendToResultItems) {
             name);
         item.description = L"aliasc PowerShell alias: " + name;
         item.sourceKind = ItemSourceKind::AliasDsl;
+        item.showCommand = g_state.aliasSupport.showCommand;
         if (item.name.empty() || item.commandLine.empty()) {
             continue;
         }

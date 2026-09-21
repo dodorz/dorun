@@ -2,8 +2,8 @@
 
 #define DORUN_VERSION_MAJOR 0
 #define DORUN_VERSION_MINOR 2
-#define DORUN_VERSION_PATCH 6
-#define DORUN_VERSION_BUILD 45
+#define DORUN_VERSION_PATCH 7
+#define DORUN_VERSION_BUILD 46
 
 #define DORUN_VERSION_STR_IMPL(major, minor, patch, build) #major "." #minor "." #patch "." #build
 #define DORUN_VERSION_STR(major, minor, patch, build) DORUN_VERSION_STR_IMPL(major, minor, patch, build)

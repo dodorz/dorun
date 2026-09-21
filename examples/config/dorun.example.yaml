@@ -56,6 +56,8 @@ VARS:
 ALIASES:
   FILE: 'C:\~\.config\alias'
   COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
+  # 0 = SW_HIDE (no console window for alias items), 1 = SW_SHOWNORMAL (default).
+  #SHOW_WINDOW: 0
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''

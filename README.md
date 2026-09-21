@@ -74,7 +74,7 @@ ALIASES:
   COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
 ```
 
-When `ALIASES` is configured, DoRun invokes `aliasc` to compile the source for PowerShell, CMD, and POSIX shells. It imports the names reported by `aliasc list --shell powershell` into the launcher; selecting one runs the corresponding generated PowerShell function. The compiler also includes the adjacent `alias.local` and `ShortcutMap.yaml` files according to its own defaults.
+When `ALIASES` is configured, DoRun invokes `aliasc` to compile the source for PowerShell, CMD, and POSIX shells. It imports the names reported by `aliasc list --shell powershell` into the launcher; selecting one runs the corresponding generated PowerShell function. The compiler also includes the adjacent `alias.local` and `ShortcutMap.yaml` files according to its own defaults. Alias items launch through `powershell.exe`, so they show a console window by default; set `SHOW_WINDOW: 0` under `ALIASES` to hide it (value is a `SW_*` constant, default `1`).
 
 Example:
 
@@ -87,6 +87,8 @@ VARS:
 ALIASES:
   FILE: 'C:\~\.config\alias'
   COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
+  # Optional. 0 = SW_HIDE (no console window for alias items), 1 = SW_SHOWNORMAL.
+  # SHOW_WINDOW: 0
   # Or use the fallback command:
   # COMPILER: 'scoopx aliasc'
   # TERMINAL: 'pwsh.exe'
