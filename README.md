@@ -42,6 +42,16 @@ Type these in the launcher search box and press Enter:
 | `/config` | Open `DoRun.yaml` with `EDITOR` |
 | `/cmdconfig` | Open `Command.conf` with `EDITOR` |
 
+### Command-line arguments
+
+| Argument | Description |
+|---|---|
+| `/startup`, `-startup`, `--startup` | Run the `STARTUP` group, then keep running. |
+| `-run <group>` | Run the named group, then keep running. |
+| `/reload`, `-reload`, `--reload` | Ask the running DoRun instance to reload both config files. If no instance is running, start DoRun, perform one reload, and exit. |
+
+`DoRun.exe /reload` is the command-line equivalent of the `/reload` slash command. It is convenient for scripts that edit `DoRun.yaml` or `Command.conf` and want the changes applied immediately.
+
 ## Configuration files
 
 DoRun uses two main config files:
