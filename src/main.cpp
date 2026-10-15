@@ -246,6 +246,7 @@ struct AppState {
     ULONGLONG lastItemsRefreshTick = 0;
     ULONGLONG lastHistoryRefreshTick = 0;
     bool startupMode = false;
+    bool reloadMode = false;
     std::wstring groupRunName;
 };
 
@@ -272,6 +273,7 @@ constexpr UINT kMessageRefreshLauncherData = WM_APP + 1;
 constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr UINT kMessageSingletonShowLauncher = WM_APP + 3;
 constexpr UINT kMessageSingletonRunGroup = WM_APP + 4;
+constexpr UINT kMessageSingletonReload = WM_APP + 5;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 2000;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
@@ -4288,18 +4290,27 @@ bool ParseRunArgument() {
         return false;
     }
 
-    bool shouldRun = false;
     for (int index = 1; index < argumentCount; ++index) {
         std::wstring_view argument(arguments[index]);
-        if (argument == L"/startup" || argument == L"-startup" || argument == L"--startup") {
-            shouldRun = true;
-            g_state.groupRunName = L"STARTUP";
-            break;
+        if (argument == L"/reload" || argument == L"-reload" || argument == L"--reload") {
+            g_state.reloadMode = true;
         }
-        if (argument == L"-run" && index + 1 < argumentCount) {
-            g_state.groupRunName = arguments[index + 1];
-            shouldRun = !g_state.groupRunName.empty();
-            break;
+    }
+
+    bool shouldRun = false;
+    if (!g_state.reloadMode) {
+        for (int index = 1; index < argumentCount; ++index) {
+            std::wstring_view argument(arguments[index]);
+            if (argument == L"/startup" || argument == L"-startup" || argument == L"--startup") {
+                shouldRun = true;
+                g_state.groupRunName = L"STARTUP";
+                break;
+            }
+            if (argument == L"-run" && index + 1 < argumentCount) {
+                g_state.groupRunName = arguments[index + 1];
+                shouldRun = !g_state.groupRunName.empty();
+                break;
+            }
         }
     }
 
@@ -4320,7 +4331,9 @@ bool NotifyExistingInstanceAndExit() {
 
     const HWND existingHostWindow = FindWindowW(kHostClassName, kSingletonHostWindowTitle);
     if (existingHostWindow != nullptr) {
-        if (g_state.startupMode && !g_state.groupRunName.empty()) {
+        if (g_state.reloadMode) {
+            PostMessageW(existingHostWindow, kMessageSingletonReload, 0, 0);
+        } else if (g_state.startupMode && !g_state.groupRunName.empty()) {
             const ATOM atom = GlobalAddAtomW(g_state.groupRunName.c_str());
             if (atom != 0) {
                 PostMessageW(existingHostWindow, kMessageSingletonRunGroup, 0, static_cast<LPARAM>(atom));
@@ -5337,6 +5350,10 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         ShowLauncher();
         return 0;
     }
+    if (message == kMessageSingletonReload) {
+        ReloadAllConfiguration(false);
+        return 0;
+    }
     if (message == kMessageSingletonRunGroup) {
         wchar_t groupName[256] {};
         if (lParam != 0 && GlobalGetAtomNameW(static_cast<ATOM>(lParam), groupName, static_cast<UINT>(std::size(groupName))) > 0) {
@@ -5469,18 +5486,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
-    g_state.hotkeyRegistrationFailures.clear();
-    RegisterLauncherHotkey();
-    RegisterManagedHotkeys();
-    ConfigureKeyboardHook();
-    ShowHotkeyRegistrationFailures();
-    if (g_state.startupMode) {
-        RunNamedGroup(g_state.groupRunName);
+    if (g_state.reloadMode) {
+        ReloadAllConfiguration(false);
+        PostMessageW(g_state.hostWindow, WM_CLOSE, 0, 0);
+    } else {
+        g_state.hotkeyRegistrationFailures.clear();
+        RegisterLauncherHotkey();
+        RegisterManagedHotkeys();
+        ConfigureKeyboardHook();
+        ShowHotkeyRegistrationFailures();
+        if (g_state.startupMode) {
+            RunNamedGroup(g_state.groupRunName);
+        }
+        RunCronTasks();
+        StartCronTimer();
+        StartConfigWatchTimer();
+        RequestLauncherDataRefresh(true, true);
     }
-    RunCronTasks();
-    StartCronTimer();
-    StartConfigWatchTimer();
-    RequestLauncherDataRefresh(true, true);
 
     MSG message {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
