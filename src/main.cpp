@@ -2718,7 +2718,7 @@ std::wstring MakeInlineBatchFilePath() {
     return (directory / fileName).wstring();
 }
 
-bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = nullptr) {
+bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = nullptr, std::optional<int> showCommandOverride = std::nullopt) {
     const std::wstring batchPath = MakeInlineBatchFilePath();
     const std::wstring rawCommand = item.commandLine;
     const std::wstring rawWorkingDir = item.workingDirectory;
@@ -2733,8 +2733,9 @@ bool LaunchInlineBatchScript(const LaunchItem& item, HANDLE* launchedProcess = n
 
     const std::wstring commandLine = L"cmd.exe /c " + QuoteCommandLineArgument(batchPath);
     const std::wstring cwdText = ExpandRuntimeVariables(item.workingDirectory, rawCommand, rawWorkingDir);
-    const DWORD extraCreationFlags = item.showCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
-    return LaunchProcessCommand(commandLine, cwdText, item.showCommand, item.priorityClass, extraCreationFlags, launchedProcess);
+    const int effectiveShowCommand = showCommandOverride.value_or(item.showCommand);
+    const DWORD extraCreationFlags = effectiveShowCommand == SW_HIDE ? CREATE_NO_WINDOW : 0;
+    return LaunchProcessCommand(commandLine, cwdText, effectiveShowCommand, item.priorityClass, extraCreationFlags, launchedProcess);
 }
 
 std::optional<UINT> ParseHotkeyVirtualKey(std::wstring_view text) {
@@ -4697,6 +4698,24 @@ std::wstring GetControlText(HWND window) {
     return text;
 }
 
+struct ParsedLauncherQuery {
+    std::wstring text;
+    std::optional<int> showCommand;
+};
+
+// A leading '!' forces the launched item to show its console window for this
+// launch only. The marker is stripped before matching so it does not change the
+// effective query used for search, ranking, history, or trailing arguments.
+ParsedLauncherQuery ParseLauncherQuery(std::wstring_view rawText) {
+    ParsedLauncherQuery parsed;
+    parsed.text = Trim(std::wstring(rawText));
+    if (!parsed.text.empty() && parsed.text.front() == L'!') {
+        parsed.showCommand = SW_SHOWNORMAL;
+        parsed.text = Trim(parsed.text.substr(1));
+    }
+    return parsed;
+}
+
 struct RankedResult {
     size_t itemIndex = 0;
     int matchScore = 0;
@@ -4707,7 +4726,8 @@ struct RankedResult {
 };
 
 void RebuildResultList() {
-    const std::wstring query = Trim(GetControlText(g_state.searchEdit));
+    const ParsedLauncherQuery parsedQuery = ParseLauncherQuery(GetControlText(g_state.searchEdit));
+    const std::wstring query = parsedQuery.text;
     const bool builtinQuery = !query.empty() && query.front() == L'/';
     const std::wstring normalizedQuery = Lowercase(query);
     std::vector<std::wstring> normalizedTokens = SplitQueryTokens(normalizedQuery);
@@ -4952,7 +4972,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     }
 }
 
-bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
+bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess, std::optional<int> showCommandOverride = std::nullopt) {
     if (!DoesCurrentHostMatchFilter(item.hostFilter)) {
         return true;
     }
@@ -5009,7 +5029,7 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     // rather than recursing into themselves.
     std::wstring rawCommand = item.commandLine;
     if (item.sourceKind == ItemSourceKind::AliasDsl) {
-        const std::wstring searchQuery = Trim(GetControlText(g_state.searchEdit));
+        const std::wstring searchQuery = ParseLauncherQuery(GetControlText(g_state.searchEdit)).text;
         const std::wstring lowerQuery = Lowercase(searchQuery);
         const std::wstring lowerName = Lowercase(item.name);
         if (lowerQuery.starts_with(lowerName)) {
@@ -5024,9 +5044,10 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess) {
     const std::wstring rawWorkingDir = item.workingDirectory;
     const std::wstring cmdText = ExpandRuntimeVariables(rawCommand, rawCommand, rawWorkingDir);
     const std::wstring cwdText = ExpandRuntimeVariables(rawWorkingDir, rawCommand, rawWorkingDir);
+    const int effectiveShowCommand = showCommandOverride.value_or(item.showCommand);
     const bool launched = item.inlineBatchScript.empty()
-        ? LaunchProcessCommand(cmdText, cwdText, item.showCommand, item.priorityClass)
-        : LaunchInlineBatchScript(item);
+        ? LaunchProcessCommand(cmdText, cwdText, effectiveShowCommand, item.priorityClass)
+        : LaunchInlineBatchScript(item, nullptr, effectiveShowCommand);
     if (!launched) {
         return false;
     }
@@ -5087,13 +5108,13 @@ bool LaunchBuiltinQueryCommand(std::wstring_view query) {
     return false;
 }
 
-bool LaunchItemByIndex(size_t index) {
+bool LaunchItemByIndex(size_t index, std::optional<int> showCommandOverride = std::nullopt) {
     if (index >= g_state.items.size()) {
         return false;
     }
 
     const LaunchItem& item = g_state.items[index];
-    return LaunchConfiguredItem(item, true);
+    return LaunchConfiguredItem(item, true, showCommandOverride);
 }
 
 void LaunchSelectedItem() {
@@ -5105,7 +5126,11 @@ void LaunchSelectedItem() {
     if (itemIndex == LB_ERR) {
         return;
     }
-    LaunchItemByIndex(static_cast<size_t>(itemIndex));
+    // Read the prefix from the live search box so a forced-visible console is
+    // honored even when the debounced result rebuild has not run yet.
+    LaunchItemByIndex(
+        static_cast<size_t>(itemIndex),
+        ParseLauncherQuery(GetControlText(g_state.searchEdit)).showCommand);
 }
 
 void MoveSelection(int delta) {
@@ -5148,7 +5173,7 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
             return 0;
         }
         if (wParam == VK_RETURN) {
-            if (!LaunchBuiltinQueryCommand(GetControlText(g_state.searchEdit))) {
+            if (!LaunchBuiltinQueryCommand(ParseLauncherQuery(GetControlText(g_state.searchEdit)).text)) {
                 LaunchSelectedItem();
             }
             return 0;

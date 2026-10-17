@@ -42,6 +42,10 @@ Type these in the launcher search box and press Enter:
 | `/config` | Open `DoRun.yaml` with `EDITOR` |
 | `/cmdconfig` | Open `Command.conf` with `EDITOR` |
 
+### Forcing a console window
+
+Prefix a search with `!` to force the selected item to show its console window for that launch, even when the global default hides it (for example `ALIASES: SHOW_WINDOW: 0`). The marker is stripped before matching, so `!ForwardConeSyncthing` matches and ranks `ForwardConeSyncthing` normally, including its usage history. This only affects launches started from the search box; hotkeys, `STARTUP`, and `CRON` entries keep their configured `show_window` value.
+
 ### Command-line arguments
 
 | Argument | Description |
