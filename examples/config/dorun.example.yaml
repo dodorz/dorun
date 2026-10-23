@@ -58,6 +58,9 @@ ALIASES:
   COMPILER: 'C:\~\Scoop\apps\aliasc\current\aliasc.exe'
   # 0 = SW_HIDE (no console window for alias items), 1 = SW_SHOWNORMAL (default).
   #SHOW_WINDOW: 0
+  # Show each alias definition body in the launcher preview (default 1).
+  # Set to 0 to show the generic "aliasc PowerShell alias: <name>" text instead.
+  #SHOW_DEFINITION: 0
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''

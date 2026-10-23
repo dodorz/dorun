@@ -85,6 +85,7 @@ struct AliasSupportConfig {
     std::wstring posixBootstrapPath;
     bool compilerReady = false;
     int showCommand = SW_SHOWNORMAL;
+    bool showDefinition = true;
 };
 
 struct HistoryInfo {
@@ -1223,6 +1224,12 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         g_state.aliasSupport.showCommand = _wtoi(Trim(showWindowSetting).c_str());
     }
 
+    const std::wstring showDefinitionSetting = getAliasSetting(L"SHOW_DEFINITION", L"ALIAS_SHOW_DEFINITION");
+    if (!showDefinitionSetting.empty()) {
+        const std::wstring value = Lowercase(Trim(showDefinitionSetting));
+        g_state.aliasSupport.showDefinition = !(value == L"0" || value == L"false");
+    }
+
     const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
     std::filesystem::create_directories(supportDirectory, error);
     if (error) {
@@ -1323,6 +1330,7 @@ std::wstring BuildAliasImportDependencySignature() {
     std::wostringstream signature;
     signature << L"compiler=" << g_state.aliasSupport.compilerCommand << L'\n';
     signature << L"show_window=" << g_state.aliasSupport.showCommand << L'\n';
+    signature << L"show_definition=" << (g_state.aliasSupport.showDefinition ? 1 : 0) << L'\n';
     for (const std::wstring& path : dependencyPaths) {
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error) && !error;
@@ -3871,6 +3879,21 @@ void RequestCronTaskLaunch(CronTask& task) {
     }
 }
 
+std::wstring BuildAliasPreviewText(std::wstring_view body) {
+    std::wstring preview(body);
+    for (wchar_t& ch : preview) {
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            ch = L' ';
+        }
+    }
+    constexpr size_t kMaxAliasPreviewLength = 500;
+    if (preview.size() > kMaxAliasPreviewLength) {
+        preview.resize(kMaxAliasPreviewLength);
+        preview += L"...";
+    }
+    return preview;
+}
+
 void LoadAliasCommandItems(bool appendToResultItems) {
     if (g_state.aliasSupport.sourcePath.empty() ||
         g_state.aliasSupport.compilerCommand.empty() ||
@@ -3903,17 +3926,32 @@ void LoadAliasCommandItems(bool appendToResultItems) {
 
     const std::filesystem::path supportDirectory = GetAliasSupportDirectory();
     const std::wstring listFilePath = (supportDirectory / L"aliasc-powershell-list.txt").wstring();
-    const std::wstring listArguments = BuildAliasCompilerArguments(
+    const std::wstring plainListArguments = BuildAliasCompilerArguments(
         L"list",
         L"powershell",
         g_state.aliasSupport.sourcePath,
         {},
         L"windows");
-    if (!RunAliasCompilerToFile(
+    const std::wstring workingDirectory =
+        std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
+    // Ask for the richer output that carries each definition body. Older aliasc
+    // builds do not understand --format, so fall back to the name-only list.
+    bool listed = false;
+    if (g_state.aliasSupport.showDefinition) {
+        listed = RunAliasCompilerToFile(
             g_state.aliasSupport.compilerCommand,
-            listArguments,
+            plainListArguments + L" --format tsv",
             listFilePath,
-            std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring())) {
+            workingDirectory);
+    }
+    if (!listed) {
+        listed = RunAliasCompilerToFile(
+            g_state.aliasSupport.compilerCommand,
+            plainListArguments,
+            listFilePath,
+            workingDirectory);
+    }
+    if (!listed) {
         if (g_state.aliasImportCache.valid) {
             AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
         }
@@ -3924,17 +3962,29 @@ void LoadAliasCommandItems(bool appendToResultItems) {
     std::wstring line;
     std::vector<LaunchItem> importedItems;
     while (std::getline(stream, line)) {
-        const std::wstring name = Trim(line);
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        const size_t separator = line.find(L'\t');
+        std::wstring name = separator == std::wstring::npos ? line : line.substr(0, separator);
+        name = Trim(name);
         if (name.empty()) {
             continue;
         }
+        const std::wstring definitionBody = separator == std::wstring::npos
+            ? std::wstring()
+            : UnescapeCacheField(line.substr(separator + 1));
 
         LaunchItem item {};
         item.name = name;
         item.commandLine = MakeAliasRunnerCommandLine(
             g_state.aliasSupport.powershellRunnerPath,
             name);
-        item.description = L"aliasc PowerShell alias: " + name;
+        if (g_state.aliasSupport.showDefinition && !definitionBody.empty()) {
+            item.description = BuildAliasPreviewText(definitionBody);
+        } else {
+            item.description = L"aliasc PowerShell alias: " + name;
+        }
         item.sourceKind = ItemSourceKind::AliasDsl;
         item.showCommand = g_state.aliasSupport.showCommand;
         if (item.name.empty() || item.commandLine.empty()) {
