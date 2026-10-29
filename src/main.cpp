@@ -86,6 +86,7 @@ struct AliasSupportConfig {
     bool compilerReady = false;
     int showCommand = SW_SHOWNORMAL;
     bool showDefinition = true;
+    std::wstring shortcutMapPath;
 };
 
 struct HistoryInfo {
@@ -1026,7 +1027,8 @@ std::wstring BuildAliasCompilerArguments(
     std::wstring_view shell,
     std::wstring_view sourcePath,
     std::wstring_view outputPath = {},
-    std::wstring_view platform = L"windows") {
+    std::wstring_view platform = L"windows",
+    std::wstring_view shortcutMapPath = {}) {
     std::wstring arguments = std::wstring(mode) +
         L" --shell " + std::wstring(shell) +
         L" --platform " + std::wstring(platform) +
@@ -1034,6 +1036,9 @@ std::wstring BuildAliasCompilerArguments(
         QuoteCommandLineArgument(std::wstring(sourcePath));
     if (!outputPath.empty()) {
         arguments += L" --output " + QuoteCommandLineArgument(std::wstring(outputPath));
+    }
+    if (!shortcutMapPath.empty()) {
+        arguments += L" --shortcut-map " + QuoteCommandLineArgument(std::wstring(shortcutMapPath));
     }
     return arguments;
 }
@@ -1062,6 +1067,7 @@ bool CompileAliasArtifacts() {
     }
 
     const std::wstring workingDirectory = std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
+    const std::wstring shortcutMapPath = g_state.aliasSupport.shortcutMapPath;
     const bool powershellCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         BuildAliasCompilerArguments(
@@ -1069,7 +1075,8 @@ bool CompileAliasArtifacts() {
             L"powershell",
             g_state.aliasSupport.sourcePath,
             g_state.aliasSupport.powershellOutputPath,
-            L"windows"),
+            L"windows",
+            shortcutMapPath),
         workingDirectory);
     const bool cmdCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
@@ -1078,7 +1085,8 @@ bool CompileAliasArtifacts() {
             L"cmd",
             g_state.aliasSupport.sourcePath,
             g_state.aliasSupport.cmdOutputPath,
-            L"windows"),
+            L"windows",
+            shortcutMapPath),
         workingDirectory);
     const bool posixCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
@@ -1087,7 +1095,8 @@ bool CompileAliasArtifacts() {
             L"posix",
             g_state.aliasSupport.sourcePath,
             g_state.aliasSupport.posixOutputPath,
-            L"auto"),
+            L"auto",
+            shortcutMapPath),
         workingDirectory);
 
     if (cmdCompiled) {
@@ -1219,6 +1228,14 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         }
     }
 
+    const std::wstring configuredShortcutMap = getAliasSetting(L"SHORTCUT_MAP", L"ALIAS_SHORTCUT_MAP");
+    if (!configuredShortcutMap.empty()) {
+        const std::wstring trimmedShortcutMap = Trim(configuredShortcutMap);
+        if (!trimmedShortcutMap.empty()) {
+            g_state.aliasSupport.shortcutMapPath = ResolveConfiguredPath(trimmedShortcutMap, configPath);
+        }
+    }
+
     const std::wstring showWindowSetting = getAliasSetting(L"SHOW_WINDOW", L"ALIAS_SHOW_WINDOW");
     if (!showWindowSetting.empty()) {
         g_state.aliasSupport.showCommand = _wtoi(Trim(showWindowSetting).c_str());
@@ -1321,6 +1338,16 @@ std::wstring BuildAliasImportDependencySignature() {
     const std::filesystem::path sourceDirectory = sourcePath.parent_path();
     if (!sourceDirectory.empty()) {
         dependencyPaths.push_back((sourceDirectory / L"alias.local").wstring());
+    }
+    // Track every ShortcutMap location aliasc may read so a config reload
+    // reimports when any of them changes: an explicit ALIASES.SHORTCUT_MAP,
+    // the %USERPROFILE%\.config default (aliasc's preference), and the
+    // source-adjacent fallback aliasc uses when the default is missing.
+    if (!g_state.aliasSupport.shortcutMapPath.empty()) {
+        dependencyPaths.push_back(g_state.aliasSupport.shortcutMapPath);
+    }
+    dependencyPaths.push_back(ExpandEnvironmentVariables(L"%USERPROFILE%\\.config\\ShortcutMap.yaml"));
+    if (!sourceDirectory.empty()) {
         dependencyPaths.push_back((sourceDirectory / L"ShortcutMap.yaml").wstring());
     }
 
@@ -3931,7 +3958,8 @@ void LoadAliasCommandItems(bool appendToResultItems) {
         L"powershell",
         g_state.aliasSupport.sourcePath,
         {},
-        L"windows");
+        L"windows",
+        g_state.aliasSupport.shortcutMapPath);
     const std::wstring workingDirectory =
         std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
     // Ask for the richer output that carries each definition body. Older aliasc
