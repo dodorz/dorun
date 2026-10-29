@@ -61,6 +61,10 @@ ALIASES:
   # Show each alias definition body in the launcher preview (default 1).
   # Set to 0 to show the generic "aliasc PowerShell alias: <name>" text instead.
   #SHOW_DEFINITION: 0
+  # Optional. ShortcutMap.yaml for aliasc. When unset, aliasc reads
+  # %USERPROFILE%\.config\ShortcutMap.yaml, falling back to a
+  # ShortcutMap.yaml beside the alias source.
+  #SHORTCUT_MAP: 'C:\~\.config\ShortcutMap.yaml'
 
 HISTORY_ENABLED: 1
 HISTORY_DB_PATH: ''
