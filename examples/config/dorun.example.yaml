@@ -17,6 +17,14 @@ HOTKEY_DEBUG_LOG: false
 # Defaults to `^+c` when unset. Leave empty or set to `none` to disable.
 COPY_COMMAND_HOTKEY: '^+c'
 
+# Ditto-like clipboard text history.
+# The popup hotkey uses the same modifier syntax as Command.conf hotkeys
+# (^ = Ctrl, ! = Alt, + = Shift, @ = Win) and is global while DoRun runs.
+CLIPBOARD_HISTORY_ENABLED: true
+CLIPBOARD_HOTKEY: '^`'
+CLIPBOARD_HISTORY_MAX_ROWS: 500
+CLIPBOARD_VISIBLE_ITEM_COUNT: 12
+
 # Launcher appearance.
 # `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.
 # `LAUNCHER_OPACITY` uses the Win32 alpha range 32-255. Set to 255 for a fully opaque window.
