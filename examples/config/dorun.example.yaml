@@ -11,6 +11,12 @@ HOTKEY_MODIFIERS: 1
 HOTKEY_VK: 32
 HOTKEY_DEBUG_LOG: false
 
+# Launcher-scoped hotkey that copies the selected result's command line to the
+# clipboard while the launcher is open. Same modifier syntax as Command.conf
+# hotkeys: ^ = Ctrl, ! = Alt, + = Shift, @ = Win.
+# Defaults to `^+c` when unset. Leave empty or set to `none` to disable.
+COPY_COMMAND_HOTKEY: '^+c'
+
 # Launcher appearance.
 # `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.
 # `LAUNCHER_OPACITY` uses the Win32 alpha range 32-255. Set to 255 for a fully opaque window.

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -216,6 +217,10 @@ struct AppState {
     HBRUSH searchBackgroundBrush = nullptr;
     int dpi = USER_DEFAULT_SCREEN_DPI;
     HotkeyConfig hotkey {};
+    HotkeyConfig copyCommandHotkey {};
+    bool copyCommandHotkeyEnabled = false;
+    // Transient status text shown in the description line after a copy.
+    std::wstring copyFeedbackText;
     HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
     bool launcherHotkeyArmed = false;
     bool suppressHookWinKeyUp = false;
@@ -282,6 +287,8 @@ constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
 constexpr ULONGLONG kRefreshBlockAfterInputMs = 3000;
 constexpr UINT_PTR kSearchDebounceTimerId = 5;
 constexpr UINT kSearchDebounceDelayMs = 50;
+constexpr UINT_PTR kCopyFeedbackTimerId = 6;
+constexpr UINT kCopyFeedbackDurationMs = 1500;
 constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
@@ -332,6 +339,11 @@ void CancelDeferredRefresh();
 void RecordSearchInputActivity();
 void LoadCronTasks();
 void LoadManagedHotkeys();
+void LoadCopyCommandHotkeyConfig();
+void CopySelectedCommandLine();
+void ClearCopyFeedback(bool refreshDescription = true);
+bool HandleCopyCommandHotkeyKeyDown(WPARAM vkCode, LPARAM keyData);
+bool ParseManagedHotkeySpec(std::wstring_view text, HotkeyConfig* hotkey);
 std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey);
 void AddHotkeyRegistrationFailure(std::wstring label, std::wstring spec, DWORD errorCode);
 void ShowHotkeyRegistrationFailures();
@@ -1932,6 +1944,7 @@ void HideLauncher() {
         KillTimer(g_state.launcherWindow, kVisibilityTimerId);
         KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
     }
+    ClearCopyFeedback(false);
     CancelDeferredRefresh();
     ShowWindow(g_state.launcherWindow, SW_HIDE);
 }
@@ -2010,6 +2023,52 @@ void LoadHotkeyConfig() {
     if (g_state.hotkey.vk == 0U) {
         g_state.hotkey.vk = VK_SPACE;
     }
+}
+
+// What DoRun uses when COPY_COMMAND_HOTKEY is missing from DoRun.yaml.
+constexpr wchar_t kDefaultCopyCommandHotkey[] = L"^+c";
+
+// Optional hotkey that copies the command line of the currently selected result
+// to the clipboard while the launcher is open, e.g. `COPY_COMMAND_HOTKEY: '^+c'`.
+// The chord is handled locally inside the launcher window so it is not taken
+// away from other applications.
+void LoadCopyCommandHotkeyConfig() {
+    g_state.copyCommandHotkey = HotkeyConfig {};
+    g_state.copyCommandHotkeyEnabled = ParseManagedHotkeySpec(kDefaultCopyCommandHotkey, &g_state.copyCommandHotkey);
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        return;
+    }
+
+    const std::optional<std::wstring> spec = ParseYamlString(content, L"COPY_COMMAND_HOTKEY");
+    if (!spec) {
+        return;
+    }
+
+    const std::wstring trimmedSpec = Trim(*spec);
+    const std::wstring lowercaseSpec = Lowercase(trimmedSpec);
+    if (trimmedSpec.empty() ||
+        trimmedSpec == L"0" ||
+        lowercaseSpec == L"none" ||
+        lowercaseSpec == L"off" ||
+        lowercaseSpec == L"disabled") {
+        g_state.copyCommandHotkey = HotkeyConfig {};
+        g_state.copyCommandHotkeyEnabled = false;
+        return;
+    }
+
+    HotkeyConfig parsed {};
+    if (!ParseManagedHotkeySpec(trimmedSpec, &parsed)) {
+        AppendHotkeyDebugLog(L"Ignoring invalid COPY_COMMAND_HOTKEY: " + trimmedSpec);
+        g_state.copyCommandHotkey = HotkeyConfig {};
+        g_state.copyCommandHotkeyEnabled = false;
+        return;
+    }
+
+    g_state.copyCommandHotkey = parsed;
+    g_state.copyCommandHotkeyEnabled = true;
 }
 
 void LoadHistoryConfig() {
@@ -4669,6 +4728,11 @@ void UpdateSelectedItemDescription() {
         return;
     }
 
+    if (!g_state.copyFeedbackText.empty()) {
+        SetWindowTextW(g_state.descriptionText, g_state.copyFeedbackText.c_str());
+        return;
+    }
+
     const LRESULT selected = SendMessageW(g_state.resultList, LB_GETCURSEL, 0, 0);
     if (selected == LB_ERR) {
         SetWindowTextW(g_state.descriptionText, L"");
@@ -5032,6 +5096,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     LoadCommandItems(false);
     LoadCronTasks();
     LoadManagedHotkeys();
+    LoadCopyCommandHotkeyConfig();
     RefreshMonitoredConfigFiles();
     UpdateUiFont(g_state.dpi);
     g_state.hotkeyRegistrationFailures.clear();
@@ -5211,12 +5276,169 @@ void LaunchSelectedItem() {
         ParseLauncherQuery(GetControlText(g_state.searchEdit)).showCommand);
 }
 
+std::optional<size_t> GetSelectedItemIndex() {
+    if (g_state.resultList == nullptr) {
+        return std::nullopt;
+    }
+    const LRESULT selected = SendMessageW(g_state.resultList, LB_GETCURSEL, 0, 0);
+    if (selected == LB_ERR) {
+        return std::nullopt;
+    }
+    const LRESULT itemIndex = SendMessageW(g_state.resultList, LB_GETITEMDATA, static_cast<WPARAM>(selected), 0);
+    if (itemIndex == LB_ERR || static_cast<size_t>(itemIndex) >= g_state.items.size()) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(itemIndex);
+}
+
+// Builds the command line that would be executed for the given item, with alias
+// arguments from the search box and runtime variables resolved, so it can be
+// pasted into a shell.
+std::optional<std::wstring> BuildCopyableCommandText(size_t index) {
+    if (index >= g_state.items.size()) {
+        return std::nullopt;
+    }
+
+    const LaunchItem& item = g_state.items[index];
+    const std::wstring searchQuery = ParseLauncherQuery(GetControlText(g_state.searchEdit)).text;
+
+    if (item.sourceKind == ItemSourceKind::Synthetic) {
+        // Built-in slash commands only exist as typed query text.
+        if (searchQuery.empty()) {
+            return std::nullopt;
+        }
+        return searchQuery;
+    }
+
+    std::wstring rawCommand = item.inlineBatchScript.empty() ? item.commandLine : item.inlineBatchScript;
+    if (item.sourceKind == ItemSourceKind::AliasDsl) {
+        const std::wstring lowerQuery = Lowercase(searchQuery);
+        const std::wstring lowerName = Lowercase(item.name);
+        if (lowerQuery.starts_with(lowerName)) {
+            std::wstring_view trailing(searchQuery);
+            trailing.remove_prefix(lowerName.size());
+            const std::wstring trailingArgs = Trim(trailing);
+            if (!trailingArgs.empty()) {
+                rawCommand += L" " + trailingArgs;
+            }
+        }
+    }
+
+    std::wstring commandText = Trim(ExpandRuntimeVariables(rawCommand, rawCommand, item.workingDirectory));
+    if (commandText.empty()) {
+        return std::nullopt;
+    }
+    return commandText;
+}
+
+bool CopyTextToClipboard(std::wstring_view text) {
+    if (!OpenClipboard(g_state.launcherWindow)) {
+        return false;
+    }
+
+    bool copied = false;
+    if (EmptyClipboard() != FALSE) {
+        const size_t byteCount = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, byteCount);
+        if (handle != nullptr) {
+            void* buffer = GlobalLock(handle);
+            if (buffer != nullptr) {
+                std::memcpy(buffer, text.data(), text.size() * sizeof(wchar_t));
+                static_cast<wchar_t*>(buffer)[text.size()] = L'\0';
+                GlobalUnlock(handle);
+                copied = SetClipboardData(CF_UNICODETEXT, handle) != nullptr;
+            }
+            if (!copied) {
+                GlobalFree(handle);
+            }
+        }
+    }
+    CloseClipboard();
+    return copied;
+}
+
+// Clears the transient copy status line. Callers that are about to refresh the
+// description themselves can pass refreshDescription = false.
+void ClearCopyFeedback(bool refreshDescription) {
+    if (g_state.launcherWindow != nullptr) {
+        KillTimer(g_state.launcherWindow, kCopyFeedbackTimerId);
+    }
+    if (g_state.copyFeedbackText.empty()) {
+        return;
+    }
+    g_state.copyFeedbackText.clear();
+    if (refreshDescription) {
+        UpdateSelectedItemDescription();
+    }
+}
+
+void ShowCopyFeedback(std::wstring text) {
+    g_state.copyFeedbackText = std::move(text);
+    UpdateSelectedItemDescription();
+    if (g_state.launcherWindow != nullptr) {
+        KillTimer(g_state.launcherWindow, kCopyFeedbackTimerId);
+        SetTimer(g_state.launcherWindow, kCopyFeedbackTimerId, kCopyFeedbackDurationMs, nullptr);
+    }
+}
+
+void CopySelectedCommandLine() {
+    if (!IsWindowVisible(g_state.launcherWindow)) {
+        return;
+    }
+
+    const std::optional<size_t> index = GetSelectedItemIndex();
+    if (!index) {
+        return;
+    }
+    const std::optional<std::wstring> commandText = BuildCopyableCommandText(*index);
+    if (!commandText) {
+        return;
+    }
+
+    if (CopyTextToClipboard(*commandText)) {
+        AppendHotkeyDebugLog(L"Copied command line: " + *commandText);
+        ShowCopyFeedback(L"Copied: " + *commandText);
+    } else {
+        AppendHotkeyDebugLog(L"Failed to copy command line: " + *commandText);
+        ShowCopyFeedback(L"Failed to copy command line to clipboard.");
+    }
+}
+
+// The copy hotkey is scoped to the launcher window, so it does not steal a
+// global hotkey from other applications. It is handled centrally from the
+// message loop so it also works while a launcher child control has focus.
+bool HandleCopyCommandHotkeyKeyDown(WPARAM vkCode, LPARAM keyData) {
+    if (!g_state.copyCommandHotkeyEnabled || vkCode != g_state.copyCommandHotkey.vk) {
+        return false;
+    }
+    if (IsWindowVisible(g_state.launcherWindow) == FALSE) {
+        return false;
+    }
+    if (!AreHotkeyModifiersPressed(g_state.copyCommandHotkey.modifiers)) {
+        return false;
+    }
+
+    // Bit 30 of lParam is set for auto-repeat, so holding the chord down only
+    // copies once.
+    constexpr LPARAM kPreviousKeyStateBit = 1LL << 30;
+    if ((keyData & kPreviousKeyStateBit) != 0) {
+        return true;
+    }
+
+    if (g_state.hotkey.debugLoggingEnabled) {
+        AppendHotkeyDebugLog(L"Copy command hotkey pressed: " + FormatHotkeyConfig(g_state.copyCommandHotkey));
+    }
+    CopySelectedCommandLine();
+    return true;
+}
+
 void MoveSelection(int delta) {
     const LRESULT count = SendMessageW(g_state.resultList, LB_GETCOUNT, 0, 0);
     if (count <= 0) {
         return;
     }
 
+    ClearCopyFeedback(false);
     LRESULT selected = SendMessageW(g_state.resultList, LB_GETCURSEL, 0, 0);
     if (selected == LB_ERR) {
         selected = 0;
@@ -5266,6 +5488,8 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
 void ShowLauncher() {
     LayoutLauncher();
+    ClearCopyFeedback(false);
+    UpdateSelectedItemDescription();
     ShowWindow(g_state.launcherWindow, SW_SHOW);
     SetForegroundWindow(g_state.launcherWindow);
     SetFocus(g_state.searchEdit);
@@ -5333,6 +5557,9 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_SEARCH && HIWORD(wParam) == EN_CHANGE) {
             RecordSearchInputActivity();
+            // The pending rebuild repaints the description; skip an intermediate
+            // repaint that would briefly show the previous result's text.
+            ClearCopyFeedback(false);
             KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
             SetTimer(g_state.launcherWindow, kSearchDebounceTimerId, kSearchDebounceDelayMs, nullptr);
             return 0;
@@ -5342,6 +5569,7 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
             return 0;
         }
         if (LOWORD(wParam) == IDC_RESULTS && HIWORD(wParam) == LBN_SELCHANGE) {
+            ClearCopyFeedback(false);
             UpdateSelectedItemDescription();
             return 0;
         }
@@ -5392,6 +5620,10 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
         if (wParam == kSearchDebounceTimerId) {
             KillTimer(g_state.launcherWindow, kSearchDebounceTimerId);
             RequestResultListRebuild();
+            return 0;
+        }
+        if (wParam == kCopyFeedbackTimerId) {
+            ClearCopyFeedback();
             return 0;
         }
         break;
@@ -5580,6 +5812,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCommandItems(false);
     LoadCronTasks();
     LoadManagedHotkeys();
+    LoadCopyCommandHotkeyConfig();
     RefreshMonitoredConfigFiles();
 
     if (!InitializeWindows()) {
@@ -5609,6 +5842,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     MSG message {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if ((message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN) &&
+            IsLauncherRelatedWindow(message.hwnd) &&
+            HandleCopyCommandHotkeyKeyDown(message.wParam, message.lParam)) {
+            continue;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
