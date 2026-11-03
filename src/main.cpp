@@ -49,6 +49,17 @@ struct HistoryConfig {
     bool fuzzyEnabled = true;
 };
 
+struct ClipboardConfig {
+    bool enabled = true;
+    HotkeyConfig hotkey {};
+    int maxRows = 500;
+    int visibleItemCount = 12;
+};
+
+struct ClipboardEntry {
+    std::wstring text;
+};
+
 struct LauncherAppearanceConfig {
     int cornerRadius = 18;
     int opacity = 245;
@@ -219,6 +230,23 @@ struct AppState {
     HotkeyConfig hotkey {};
     HotkeyConfig copyCommandHotkey {};
     bool copyCommandHotkeyEnabled = false;
+    // Clipboard history (Ditto-like) state.
+    ClipboardConfig clipboardConfig {};
+    HWND clipboardWindow = nullptr;
+    HWND clipboardList = nullptr;
+    HWND clipboardPreview = nullptr;
+    HWND clipboardHint = nullptr;
+    WNDPROC clipboardListProc = nullptr;
+    HFONT clipboardFont = nullptr;
+    HFONT clipboardPreviewFont = nullptr;
+    HBRUSH clipboardBackgroundBrush = nullptr;
+    std::vector<ClipboardEntry> clipboardEntries;
+    HWND clipboardReturnWindow = nullptr;
+    DWORD lastClipboardSequenceNumber = 0;
+    HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    bool clipboardHotkeyArmed = false;
+    bool clipboardWindowActivated = false;
+    int clipboardVisibilityTicks = 0;
     // Transient status text shown in the description line after a copy.
     std::wstring copyFeedbackText;
     HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -261,6 +289,7 @@ AppState g_state {};
 
 constexpr wchar_t kHostClassName[] = L"DoRun.HostWindow";
 constexpr wchar_t kLauncherClassName[] = L"DoRun.LauncherWindow";
+constexpr wchar_t kClipboardClassName[] = L"DoRun.ClipboardWindow";
 constexpr wchar_t kSingletonMutexName[] = L"Local\\DoRun.Singleton";
 constexpr wchar_t kSingletonHostWindowTitle[] = L"DoRun.SingletonHost";
 constexpr wchar_t kAppDirectoryName[] = L"DoRun";
@@ -289,6 +318,16 @@ constexpr UINT_PTR kSearchDebounceTimerId = 5;
 constexpr UINT kSearchDebounceDelayMs = 50;
 constexpr UINT_PTR kCopyFeedbackTimerId = 6;
 constexpr UINT kCopyFeedbackDurationMs = 1500;
+constexpr UINT_PTR kClipboardPollTimerId = 7;
+constexpr UINT_PTR kClipboardVisibilityTimerId = 8;
+constexpr UINT kClipboardVisibilityTimerIntervalMs = 200;
+// ~1s grace for the popup to become the foreground window.
+constexpr int kClipboardVisibilityGiveUpTicks = 5;
+constexpr UINT kClipboardPollIntervalMs = 400;
+constexpr size_t kClipboardPreviewLength = 240;
+constexpr size_t kClipboardPreviewPopupLimit = 1200;
+// Very large payloads (e.g. whole-document copies) are not worth persisting.
+constexpr size_t kClipboardMaxEntryLength = 512 * 1024;
 constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
@@ -331,6 +370,7 @@ constexpr BuiltinCommandDefinition kBuiltinCommands[] = {
     { L"/standby", L"Put the computer to sleep", L"standby" },
     { L"/config", L"Open DoRun.yaml", L"config" },
     { L"/cmdconfig", L"Open Command.conf", L"cmdconfig" },
+    { L"/clipboard", L"Open clipboard history", L"clipboard" },
 };
 
 void RebuildResultList();
@@ -340,6 +380,26 @@ void RecordSearchInputActivity();
 void LoadCronTasks();
 void LoadManagedHotkeys();
 void LoadCopyCommandHotkeyConfig();
+void LoadClipboardConfig();
+void LoadClipboardEntriesFromFile();
+void RegisterClipboardHotkey();
+void UninstallClipboardHotkey();
+void StartClipboardPolling();
+void StopClipboardPolling();
+void PollClipboardForChanges();
+void ShowClipboardHistory();
+void HideClipboardHistory();
+void ToggleClipboardHistory();
+void LayoutClipboardWindow();
+void ReloadClipboardHistory();
+void UpdateClipboardPreview();
+void CopySelectedClipboardEntry();
+void DeleteSelectedClipboardEntry();
+void ClearClipboardHistory();
+bool IsClipboardWindow(HWND window);
+bool CopyTextToClipboard(std::wstring_view text);
+void AddClipboardEntry(std::wstring text);
+void ApplyClipboardFonts();
 void CopySelectedCommandLine();
 void ClearCopyFeedback(bool refreshDescription = true);
 bool HandleCopyCommandHotkeyKeyDown(WPARAM vkCode, LPARAM keyData);
@@ -2071,6 +2131,61 @@ void LoadCopyCommandHotkeyConfig() {
     g_state.copyCommandHotkeyEnabled = true;
 }
 
+// Ditto-like clipboard history.
+//
+// `CLIPBOARD_HISTORY_ENABLED` toggles the whole feature. `CLIPBOARD_HOTKEY`
+// uses the same syntax as Command.conf hotkeys and defaults to Ctrl+Backtick.
+constexpr wchar_t kDefaultClipboardHotkey[] = L"^BACKTICK";
+
+void LoadClipboardConfig() {
+    g_state.clipboardConfig = ClipboardConfig {};
+
+    HotkeyConfig defaultHotkey {};
+    if (ParseManagedHotkeySpec(kDefaultClipboardHotkey, &defaultHotkey)) {
+        g_state.clipboardConfig.hotkey = defaultHotkey;
+    }
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        return;
+    }
+
+    if (const std::optional<bool> enabled = ParseYamlBool(content, L"CLIPBOARD_HISTORY_ENABLED")) {
+        g_state.clipboardConfig.enabled = *enabled;
+    }
+    if (const std::optional<int> maxRows = ParseYamlInt(content, L"CLIPBOARD_HISTORY_MAX_ROWS")) {
+        g_state.clipboardConfig.maxRows = std::clamp(*maxRows, 1, 5000);
+    }
+    if (const std::optional<int> visibleItemCount = ParseYamlInt(content, L"CLIPBOARD_VISIBLE_ITEM_COUNT")) {
+        g_state.clipboardConfig.visibleItemCount = std::clamp(*visibleItemCount, 1, 40);
+    }
+
+    const std::optional<std::wstring> hotkeySpec = ParseYamlString(content, L"CLIPBOARD_HOTKEY");
+    if (!hotkeySpec) {
+        return;
+    }
+
+    const std::wstring trimmedSpec = Trim(*hotkeySpec);
+    const std::wstring lowercaseSpec = Lowercase(trimmedSpec);
+    if (trimmedSpec.empty() ||
+        trimmedSpec == L"0" ||
+        lowercaseSpec == L"none" ||
+        lowercaseSpec == L"off" ||
+        lowercaseSpec == L"disabled") {
+        g_state.clipboardConfig.hotkey = HotkeyConfig {};
+        return;
+    }
+
+    HotkeyConfig parsed {};
+    if (!ParseManagedHotkeySpec(trimmedSpec, &parsed)) {
+        AppendHotkeyDebugLog(L"Ignoring invalid CLIPBOARD_HOTKEY: " + trimmedSpec);
+        g_state.clipboardConfig.hotkey = HotkeyConfig {};
+        return;
+    }
+    g_state.clipboardConfig.hotkey = parsed;
+}
+
 void LoadHistoryConfig() {
     g_state.historyConfig = HistoryConfig {};
 
@@ -2217,6 +2332,9 @@ bool AnyHotkeysUseWindowsKey() {
     if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
         return true;
     }
+    if (g_state.clipboardConfig.enabled && (g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
+        return true;
+    }
     return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [](const ManagedHotkey& hotkey) {
         return (hotkey.hotkey.modifiers & MOD_WIN) != 0U;
     });
@@ -2224,6 +2342,11 @@ bool AnyHotkeysUseWindowsKey() {
 
 bool IsWindowsHotkeyCandidate(DWORD vkCode) {
     if ((g_state.hotkey.modifiers & MOD_WIN) != 0U && g_state.hotkey.vk == vkCode) {
+        return true;
+    }
+    if (g_state.clipboardConfig.enabled &&
+        (g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U &&
+        g_state.clipboardConfig.hotkey.vk == vkCode) {
         return true;
     }
     return std::any_of(g_state.managedHotkeys.begin(), g_state.managedHotkeys.end(), [vkCode](const ManagedHotkey& hotkey) {
@@ -2236,6 +2359,7 @@ bool AnyHotkeysUseKeyboardHook() {
     // input.  A low-level hook is therefore also required for registered
     // Win+key hotkeys, otherwise releasing Win can open the Start menu.
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook ||
+        g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook ||
         AnyHotkeysUseWindowsKey()) {
         return true;
     }
@@ -2305,6 +2429,7 @@ void UninstallKeyboardHook() {
         g_state.keyboardHook = nullptr;
     }
     g_state.launcherHotkeyArmed = false;
+    g_state.clipboardHotkeyArmed = false;
     g_state.suppressHookWinKeyUp = false;
     g_state.pendingHookWinKey = 0;
     for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
@@ -2315,6 +2440,9 @@ void UninstallKeyboardHook() {
 void AddKeyboardHookRegistrationFailures(DWORD errorCode) {
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook) {
         AddHotkeyRegistrationFailure(L"Launcher hotkey", FormatHotkeyConfig(g_state.hotkey), errorCode);
+    }
+    if (g_state.clipboardConfig.enabled && g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook) {
+        AddHotkeyRegistrationFailure(L"Clipboard hotkey", FormatHotkeyConfig(g_state.clipboardConfig.hotkey), errorCode);
     }
     for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
         if (hotkey.backend == HotkeyBackend::KeyboardHook) {
@@ -2384,6 +2512,12 @@ bool HandleHookHotkeyKeyRelease(DWORD vkCode) {
         g_state.launcherHotkeyArmed = false;
     }
 
+    if (g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        g_state.clipboardHotkeyArmed &&
+        vkCode == g_state.clipboardConfig.hotkey.vk) {
+        g_state.clipboardHotkeyArmed = false;
+    }
+
     for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
         if (hotkey.backend == HotkeyBackend::KeyboardHook &&
             hotkey.armed &&
@@ -2430,6 +2564,22 @@ bool HandleHookHotkeyKeyDown(DWORD vkCode, bool winDown) {
             PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_LAUNCH, 0);
         }
         if ((g_state.hotkey.modifiers & MOD_WIN) != 0U) {
+            g_state.suppressHookWinKeyUp = true;
+        }
+    }
+
+    if (g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        g_state.clipboardConfig.enabled &&
+        g_state.clipboardConfig.hotkey.vk != 0U &&
+        vkCode == g_state.clipboardConfig.hotkey.vk &&
+        AreHotkeyModifiersPressed(g_state.clipboardConfig.hotkey.modifiers, winDown)) {
+        suppress = true;
+        if (!g_state.clipboardHotkeyArmed) {
+            g_state.clipboardHotkeyArmed = true;
+            AppendHotkeyDebugLog(L"Keyboard hook matched clipboard hotkey: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+            PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_CLIPBOARD, 0);
+        }
+        if ((g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
             g_state.suppressHookWinKeyUp = true;
         }
     }
@@ -2883,6 +3033,19 @@ std::optional<UINT> ParseHotkeyVirtualKey(std::wstring_view text) {
         { L"SCROLLLOCK", VK_SCROLL },
         { L"PAUSE", VK_PAUSE },
         { L"APPS", VK_APPS },
+        { L"BACKTICK", VK_OEM_3 },
+        { L"`", VK_OEM_3 },
+        { L"OEM_3", VK_OEM_3 },
+        { L"MINUS", VK_OEM_MINUS },
+        { L"EQUAL", VK_OEM_PLUS },
+        { L"COMMA", VK_OEM_COMMA },
+        { L"PERIOD", VK_OEM_PERIOD },
+        { L"SLASH", VK_OEM_2 },
+        { L"SEMICOLON", VK_OEM_1 },
+        { L"QUOTE", VK_OEM_7 },
+        { L"LBRACKET", VK_OEM_4 },
+        { L"RBRACKET", VK_OEM_6 },
+        { L"BACKSLASH", VK_OEM_5 },
     };
 
     const auto it = kNamedVirtualKeys.find(value);
@@ -2981,6 +3144,28 @@ std::wstring FormatHotkeyVirtualKey(UINT vk) {
         return L"PAUSE";
     case VK_APPS:
         return L"APPS";
+    case VK_OEM_3:
+        return L"BACKTICK";
+    case VK_OEM_MINUS:
+        return L"MINUS";
+    case VK_OEM_PLUS:
+        return L"EQUAL";
+    case VK_OEM_COMMA:
+        return L"COMMA";
+    case VK_OEM_PERIOD:
+        return L"PERIOD";
+    case VK_OEM_2:
+        return L"SLASH";
+    case VK_OEM_1:
+        return L"SEMICOLON";
+    case VK_OEM_7:
+        return L"QUOTE";
+    case VK_OEM_4:
+        return L"LBRACKET";
+    case VK_OEM_6:
+        return L"RBRACKET";
+    case VK_OEM_5:
+        return L"BACKSLASH";
     default:
         return L"VK(" + std::to_wstring(vk) + L")";
     }
@@ -3271,6 +3456,713 @@ void LoadHistoryCache() {
 
     FinalizeStatement(statement);
     sqlite3_close(database);
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard history storage (plain text entries, newest first).
+// ---------------------------------------------------------------------------
+
+std::wstring GetClipboardEntriesPath() {
+    const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
+    if (localAppDataDirectory.empty()) {
+        return (std::filesystem::path(GetModuleDirectory()) / L"clipboard-history.txt").wstring();
+    }
+    return (std::filesystem::path(localAppDataDirectory) / L"clipboard-history.txt").wstring();
+}
+
+// Entries are stored one per line, so control characters are escaped.
+void SaveClipboardEntriesToFile() {
+    std::wstring content;
+    for (const ClipboardEntry& entry : g_state.clipboardEntries) {
+        std::wstring escaped;
+        escaped.reserve(entry.text.size());
+        for (const wchar_t ch : entry.text) {
+            switch (ch) {
+            case L'\\':
+                escaped += L"\\\\";
+                break;
+            case L'\n':
+                escaped += L"\\n";
+                break;
+            case L'\r':
+                escaped += L"\\r";
+                break;
+            case L'\t':
+                escaped += L"\\t";
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+            }
+        }
+        content += escaped;
+        content += L"\n";
+    }
+
+    const std::wstring path = GetClipboardEntriesPath();
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+    SaveUtf8TextFile(path, content);
+}
+
+void TrimClipboardEntries() {
+    const size_t limit = static_cast<size_t>(std::clamp(g_state.clipboardConfig.maxRows, 1, 5000));
+    if (g_state.clipboardEntries.size() > limit) {
+        g_state.clipboardEntries.resize(limit);
+    }
+}
+
+void LoadClipboardEntriesFromFile() {
+    g_state.clipboardEntries.clear();
+
+    const std::wstring content = LoadUtf8TextFile(GetClipboardEntriesPath());
+    if (content.empty()) {
+        return;
+    }
+
+    for (size_t index = 0; index < content.size();) {
+        size_t end = content.find(L'\n', index);
+        if (end == std::wstring::npos) {
+            end = content.size();
+        }
+
+        std::wstring line = content.substr(index, end - index);
+        index = end + 1;
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+
+        std::wstring text;
+        text.reserve(line.size());
+        for (size_t pos = 0; pos < line.size(); ++pos) {
+            const wchar_t ch = line[pos];
+            if (ch == L'\\' && pos + 1 < line.size()) {
+                const wchar_t next = line[++pos];
+                if (next == L'n') {
+                    text.push_back(L'\n');
+                } else if (next == L'r') {
+                    text.push_back(L'\r');
+                } else if (next == L't') {
+                    text.push_back(L'\t');
+                } else {
+                    text.push_back(next);
+                }
+                continue;
+            }
+            text.push_back(ch);
+        }
+
+        if (text.empty()) {
+            continue;
+        }
+
+        ClipboardEntry entry {};
+        entry.text = std::move(text);
+        g_state.clipboardEntries.push_back(std::move(entry));
+    }
+
+    TrimClipboardEntries();
+}
+
+void AddClipboardEntry(std::wstring text) {
+    if (text.empty() || text.size() > kClipboardMaxEntryLength) {
+        return;
+    }
+
+    // Re-copying an older entry moves it back to the top; an unchanged newest
+    // entry is left alone so polling does not churn the list.
+    const auto existing = std::find_if(
+        g_state.clipboardEntries.begin(),
+        g_state.clipboardEntries.end(),
+        [&text](const ClipboardEntry& entry) { return entry.text == text; });
+    if (existing != g_state.clipboardEntries.end()) {
+        if (existing == g_state.clipboardEntries.begin()) {
+            return;
+        }
+        ClipboardEntry entry = std::move(*existing);
+        g_state.clipboardEntries.erase(existing);
+        g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(entry));
+        SaveClipboardEntriesToFile();
+        return;
+    }
+
+    ClipboardEntry entry {};
+    entry.text = std::move(text);
+    g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(entry));
+
+    TrimClipboardEntries();
+    SaveClipboardEntriesToFile();
+}
+
+bool GetClipboardUnicodeText(std::wstring* text) {
+    if (text == nullptr) {
+        return false;
+    }
+    text->clear();
+
+    if (OpenClipboard(g_state.hostWindow) == FALSE) {
+        return false;
+    }
+
+    bool success = false;
+    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    if (handle != nullptr) {
+        const wchar_t* data = static_cast<const wchar_t*>(GlobalLock(handle));
+        if (data != nullptr) {
+            // CF_UNICODETEXT is NUL terminated, but GlobalSize bounds the scan
+            // in case the producer forgot the terminator.
+            const size_t maxLength = GlobalSize(handle) / sizeof(wchar_t);
+            if (maxLength > 0) {
+                size_t length = 0;
+                while (length < maxLength && data[length] != L'\0') {
+                    ++length;
+                }
+                text->assign(data, length);
+                success = true;
+            }
+            GlobalUnlock(handle);
+        }
+    }
+
+    CloseClipboard();
+    return success;
+}
+
+void StartClipboardPolling() {
+    if (g_state.hostWindow == nullptr) {
+        return;
+    }
+    if (g_state.lastClipboardSequenceNumber == 0) {
+        // Skip whatever was on the clipboard before the feature started.
+        g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+    }
+    SetTimer(g_state.hostWindow, kClipboardPollTimerId, kClipboardPollIntervalMs, nullptr);
+}
+
+void StopClipboardPolling() {
+    if (g_state.hostWindow != nullptr) {
+        KillTimer(g_state.hostWindow, kClipboardPollTimerId);
+    }
+}
+
+void PollClipboardForChanges() {
+    if (!g_state.clipboardConfig.enabled) {
+        return;
+    }
+
+    // Reading the clipboard is relatively expensive and holds a global lock,
+    // so only do it when Windows reports that its contents changed.
+    const DWORD sequenceNumber = GetClipboardSequenceNumber();
+    if (sequenceNumber == g_state.lastClipboardSequenceNumber) {
+        return;
+    }
+
+    std::wstring text;
+    if (!GetClipboardUnicodeText(&text)) {
+        // Another process may be holding the clipboard open; retry on the next
+        // tick instead of marking this sequence number as consumed.
+        return;
+    }
+    g_state.lastClipboardSequenceNumber = sequenceNumber;
+    if (text.empty()) {
+        return;
+    }
+    if (!g_state.clipboardEntries.empty() && g_state.clipboardEntries.front().text == text) {
+        return;
+    }
+
+    AddClipboardEntry(std::move(text));
+    if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+        ReloadClipboardHistory();
+    }
+}
+
+// Collapses newlines/tabs into single spaces for the compact list labels.
+std::wstring BuildClipboardPreviewText(std::wstring_view text) {
+    std::wstring preview;
+    preview.reserve(text.size());
+    bool previousWasSpace = false;
+    for (const wchar_t ch : text) {
+        const bool isSpace = ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == L' ';
+        if (isSpace) {
+            if (!previousWasSpace && !preview.empty()) {
+                preview.push_back(L' ');
+            }
+            previousWasSpace = true;
+            continue;
+        }
+        previousWasSpace = false;
+        preview.push_back(ch);
+    }
+    preview = Trim(preview);
+    if (preview.empty()) {
+        return L"(whitespace only)";
+    }
+    if (preview.size() > kClipboardPreviewLength) {
+        preview.resize(kClipboardPreviewLength);
+        preview += L"...";
+    }
+    return preview;
+}
+
+void MoveClipboardSelection(int delta) {
+    if (g_state.clipboardList == nullptr) {
+        return;
+    }
+    const LRESULT count = SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0);
+    if (count <= 0) {
+        return;
+    }
+
+    LRESULT selected = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
+    if (selected == LB_ERR) {
+        selected = 0;
+    }
+    selected += delta;
+    if (selected < 0) {
+        selected = 0;
+    }
+    if (selected >= count) {
+        selected = count - 1;
+    }
+    SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+    UpdateClipboardPreview();
+}
+
+std::optional<size_t> GetSelectedClipboardEntryIndex() {
+    if (g_state.clipboardList == nullptr) {
+        return std::nullopt;
+    }
+    const LRESULT selected = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
+    if (selected == LB_ERR) {
+        return std::nullopt;
+    }
+    const LRESULT itemIndex = SendMessageW(g_state.clipboardList, LB_GETITEMDATA, static_cast<WPARAM>(selected), 0);
+    if (itemIndex == LB_ERR || static_cast<size_t>(itemIndex) >= g_state.clipboardEntries.size()) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(itemIndex);
+}
+
+void UpdateClipboardPreview() {
+    if (g_state.clipboardPreview == nullptr) {
+        return;
+    }
+
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    if (!index) {
+        SetWindowTextW(
+            g_state.clipboardPreview,
+            g_state.clipboardEntries.empty()
+                ? L"Clipboard history is empty. Copy some text to start collecting entries."
+                : L"");
+        return;
+    }
+
+    std::wstring text = g_state.clipboardEntries[*index].text;
+    if (text.size() > kClipboardPreviewPopupLimit) {
+        text.resize(kClipboardPreviewPopupLimit);
+        text += L"...";
+    }
+    SetWindowTextW(g_state.clipboardPreview, text.c_str());
+}
+
+void ReloadClipboardHistory() {
+    if (g_state.clipboardList == nullptr) {
+        return;
+    }
+
+    const LRESULT previousSelection = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
+    SendMessageW(g_state.clipboardList, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_state.clipboardList, LB_RESETCONTENT, 0, 0);
+
+    for (size_t index = 0; index < g_state.clipboardEntries.size(); ++index) {
+        const std::wstring label = BuildClipboardPreviewText(g_state.clipboardEntries[index].text);
+        const LRESULT inserted = SendMessageW(g_state.clipboardList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        if (inserted >= 0) {
+            SendMessageW(g_state.clipboardList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(index));
+        }
+    }
+
+    const LRESULT count = SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0);
+    if (count > 0) {
+        LRESULT selection = previousSelection;
+        if (selection == LB_ERR || selection >= count) {
+            selection = 0;
+        }
+        SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(selection), 0);
+    }
+
+    SendMessageW(g_state.clipboardList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_state.clipboardList, nullptr, TRUE);
+    UpdateClipboardPreview();
+}
+
+void ApplyClipboardFonts() {
+    if (g_state.clipboardFont != nullptr) {
+        DeleteObject(g_state.clipboardFont);
+        g_state.clipboardFont = nullptr;
+    }
+    if (g_state.clipboardPreviewFont != nullptr) {
+        DeleteObject(g_state.clipboardPreviewFont);
+        g_state.clipboardPreviewFont = nullptr;
+    }
+
+    g_state.clipboardFont = CreateConfiguredUiFont(
+        g_state.dpi,
+        g_state.launcherAppearance.resultFontFamily,
+        g_state.launcherAppearance.resultFontPointSize);
+    const int previewPointSize = g_state.launcherAppearance.resultFontPointSize > 0
+        ? std::max(6, g_state.launcherAppearance.resultFontPointSize - 2)
+        : 9;
+    g_state.clipboardPreviewFont = CreateConfiguredUiFont(
+        g_state.dpi,
+        g_state.launcherAppearance.resultFontFamily,
+        previewPointSize);
+
+    ApplyFont(g_state.clipboardList, g_state.clipboardFont);
+    ApplyFont(g_state.clipboardPreview, g_state.clipboardPreviewFont);
+    ApplyFont(g_state.clipboardHint, g_state.clipboardPreviewFont);
+}
+
+// SetForegroundWindow can be refused because of the foreground lock; attaching
+// to the current foreground thread first makes the launcher popups reliable.
+void ForceForegroundWindow(HWND window) {
+    if (window == nullptr) {
+        return;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == window) {
+        return;
+    }
+
+    const DWORD foregroundThread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD currentThread = GetCurrentThreadId();
+    const bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
+        AttachThreadInput(currentThread, foregroundThread, TRUE) != FALSE;
+
+    BringWindowToTop(window);
+    SetForegroundWindow(window);
+
+    if (attached) {
+        AttachThreadInput(currentThread, foregroundThread, FALSE);
+    }
+}
+
+void ApplyClipboardAppearance() {
+    if (g_state.clipboardWindow == nullptr) {
+        return;
+    }
+
+    if (g_state.clipboardBackgroundBrush != nullptr) {
+        DeleteObject(g_state.clipboardBackgroundBrush);
+        g_state.clipboardBackgroundBrush = nullptr;
+    }
+    g_state.clipboardBackgroundBrush = CreateSolidBrush(g_state.launcherAppearance.backgroundColor);
+
+    const DWM_WINDOW_CORNER_PREFERENCE preference = static_cast<DWM_WINDOW_CORNER_PREFERENCE>(
+        g_state.launcherAppearance.cornerRadius <= 0
+            ? DWMWCP_DONOTROUND
+            : (g_state.launcherAppearance.cornerRadius <= 12 ? DWMWCP_ROUNDSMALL : DWMWCP_ROUND));
+    DwmSetWindowAttribute(g_state.clipboardWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
+    const COLORREF borderColor = DWMWA_COLOR_NONE;
+    DwmSetWindowAttribute(g_state.clipboardWindow, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
+
+    InvalidateRect(g_state.clipboardWindow, nullptr, TRUE);
+}
+
+void LayoutClipboardWindow() {
+    if (g_state.clipboardWindow == nullptr) {
+        return;
+    }
+
+    RECT workArea {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+
+    const int width = Scale(760);
+    const int margin = Scale(16);
+    int listItemHeight = Scale(36);
+    if (g_state.clipboardList != nullptr) {
+        const LRESULT measuredHeight = SendMessageW(g_state.clipboardList, LB_GETITEMHEIGHT, 0, 0);
+        if (measuredHeight > 0) {
+            listItemHeight = static_cast<int>(measuredHeight);
+        }
+    }
+    const int listHeight = listItemHeight * g_state.clipboardConfig.visibleItemCount;
+    const int previewHeight = Scale(96);
+    const int hintHeight = std::max(Scale(20), MeasureFontTextHeight(g_state.clipboardPreviewFont) + Scale(6));
+    const int height = margin * 4 + listHeight + previewHeight + hintHeight;
+    const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
+    const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 6;
+
+    SetWindowPos(g_state.clipboardWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    MoveWindow(g_state.clipboardList, margin, margin, width - margin * 2, listHeight, TRUE);
+    MoveWindow(g_state.clipboardPreview, margin, margin * 2 + listHeight, width - margin * 2, previewHeight, TRUE);
+    MoveWindow(g_state.clipboardHint, margin, margin * 3 + listHeight + previewHeight, width - margin * 2, hintHeight, TRUE);
+    ApplyClipboardAppearance();
+}
+
+void HideClipboardHistory() {
+    // Callers that want focus restored capture clipboardReturnWindow before
+    // hiding; clearing it here avoids stealing focus on a later unrelated hide.
+    g_state.clipboardReturnWindow = nullptr;
+    if (g_state.clipboardWindow == nullptr || IsWindowVisible(g_state.clipboardWindow) == FALSE) {
+        return;
+    }
+    KillTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId);
+    ShowWindow(g_state.clipboardWindow, SW_HIDE);
+}
+
+void ShowClipboardHistory() {
+    if (g_state.clipboardWindow == nullptr || !g_state.clipboardConfig.enabled) {
+        return;
+    }
+
+    // Remember who had focus so the copied entry can be pasted straight away.
+    const HWND foreground = GetForegroundWindow();
+    const bool returnedWindowIsOurs =
+        foreground == nullptr || IsClipboardWindow(foreground) || IsChildOrSameWindow(g_state.launcherWindow, foreground);
+
+    HideLauncher();
+    g_state.clipboardReturnWindow = returnedWindowIsOurs ? nullptr : foreground;
+
+    g_state.clipboardWindowActivated = false;
+    g_state.clipboardVisibilityTicks = 0;
+    ReloadClipboardHistory();
+    LayoutClipboardWindow();
+    ShowWindow(g_state.clipboardWindow, SW_SHOW);
+    ForceForegroundWindow(g_state.clipboardWindow);
+    SetFocus(g_state.clipboardList);
+    // Fallback for the case where the foreground lock refuses the activation
+    // and WM_ACTIVATE never arrives: once the popup has been active, close it
+    // as soon as focus moves elsewhere.
+    SetTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId, kClipboardVisibilityTimerIntervalMs, nullptr);
+}
+
+void ToggleClipboardHistory() {
+    if (g_state.clipboardWindow != nullptr && IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+        HideClipboardHistory();
+        return;
+    }
+    ShowClipboardHistory();
+}
+
+void CopySelectedClipboardEntry() {
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    if (!index) {
+        return;
+    }
+
+    const std::wstring text = g_state.clipboardEntries[*index].text;
+    if (!CopyTextToClipboard(text)) {
+        return;
+    }
+
+    // Return focus to the window that opened the popup so the user can paste
+    // right away with Ctrl+V.
+    const HWND returnWindow = g_state.clipboardReturnWindow;
+    HideClipboardHistory();
+    if (returnWindow != nullptr && IsWindow(returnWindow) != FALSE) {
+        ForceForegroundWindow(returnWindow);
+    }
+}
+
+void DeleteSelectedClipboardEntry() {
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    if (!index) {
+        return;
+    }
+
+    using EntryDifference = std::vector<ClipboardEntry>::difference_type;
+    g_state.clipboardEntries.erase(
+        g_state.clipboardEntries.begin() + static_cast<EntryDifference>(*index));
+    SaveClipboardEntriesToFile();
+    ReloadClipboardHistory();
+}
+
+void ClearClipboardHistory() {
+    g_state.clipboardEntries.clear();
+    SaveClipboardEntriesToFile();
+    ReloadClipboardHistory();
+}
+
+bool IsClipboardWindow(HWND window) {
+    return IsChildOrSameWindow(g_state.clipboardWindow, window);
+}
+
+// The clipboard hotkey is registered globally, so it is consumed by the system
+// (or by the low-level hook) and never reaches this list box; toggling while
+// the popup is open is handled by the WM_HOTKEY path instead.
+LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_KEYDOWN) {
+        const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (wParam == VK_UP) {
+            MoveClipboardSelection(-1);
+            return 0;
+        }
+        if (wParam == VK_DOWN) {
+            MoveClipboardSelection(1);
+            return 0;
+        }
+        if (wParam == VK_RETURN || (controlDown && wParam == 'C')) {
+            CopySelectedClipboardEntry();
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            HideClipboardHistory();
+            return 0;
+        }
+        if (wParam == VK_DELETE) {
+            if (controlDown) {
+                ClearClipboardHistory();
+            } else {
+                DeleteSelectedClipboardEntry();
+            }
+            return 0;
+        }
+    }
+    return CallWindowProcW(g_state.clipboardListProc, window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        g_state.clipboardList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_LIST)), g_state.instance, nullptr);
+        g_state.clipboardPreview = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_PREVIEW)), g_state.instance, nullptr);
+        g_state.clipboardHint = CreateWindowExW(0, L"STATIC", L"Enter / Ctrl+C copy    Del remove    Ctrl+Del clear all    Esc close", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_HINT)), g_state.instance, nullptr);
+        ApplyClipboardFonts();
+        g_state.clipboardListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.clipboardList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ClipboardListProc)));
+        LayoutClipboardWindow();
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps {};
+        HDC dc = BeginPaint(window, &ps);
+        RECT clientRect {};
+        GetClientRect(window, &clientRect);
+        if (g_state.clipboardBackgroundBrush != nullptr) {
+            FillRect(dc, &clientRect, g_state.clipboardBackgroundBrush);
+        }
+        HPEN borderPen = CreatePen(PS_SOLID, 1, g_state.launcherAppearance.borderColor);
+        if (borderPen != nullptr) {
+            const HGDIOBJ oldPen = SelectObject(dc, borderPen);
+            const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            Rectangle(dc, clientRect.left, clientRect.top, clientRect.right, clientRect.bottom);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(borderPen);
+        }
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
+            UpdateClipboardPreview();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+            CopySelectedClipboardEntry();
+            return 0;
+        }
+        break;
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetBkColor(dc, g_state.launcherAppearance.backgroundColor);
+        SetTextColor(dc, g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.clipboardBackgroundBrush != nullptr ? g_state.clipboardBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        HWND control = reinterpret_cast<HWND>(lParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, control == g_state.clipboardHint ? g_state.launcherAppearance.subtleTextColor : g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.clipboardBackgroundBrush != nullptr ? g_state.clipboardBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE) {
+            HideClipboardHistory();
+            return 0;
+        }
+        g_state.clipboardWindowActivated = true;
+        return 0;
+    case WM_TIMER:
+        if (wParam == kClipboardVisibilityTimerId) {
+            const HWND foregroundWindow = GetForegroundWindow();
+            if (foregroundWindow != nullptr && IsClipboardWindow(foregroundWindow)) {
+                g_state.clipboardWindowActivated = true;
+                g_state.clipboardVisibilityTicks = 0;
+                return 0;
+            }
+
+            // Once the popup has held focus, another foreground window means
+            // the user clicked away and the popup should close.
+            if (g_state.clipboardWindowActivated) {
+                HideClipboardHistory();
+                return 0;
+            }
+
+            // Otherwise give it a moment to take focus, retrying once in case
+            // the foreground lock won the first attempt.
+            ++g_state.clipboardVisibilityTicks;
+            if (g_state.clipboardVisibilityTicks == 1) {
+                ForceForegroundWindow(g_state.clipboardWindow);
+            } else if (g_state.clipboardVisibilityTicks >= kClipboardVisibilityGiveUpTicks) {
+                // Leave the popup usable (the user can still click it); just
+                // stop polling for activation.
+                KillTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId);
+            }
+            return 0;
+        }
+        break;
+    case WM_DPICHANGED:
+        UpdateUiFont(HIWORD(wParam));
+        ApplyClipboardFonts();
+        LayoutClipboardWindow();
+        return 0;
+    case WM_CLOSE:
+        HideClipboardHistory();
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void UninstallClipboardHotkey() {
+    if (g_state.hostWindow != nullptr) {
+        UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_CLIPBOARD);
+    }
+    g_state.clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    g_state.clipboardHotkeyArmed = false;
+}
+
+void RegisterClipboardHotkey() {
+    UninstallClipboardHotkey();
+    if (g_state.hostWindow == nullptr || !g_state.clipboardConfig.enabled) {
+        return;
+    }
+    if (g_state.clipboardConfig.hotkey.vk == 0U) {
+        return;
+    }
+
+    if ((g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
+        // See RegisterLauncherHotkey: the low-level hook is the only reliable
+        // way to stop Explorer from acting on Win+key chords.
+        g_state.clipboardHotkeyBackend = HotkeyBackend::KeyboardHook;
+        AppendHotkeyDebugLog(L"Clipboard Win hotkey uses keyboard hook: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+    } else if (RegisterHotKey(
+                   g_state.hostWindow,
+                   ID_HOTKEY_CLIPBOARD,
+                   g_state.clipboardConfig.hotkey.modifiers,
+                   g_state.clipboardConfig.hotkey.vk) == FALSE) {
+        g_state.clipboardHotkeyBackend = HotkeyBackend::KeyboardHook;
+        AppendHotkeyDebugLog(L"Clipboard hotkey fell back to keyboard hook: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+    } else {
+        AppendHotkeyDebugLog(L"Clipboard hotkey registered via RegisterHotKey: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+    }
 }
 
 std::vector<std::wstring> SplitCommandFields(std::wstring_view line) {
@@ -5097,13 +5989,27 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     LoadCronTasks();
     LoadManagedHotkeys();
     LoadCopyCommandHotkeyConfig();
+    LoadClipboardConfig();
     RefreshMonitoredConfigFiles();
     UpdateUiFont(g_state.dpi);
     g_state.hotkeyRegistrationFailures.clear();
     RegisterLauncherHotkey();
+    RegisterClipboardHotkey();
     RegisterManagedHotkeys();
     ConfigureKeyboardHook();
     ShowHotkeyRegistrationFailures();
+    if (g_state.clipboardConfig.enabled) {
+        LoadClipboardEntriesFromFile();
+        StartClipboardPolling();
+    } else {
+        StopClipboardPolling();
+        g_state.clipboardEntries.clear();
+        HideClipboardHistory();
+    }
+    if (g_state.clipboardWindow != nullptr) {
+        ApplyClipboardFonts();
+        LayoutClipboardWindow();
+    }
     ApplyLauncherAppearance();
     ApplyFont(g_state.searchEdit, g_state.searchFont);
     ApplyFont(g_state.resultList, g_state.resultFont);
@@ -5158,6 +6064,9 @@ bool LaunchConfiguredItem(const LaunchItem& item, bool hideLauncherOnSuccess, st
         } else if (command == L"builtin:cmdconfig") {
             const std::wstring path = GetWritableConfigPath(kCommandFileName);
             success = EnsureFileExists(path) && OpenPathWithConfiguredEditor(path);
+        } else if (command == L"builtin:clipboard") {
+            ShowClipboardHistory();
+            return true;
         }
 
         if (success && hideLauncherOnSuccess) {
@@ -5332,7 +6241,11 @@ std::optional<std::wstring> BuildCopyableCommandText(size_t index) {
 }
 
 bool CopyTextToClipboard(std::wstring_view text) {
-    if (!OpenClipboard(g_state.launcherWindow)) {
+    HWND owner = g_state.launcherWindow;
+    if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+        owner = g_state.clipboardWindow;
+    }
+    if (OpenClipboard(owner) == FALSE) {
         return false;
     }
 
@@ -5354,6 +6267,16 @@ bool CopyTextToClipboard(std::wstring_view text) {
         }
     }
     CloseClipboard();
+
+    if (copied && g_state.clipboardConfig.enabled) {
+        // Record our own copies immediately instead of waiting for the poll,
+        // and mark the sequence number as consumed so it is not read twice.
+        g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+        AddClipboardEntry(std::wstring(text));
+        if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+            ReloadClipboardHistory();
+        }
+    }
     return copied;
 }
 
@@ -5487,6 +6410,7 @@ LRESULT CALLBACK SearchEditProc(HWND window, UINT message, WPARAM wParam, LPARAM
 }
 
 void ShowLauncher() {
+    HideClipboardHistory();
     LayoutLauncher();
     ClearCopyFeedback(false);
     UpdateSelectedItemDescription();
@@ -5660,6 +6584,11 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
             ShowLauncher();
             return 0;
         }
+        if (wParam == ID_HOTKEY_CLIPBOARD) {
+            AppendHotkeyDebugLog(L"Received WM_HOTKEY for clipboard history.");
+            ToggleClipboardHistory();
+            return 0;
+        }
         for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
             if (wParam == hotkey.id) {
                 AppendHotkeyDebugLog(L"Received WM_HOTKEY for managed hotkey: " + hotkey.spec);
@@ -5670,6 +6599,10 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
     if (message == WM_TIMER && wParam == kCronTimerId) {
         RunCronTasks();
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kClipboardPollTimerId) {
+        PollClipboardForChanges();
         return 0;
     }
     if (message == WM_TIMER && wParam == kConfigWatchTimerId) {
@@ -5740,6 +6673,9 @@ bool InitializeWindows() {
     if (RegisterWindowClass(kLauncherClassName, LauncherWindowProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1)) == 0) {
         return false;
     }
+    if (RegisterWindowClass(kClipboardClassName, ClipboardWindowProc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1)) == 0) {
+        return false;
+    }
 
     g_state.hostWindow = CreateWindowExW(
         WS_EX_TOOLWINDOW,
@@ -5772,7 +6708,23 @@ bool InitializeWindows() {
         g_state.instance,
         nullptr);
 
+    g_state.clipboardWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        kClipboardClassName,
+        L"DoRun Clipboard",
+        WS_POPUP,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        nullptr,
+        nullptr,
+        g_state.instance,
+        nullptr);
+
     ApplyLauncherAppearance();
+    // The launcher is the primary UI; a missing clipboard window only disables
+    // the clipboard history feature.
     return g_state.launcherWindow != nullptr;
 }
 
@@ -5813,6 +6765,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCronTasks();
     LoadManagedHotkeys();
     LoadCopyCommandHotkeyConfig();
+    LoadClipboardConfig();
     RefreshMonitoredConfigFiles();
 
     if (!InitializeWindows()) {
@@ -5828,9 +6781,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     } else {
         g_state.hotkeyRegistrationFailures.clear();
         RegisterLauncherHotkey();
+        RegisterClipboardHotkey();
         RegisterManagedHotkeys();
         ConfigureKeyboardHook();
         ShowHotkeyRegistrationFailures();
+        if (g_state.clipboardConfig.enabled) {
+            LoadClipboardEntriesFromFile();
+            StartClipboardPolling();
+        }
         if (g_state.startupMode) {
             RunNamedGroup(g_state.groupRunName);
         }
@@ -5843,7 +6801,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     MSG message {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if ((message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN) &&
-            IsLauncherRelatedWindow(message.hwnd) &&
+            IsChildOrSameWindow(g_state.launcherWindow, message.hwnd) &&
             HandleCopyCommandHotkeyKeyDown(message.wParam, message.lParam)) {
             continue;
         }
@@ -5852,6 +6810,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_LAUNCH);
+    UninstallClipboardHotkey();
+    StopClipboardPolling();
     UnregisterManagedHotkeys();
     UninstallKeyboardHook();
     CloseCronTaskProcessHandles();
@@ -5874,6 +6834,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_state.searchBackgroundBrush != nullptr) {
         DeleteObject(g_state.searchBackgroundBrush);
         g_state.searchBackgroundBrush = nullptr;
+    }
+    if (g_state.clipboardFont != nullptr) {
+        DeleteObject(g_state.clipboardFont);
+        g_state.clipboardFont = nullptr;
+    }
+    if (g_state.clipboardPreviewFont != nullptr) {
+        DeleteObject(g_state.clipboardPreviewFont);
+        g_state.clipboardPreviewFont = nullptr;
+    }
+    if (g_state.clipboardBackgroundBrush != nullptr) {
+        DeleteObject(g_state.clipboardBackgroundBrush);
+        g_state.clipboardBackgroundBrush = nullptr;
     }
     if (comInitialized) {
         CoUninitialize();

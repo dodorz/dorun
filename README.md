@@ -17,6 +17,7 @@ Main capabilities:
 - Custom commands from `Command.conf`.
 - Built-in slash commands such as `/reload`, `/kill`, `/config`, and `/cmdconfig`.
 - Optional launcher-scoped hotkey to copy the selected command line to the clipboard.
+- Ditto-like clipboard history: a global hotkey opens a floating list of recent clipboard text, newest first.
 - Managed hotkeys that launch specific commands directly.
 - `STARTUP` tasks that run when DoRun starts in startup mode.
 - Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
@@ -42,6 +43,7 @@ Type these in the launcher search box and press Enter:
 | `/standby` | Sleep |
 | `/config` | Open `DoRun.yaml` with `EDITOR` |
 | `/cmdconfig` | Open `Command.conf` with `EDITOR` |
+| `/clipboard` | Open the clipboard history window |
 
 ### Copying a command line
 
@@ -54,6 +56,31 @@ COPY_COMMAND_HOTKEY: '^+c'
 ```
 
 The hotkey is handled only while the launcher window is focused, so it does not take a system-wide shortcut away from other applications.
+
+### Clipboard history
+
+DoRun can keep a Ditto-like history of clipboard **text**. While it is running, every new clipboard text is appended to the history (newest first), including text copied by DoRun itself.
+
+Press the clipboard hotkey at any time to open a small floating window with the history:
+
+```yaml
+CLIPBOARD_HISTORY_ENABLED: true     # master switch for the feature
+CLIPBOARD_HOTKEY: '^`'              # AutoHotkey-like syntax, default is Ctrl+`
+CLIPBOARD_HISTORY_MAX_ROWS: 500     # how many entries to keep
+CLIPBOARD_VISIBLE_ITEM_COUNT: 12    # rows visible in the popup
+```
+
+In the popup:
+
+| Key | Action |
+|---|---|
+| `Up` / `Down` | Move the selection; the full text is previewed below the list |
+| `Enter`, `Ctrl+C`, double-click | Copy the selected entry back to the clipboard and close |
+| `Delete` | Remove the selected entry |
+| `Ctrl+Delete` | Clear the whole history |
+| `Esc` | Close without copying |
+
+The popup also closes when it loses focus. Entries are stored as plain text in `%LOCALAPPDATA%\DoRun\clipboard-history.txt`; copying the selected entry returns focus to the window you came from, so `Ctrl+V` pastes it right away. Only text formats are captured — images and files are not part of the history. `/clipboard` opens the same popup from the launcher.
 
 ### Forcing a console window
 
@@ -151,6 +178,10 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `HOTKEY_VK`
 - `HOTKEY_DEBUG_LOG`
 - `COPY_COMMAND_HOTKEY`
+- `CLIPBOARD_HISTORY_ENABLED`
+- `CLIPBOARD_HOTKEY`
+- `CLIPBOARD_HISTORY_MAX_ROWS`
+- `CLIPBOARD_VISIBLE_ITEM_COUNT`
 - `HISTORY_ENABLED`
 - `HISTORY_DB_PATH`
 - `HISTORY_RANK_SUM_LIMIT`
