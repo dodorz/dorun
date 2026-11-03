@@ -16,6 +16,7 @@ Main capabilities:
 - Indexed app search from configured directories.
 - Custom commands from `Command.conf`.
 - Built-in slash commands such as `/reload`, `/kill`, `/config`, and `/cmdconfig`.
+- Optional launcher-scoped hotkey to copy the selected command line to the clipboard.
 - Managed hotkeys that launch specific commands directly.
 - `STARTUP` tasks that run when DoRun starts in startup mode.
 - Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
@@ -41,6 +42,18 @@ Type these in the launcher search box and press Enter:
 | `/standby` | Sleep |
 | `/config` | Open `DoRun.yaml` with `EDITOR` |
 | `/cmdconfig` | Open `Command.conf` with `EDITOR` |
+
+### Copying a command line
+
+While the launcher is open, a configurable hotkey copies the command line of the currently selected result to the clipboard (runtime variables such as `${CMD}` and `${CWD}` are expanded, and alias arguments typed after the alias name in the search box are kept). The status line briefly shows what was copied.
+
+```yaml
+# AutoHotkey-like syntax: ^ = Ctrl, ! = Alt, + = Shift, @ = Win.
+# Defaults to `^+c` when unset. Set to '' / 0 / none to disable.
+COPY_COMMAND_HOTKEY: '^+c'
+```
+
+The hotkey is handled only while the launcher window is focused, so it does not take a system-wide shortcut away from other applications.
 
 ### Forcing a console window
 
@@ -137,6 +150,7 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `HOTKEY_MODIFIERS`
 - `HOTKEY_VK`
 - `HOTKEY_DEBUG_LOG`
+- `COPY_COMMAND_HOTKEY`
 - `HISTORY_ENABLED`
 - `HISTORY_DB_PATH`
 - `HISTORY_RANK_SUM_LIMIT`
