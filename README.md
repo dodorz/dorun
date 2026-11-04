@@ -130,6 +130,8 @@ ALIASES:
 
 When `ALIASES` is configured, DoRun invokes `aliasc` to compile the source for PowerShell, CMD, and POSIX shells. It imports the names reported by `aliasc list --shell powershell` into the launcher; selecting one runs the corresponding generated PowerShell function. The compiler also includes the adjacent `alias.local`, plus a `ShortcutMap.yaml` resolved by aliasc itself: `%USERPROFILE%\.config\ShortcutMap.yaml` when it exists, otherwise a `ShortcutMap.yaml` beside the alias source. Pass a different file with `SHORTCUT_MAP`. Alias items launch through `powershell.exe`, so they show a console window by default; set `SHOW_WINDOW: 0` under `ALIASES` to hide it (value is a `SW_*` constant, default `1`).
 
+`ShortcutMap.yaml` is an alias source in its own right, so `FILE` and `SHORTCUT_MAP` are independent. `aliasc` expands the map even when the configured alias file is missing (it only reports `source ... does not exist` on stderr), and DoRun follows that behaviour: a stale or renamed `FILE` no longer disables the import, and `ALIASES` with only `SHORTCUT_MAP` set is valid. Keep at least one of the two configured; with neither, `ALIASES` stays inert. Changes to `FILE`, `alias.local`, `SHORTCUT_MAP`, and both autodetected `ShortcutMap.yaml` locations invalidate the import cache, so the launcher reimports automatically.
+
 The launcher preview shows each alias's definition body when the installed `aliasc` supports `list --format tsv` (the body is the same single-line form printed by `aliasc`'s `alias-search`). Set `SHOW_DEFINITION: 0` under `ALIASES` to keep the generic `aliasc PowerShell alias: <name>` text instead. Bodies are shown verbatim, so they may expose secrets or private paths on shared screens.
 
 Example:
@@ -149,6 +151,7 @@ ALIASES:
   # SHOW_DEFINITION: 0
   # Optional. Override the ShortcutMap.yaml aliasc reads (aliasc defaults to
   # %USERPROFILE%\.config\ShortcutMap.yaml, then the source's directory).
+  # FILE and SHORTCUT_MAP are independent; either one alone is enough.
   # SHORTCUT_MAP: 'C:\~\.config\ShortcutMap.yaml'
   # Or use the fallback command:
   # COMPILER: 'scoopx aliasc'

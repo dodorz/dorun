@@ -99,6 +99,8 @@ struct AliasSupportConfig {
     int showCommand = SW_SHOWNORMAL;
     bool showDefinition = true;
     std::wstring shortcutMapPath;
+    std::wstring configPath;
+    std::wstring supportDirectory;
 };
 
 struct HistoryInfo {
@@ -1133,19 +1135,59 @@ bool RunAliasCompilerToFile(
     return RunProcessAndWaitHidden(L"cmd.exe /d /c \"" + command + L"\"", workingDirectory);
 }
 
+// The directory aliasc runs in. A missing alias source still imports the
+// ShortcutMap, so fall back to the config directory and finally to the
+// executable directory instead of handing CreateProcessW an invalid cwd.
+std::wstring ResolveAliasWorkingDirectory() {
+    std::error_code error;
+    if (!g_state.aliasSupport.sourcePath.empty()) {
+        const std::filesystem::path sourceDirectory =
+            std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path();
+        if (!sourceDirectory.empty() && std::filesystem::is_directory(sourceDirectory, error) && !error) {
+            return sourceDirectory.wstring();
+        }
+    }
+    error.clear();
+    if (!g_state.aliasSupport.configPath.empty()) {
+        const std::filesystem::path configDirectory =
+            std::filesystem::path(g_state.aliasSupport.configPath).parent_path();
+        if (!configDirectory.empty() && std::filesystem::is_directory(configDirectory, error) && !error) {
+            return configDirectory.wstring();
+        }
+    }
+    return GetModuleDirectory();
+}
+
+// A ShortcutMap-only setup still needs a valid --source argument, so point
+// aliasc at an empty file when the alias source is missing. It emits a
+// "source does not exist" warning but keeps expanding the map.
+std::wstring ResolveAliasSourceArgument() {
+    if (!g_state.aliasSupport.sourcePath.empty()) {
+        return g_state.aliasSupport.sourcePath;
+    }
+    const std::wstring emptySourcePath =
+        (std::filesystem::path(g_state.aliasSupport.supportDirectory) / L"aliasc-empty-source").wstring();
+    std::error_code error;
+    if (!std::filesystem::exists(emptySourcePath, error) || error) {
+        SaveUtf8TextFile(emptySourcePath, L"");
+    }
+    return emptySourcePath;
+}
+
 bool CompileAliasArtifacts() {
-    if (!g_state.aliasSupport.compilerReady || g_state.aliasSupport.sourcePath.empty()) {
+    if (!g_state.aliasSupport.compilerReady ||
+        (g_state.aliasSupport.sourcePath.empty() && g_state.aliasSupport.shortcutMapPath.empty())) {
         return false;
     }
 
-    const std::wstring workingDirectory = std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
+    const std::wstring workingDirectory = ResolveAliasWorkingDirectory();
     const std::wstring shortcutMapPath = g_state.aliasSupport.shortcutMapPath;
     const bool powershellCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         BuildAliasCompilerArguments(
             L"compile",
             L"powershell",
-            g_state.aliasSupport.sourcePath,
+            ResolveAliasSourceArgument(),
             g_state.aliasSupport.powershellOutputPath,
             L"windows",
             shortcutMapPath),
@@ -1155,7 +1197,7 @@ bool CompileAliasArtifacts() {
         BuildAliasCompilerArguments(
             L"compile",
             L"cmd",
-            g_state.aliasSupport.sourcePath,
+            ResolveAliasSourceArgument(),
             g_state.aliasSupport.cmdOutputPath,
             L"windows",
             shortcutMapPath),
@@ -1165,7 +1207,7 @@ bool CompileAliasArtifacts() {
         BuildAliasCompilerArguments(
             L"compile",
             L"posix",
-            g_state.aliasSupport.sourcePath,
+            ResolveAliasSourceArgument(),
             g_state.aliasSupport.posixOutputPath,
             L"auto",
             shortcutMapPath),
@@ -1266,18 +1308,29 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         return L"";
     };
 
+    g_state.aliasSupport.configPath = configPath;
+
     const std::wstring sourcePath = ResolveConfiguredPath(
         getAliasSetting(L"FILE", L"ALIAS_FILE"),
         configPath);
-    if (sourcePath.empty()) {
-        return;
-    }
 
+    // aliasc expands ShortcutMap on its own, so it is an independent alias source.
     std::error_code error;
-    if (!std::filesystem::exists(sourcePath, error) || error) {
+    const std::wstring configuredShortcutMap = getAliasSetting(L"SHORTCUT_MAP", L"ALIAS_SHORTCUT_MAP");
+    if (!configuredShortcutMap.empty()) {
+        const std::wstring trimmedShortcutMap = Trim(configuredShortcutMap);
+        if (!trimmedShortcutMap.empty()) {
+            g_state.aliasSupport.shortcutMapPath = ResolveConfiguredPath(trimmedShortcutMap, configPath);
+        }
+    }
+
+    if (sourcePath.empty() && g_state.aliasSupport.shortcutMapPath.empty()) {
         return;
     }
 
+    // A stale ALIASES.FILE must not disable the ShortcutMap import: aliasc reports
+    // a missing source but still expands the map, so keep the path as configured
+    // and let the compiler decide.
     g_state.aliasSupport.sourcePath = sourcePath;
     const std::wstring configuredCompiler = ExpandEnvironmentVariables(ExpandCommandVariables(
         getAliasSetting(L"COMPILER", L"ALIASC_BIN")));
@@ -1300,14 +1353,6 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
         }
     }
 
-    const std::wstring configuredShortcutMap = getAliasSetting(L"SHORTCUT_MAP", L"ALIAS_SHORTCUT_MAP");
-    if (!configuredShortcutMap.empty()) {
-        const std::wstring trimmedShortcutMap = Trim(configuredShortcutMap);
-        if (!trimmedShortcutMap.empty()) {
-            g_state.aliasSupport.shortcutMapPath = ResolveConfiguredPath(trimmedShortcutMap, configPath);
-        }
-    }
-
     const std::wstring showWindowSetting = getAliasSetting(L"SHOW_WINDOW", L"ALIAS_SHOW_WINDOW");
     if (!showWindowSetting.empty()) {
         g_state.aliasSupport.showCommand = _wtoi(Trim(showWindowSetting).c_str());
@@ -1324,6 +1369,8 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
     if (error) {
         return;
     }
+
+    g_state.aliasSupport.supportDirectory = supportDirectory.wstring();
 
     g_state.aliasSupport.cmdOutputPath = (supportDirectory / L"aliasc-cmd.mac").wstring();
     g_state.aliasSupport.cmdBootstrapPath = (supportDirectory / L"aliasc-cmd-bootstrap.cmd").wstring();
@@ -1396,12 +1443,15 @@ std::wstring BuildItemKey(ItemSourceKind sourceKind, std::wstring_view commandLi
 }
 
 std::wstring BuildAliasImportDependencySignature() {
-    if (g_state.aliasSupport.sourcePath.empty() || g_state.aliasSupport.compilerCommand.empty()) {
+    if ((g_state.aliasSupport.sourcePath.empty() && g_state.aliasSupport.shortcutMapPath.empty()) ||
+        g_state.aliasSupport.compilerCommand.empty()) {
         return L"";
     }
 
     std::vector<std::wstring> dependencyPaths;
-    dependencyPaths.push_back(g_state.aliasSupport.sourcePath);
+    if (!g_state.aliasSupport.sourcePath.empty()) {
+        dependencyPaths.push_back(g_state.aliasSupport.sourcePath);
+    }
     if (!g_state.aliasSupport.compilerPath.empty()) {
         dependencyPaths.push_back(g_state.aliasSupport.compilerPath);
     }
@@ -4873,16 +4923,15 @@ std::wstring BuildAliasPreviewText(std::wstring_view body) {
 }
 
 void LoadAliasCommandItems(bool appendToResultItems) {
-    if (g_state.aliasSupport.sourcePath.empty() ||
+    if ((g_state.aliasSupport.sourcePath.empty() && g_state.aliasSupport.shortcutMapPath.empty()) ||
         g_state.aliasSupport.compilerCommand.empty() ||
         !g_state.aliasSupport.compilerReady) {
         return;
     }
 
+    // A missing alias file is not fatal: aliasc still expands ShortcutMap, which
+    // the dependency signature and the compiler arguments both track.
     std::error_code error;
-    if (!std::filesystem::exists(g_state.aliasSupport.sourcePath, error) || error) {
-        return;
-    }
 
     const std::wstring dependencySignature = BuildAliasImportDependencySignature();
     if (g_state.aliasImportCache.valid &&
@@ -4907,12 +4956,11 @@ void LoadAliasCommandItems(bool appendToResultItems) {
     const std::wstring plainListArguments = BuildAliasCompilerArguments(
         L"list",
         L"powershell",
-        g_state.aliasSupport.sourcePath,
+        ResolveAliasSourceArgument(),
         {},
         L"windows",
         g_state.aliasSupport.shortcutMapPath);
-    const std::wstring workingDirectory =
-        std::filesystem::path(g_state.aliasSupport.sourcePath).parent_path().wstring();
+    const std::wstring workingDirectory = ResolveAliasWorkingDirectory();
     // Ask for the richer output that carries each definition body. Older aliasc
     // builds do not understand --format, so fall back to the name-only list.
     bool listed = false;

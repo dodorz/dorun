@@ -78,6 +78,8 @@ ALIASES:
   # Optional. ShortcutMap.yaml for aliasc. When unset, aliasc reads
   # %USERPROFILE%\.config\ShortcutMap.yaml, falling back to a
   # ShortcutMap.yaml beside the alias source.
+  # FILE and SHORTCUT_MAP are independent sources; the map still imports
+  # when FILE is missing, and SHORTCUT_MAP may be used on its own.
   #SHORTCUT_MAP: 'C:\~\.config\ShortcutMap.yaml'
 
 HISTORY_ENABLED: 1
