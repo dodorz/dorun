@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <locale>
 #include <optional>
@@ -238,15 +239,32 @@ struct AppState {
     HWND clipboardHint = nullptr;
     WNDPROC clipboardListProc = nullptr;
     HFONT clipboardFont = nullptr;
+    HFONT clipboardSelectedFont = nullptr;
     HFONT clipboardPreviewFont = nullptr;
     HBRUSH clipboardBackgroundBrush = nullptr;
     std::vector<ClipboardEntry> clipboardEntries;
     HWND clipboardReturnWindow = nullptr;
     DWORD lastClipboardSequenceNumber = 0;
     HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    HotkeyBackend clipboardUpHotkeyBackend = HotkeyBackend::RegisterHotKey;
     bool clipboardHotkeyArmed = false;
+    bool clipboardUpHotkeyArmed = false;
     bool clipboardWindowActivated = false;
     int clipboardVisibilityTicks = 0;
+    // Selection cycling: the popup was opened by the clipboard hotkey, so
+    // repeated presses walk the list and the end of the sequence pastes.
+    bool clipboardCycleActive = false;
+    // Rejects the auto-repeat key-downs of a held hotkey key.
+    bool clipboardCycleKeyHeld = false;
+    ULONGLONG clipboardCycleLastPressTick = 0;
+    // Focus bookkeeping for closing the popup when the user clicks elsewhere.
+    ULONGLONG clipboardShownTick = 0;
+    int clipboardLostFocusTicks = 0;
+    // The Shift+hotkey variant is only registered when the base hotkey does
+    // not already include Shift.
+    bool clipboardUpHotkeyRegistered = false;
+    // Window that receives the injected Ctrl+V after the popup closes.
+    HWND clipboardPasteTarget = nullptr;
     // Transient status text shown in the description line after a copy.
     std::wstring copyFeedbackText;
     HotkeyBackend launcherHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -320,9 +338,25 @@ constexpr UINT_PTR kCopyFeedbackTimerId = 6;
 constexpr UINT kCopyFeedbackDurationMs = 1500;
 constexpr UINT_PTR kClipboardPollTimerId = 7;
 constexpr UINT_PTR kClipboardVisibilityTimerId = 8;
-constexpr UINT kClipboardVisibilityTimerIntervalMs = 200;
-// ~1s grace for the popup to become the foreground window.
-constexpr int kClipboardVisibilityGiveUpTicks = 5;
+// Polls the hotkey state to detect the end of a selection-cycling sequence.
+constexpr UINT_PTR kClipboardCycleTimerId = 9;
+// Delays the injected Ctrl+V slightly so focus has settled in the target app.
+constexpr UINT_PTR kClipboardPasteTimerId = 10;
+constexpr UINT kClipboardVisibilityTimerIntervalMs = 100;
+// ~1.5s of retries for the popup to become the foreground window.
+constexpr int kClipboardVisibilityGiveUpTicks = 15;
+// Focus loss right after showing is usually the hotkey modifier bouncing in
+// and out of menu mode, so it is ignored for this long.
+constexpr ULONGLONG kClipboardFocusGraceMs = 400;
+// Consecutive focus-loss checks before the popup closes (~600ms).
+constexpr int kClipboardLostFocusTicks = 6;
+// Fast enough to see a short key tap, so the next press is not mistaken for
+// auto-repeat and a quick tap is never dropped.
+constexpr UINT kClipboardCycleTimerIntervalMs = 15;
+// A hotkey without modifiers (e.g. an F-key) has no modifier release that ends
+// the sequence, so a short idle gap between presses ends it instead.
+constexpr ULONGLONG kClipboardCycleIdleMs = 700;
+constexpr UINT kClipboardPasteDelayMs = 120;
 constexpr UINT kClipboardPollIntervalMs = 400;
 constexpr size_t kClipboardPreviewLength = 240;
 constexpr size_t kClipboardPreviewPopupLimit = 1200;
@@ -389,13 +423,29 @@ void StopClipboardPolling();
 void PollClipboardForChanges();
 void ShowClipboardHistory();
 void HideClipboardHistory();
-void ToggleClipboardHistory();
 void LayoutClipboardWindow();
 void ReloadClipboardHistory();
 void UpdateClipboardPreview();
+void SelectFirstClipboardEntry();
 void CopySelectedClipboardEntry();
 void DeleteSelectedClipboardEntry();
 void ClearClipboardHistory();
+void HandleClipboardHotkeyPress(bool moveUp);
+void StartClipboardCycleSequence();
+void PollClipboardCycleSequence();
+void EndClipboardCycleSequence();
+void CancelClipboardCycleSequence();
+void PasteSelectedClipboardEntry();
+void InjectPasteKeystroke();
+void InjectPasteIntoClipboardTarget();
+void DrawClipboardListItem(const DRAWITEMSTRUCT& draw);
+int ClipboardListItemHeight();
+int ClipboardHintLineCount();
+std::wstring BuildClipboardHintText();
+HotkeyConfig MakeClipboardUpHotkey();
+bool ClipboardUpHotkeyAvailable();
+bool AreHotkeyRequiredModifiersHeld(UINT modifiers);
+COLORREF BlendColor(COLORREF base, COLORREF overlay, int overlayWeightPercent);
 bool IsClipboardWindow(HWND window);
 bool CopyTextToClipboard(std::wstring_view text);
 void AddClipboardEntry(std::wstring text);
@@ -1809,7 +1859,7 @@ int ComputeRecencyBonus(const std::wstring& lastRunUtc, ULONGLONG nowTicks) {
     return 0;
 }
 
-HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSize) {
+HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSize, bool bold = false) {
     NONCLIENTMETRICSW metrics {};
     metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, static_cast<UINT>(dpi)) == FALSE) {
@@ -1826,6 +1876,9 @@ HFONT CreateConfiguredUiFont(int dpi, std::wstring_view fontFamily, int pointSiz
             ReleaseDC(nullptr, screenDc);
         }
         metrics.lfMessageFont.lfHeight = -MulDiv(pointSize, logPixelsY, 72);
+    }
+    if (bold) {
+        metrics.lfMessageFont.lfWeight = FW_SEMIBOLD;
     }
 
     return CreateFontIndirectW(&metrics.lfMessageFont);
@@ -2137,12 +2190,22 @@ void LoadCopyCommandHotkeyConfig() {
 // uses the same syntax as Command.conf hotkeys and defaults to Ctrl+Backtick.
 constexpr wchar_t kDefaultClipboardHotkey[] = L"^BACKTICK";
 
+// A disabled hotkey is represented by vk == 0; the modifiers are cleared too so
+// nothing (e.g. the "does this use Shift/Win" checks) can see a stale chord.
+void DisableClipboardHotkey() {
+    g_state.clipboardConfig.hotkey = HotkeyConfig {};
+    g_state.clipboardConfig.hotkey.modifiers = 0;
+    g_state.clipboardConfig.hotkey.vk = 0;
+}
+
 void LoadClipboardConfig() {
     g_state.clipboardConfig = ClipboardConfig {};
 
     HotkeyConfig defaultHotkey {};
     if (ParseManagedHotkeySpec(kDefaultClipboardHotkey, &defaultHotkey)) {
         g_state.clipboardConfig.hotkey = defaultHotkey;
+    } else {
+        DisableClipboardHotkey();
     }
 
     const std::wstring configPath = FindConfigPath(kConfigFileName);
@@ -2173,14 +2236,14 @@ void LoadClipboardConfig() {
         lowercaseSpec == L"none" ||
         lowercaseSpec == L"off" ||
         lowercaseSpec == L"disabled") {
-        g_state.clipboardConfig.hotkey = HotkeyConfig {};
+        DisableClipboardHotkey();
         return;
     }
 
     HotkeyConfig parsed {};
     if (!ParseManagedHotkeySpec(trimmedSpec, &parsed)) {
         AppendHotkeyDebugLog(L"Ignoring invalid CLIPBOARD_HOTKEY: " + trimmedSpec);
-        g_state.clipboardConfig.hotkey = HotkeyConfig {};
+        DisableClipboardHotkey();
         return;
     }
     g_state.clipboardConfig.hotkey = parsed;
@@ -2322,6 +2385,25 @@ bool AreHotkeyModifiersPressed(UINT modifiers) {
     return AreHotkeyModifiersPressed(modifiers, IsWindowsKeyDown());
 }
 
+// Unlike AreHotkeyModifiersPressed this ignores extra modifiers. The clipboard
+// popup needs that: the hotkey modifier has to stay down, and pressing Shift on
+// top of it (move selection up) must not look like a release.
+bool AreHotkeyRequiredModifiersHeld(UINT modifiers) {
+    if ((modifiers & MOD_CONTROL) != 0U && !IsModifierDown(VK_CONTROL, VK_LCONTROL, VK_RCONTROL)) {
+        return false;
+    }
+    if ((modifiers & MOD_ALT) != 0U && !IsModifierDown(VK_MENU, VK_LMENU, VK_RMENU)) {
+        return false;
+    }
+    if ((modifiers & MOD_SHIFT) != 0U && !IsModifierDown(VK_SHIFT, VK_LSHIFT, VK_RSHIFT)) {
+        return false;
+    }
+    if ((modifiers & MOD_WIN) != 0U && !IsWindowsKeyDown()) {
+        return false;
+    }
+    return true;
+}
+
 bool IsKeyboardModifierKey(DWORD vkCode) {
     return vkCode == VK_LCONTROL || vkCode == VK_RCONTROL ||
         vkCode == VK_LMENU || vkCode == VK_RMENU ||
@@ -2360,6 +2442,7 @@ bool AnyHotkeysUseKeyboardHook() {
     // Win+key hotkeys, otherwise releasing Win can open the Start menu.
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook ||
         g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook ||
+        g_state.clipboardUpHotkeyBackend == HotkeyBackend::KeyboardHook ||
         AnyHotkeysUseWindowsKey()) {
         return true;
     }
@@ -2430,6 +2513,7 @@ void UninstallKeyboardHook() {
     }
     g_state.launcherHotkeyArmed = false;
     g_state.clipboardHotkeyArmed = false;
+    g_state.clipboardUpHotkeyArmed = false;
     g_state.suppressHookWinKeyUp = false;
     g_state.pendingHookWinKey = 0;
     for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
@@ -2441,7 +2525,9 @@ void AddKeyboardHookRegistrationFailures(DWORD errorCode) {
     if (g_state.launcherHotkeyBackend == HotkeyBackend::KeyboardHook) {
         AddHotkeyRegistrationFailure(L"Launcher hotkey", FormatHotkeyConfig(g_state.hotkey), errorCode);
     }
-    if (g_state.clipboardConfig.enabled && g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook) {
+    if (g_state.clipboardConfig.enabled &&
+        (g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook ||
+         g_state.clipboardUpHotkeyBackend == HotkeyBackend::KeyboardHook)) {
         AddHotkeyRegistrationFailure(L"Clipboard hotkey", FormatHotkeyConfig(g_state.clipboardConfig.hotkey), errorCode);
     }
     for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
@@ -2517,6 +2603,11 @@ bool HandleHookHotkeyKeyRelease(DWORD vkCode) {
         vkCode == g_state.clipboardConfig.hotkey.vk) {
         g_state.clipboardHotkeyArmed = false;
     }
+    if (g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        g_state.clipboardUpHotkeyArmed &&
+        vkCode == g_state.clipboardConfig.hotkey.vk) {
+        g_state.clipboardUpHotkeyArmed = false;
+    }
 
     for (ManagedHotkey& hotkey : g_state.managedHotkeys) {
         if (hotkey.backend == HotkeyBackend::KeyboardHook &&
@@ -2578,6 +2669,21 @@ bool HandleHookHotkeyKeyDown(DWORD vkCode, bool winDown) {
             g_state.clipboardHotkeyArmed = true;
             AppendHotkeyDebugLog(L"Keyboard hook matched clipboard hotkey: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
             PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_CLIPBOARD, 0);
+        }
+        if ((g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
+            g_state.suppressHookWinKeyUp = true;
+        }
+    } else if (g_state.clipboardHotkeyBackend == HotkeyBackend::KeyboardHook &&
+        g_state.clipboardUpHotkeyRegistered &&
+        g_state.clipboardConfig.enabled &&
+        vkCode == g_state.clipboardConfig.hotkey.vk &&
+        AreHotkeyModifiersPressed(MakeClipboardUpHotkey().modifiers, winDown)) {
+        // Same key with Shift on top walks the selection upwards.
+        suppress = true;
+        if (!g_state.clipboardUpHotkeyArmed) {
+            g_state.clipboardUpHotkeyArmed = true;
+            AppendHotkeyDebugLog(L"Keyboard hook matched clipboard hotkey (Shift): " + FormatHotkeyConfig(MakeClipboardUpHotkey()));
+            PostMessageW(g_state.hostWindow, WM_HOTKEY, ID_HOTKEY_CLIPBOARD_UP, 0);
         }
         if ((g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
             g_state.suppressHookWinKeyUp = true;
@@ -3093,6 +3199,58 @@ bool ParseManagedHotkeySpec(std::wstring_view text, HotkeyConfig* hotkey) {
     hotkey->modifiers = modifiers;
     hotkey->vk = *vk;
     return true;
+}
+
+std::wstring FormatHotkeyVirtualKey(UINT vk);
+
+// Key name for UI text: printable OEM keys become their character, everything
+// else uses the same names as the configuration format.
+std::wstring FormatHotkeyKeyForDisplay(UINT vk) {
+    switch (vk) {
+    case VK_OEM_3:
+        return L"`";
+    case VK_OEM_MINUS:
+        return L"-";
+    case VK_OEM_PLUS:
+        return L"=";
+    case VK_OEM_COMMA:
+        return L",";
+    case VK_OEM_PERIOD:
+        return L".";
+    case VK_OEM_2:
+        return L"/";
+    case VK_OEM_1:
+        return L";";
+    case VK_OEM_7:
+        return L"'";
+    case VK_OEM_4:
+        return L"[";
+    case VK_OEM_6:
+        return L"]";
+    case VK_OEM_5:
+        return L"\\";
+    default:
+        return FormatHotkeyVirtualKey(vk);
+    }
+}
+
+// User-facing hotkey text, e.g. "Ctrl+`" instead of the config syntax "^BACKTICK".
+std::wstring FormatHotkeyForDisplay(const HotkeyConfig& hotkey) {
+    std::wstring text;
+    if ((hotkey.modifiers & MOD_CONTROL) != 0U) {
+        text += L"Ctrl+";
+    }
+    if ((hotkey.modifiers & MOD_ALT) != 0U) {
+        text += L"Alt+";
+    }
+    if ((hotkey.modifiers & MOD_SHIFT) != 0U) {
+        text += L"Shift+";
+    }
+    if ((hotkey.modifiers & MOD_WIN) != 0U) {
+        text += L"Win+";
+    }
+    text += FormatHotkeyKeyForDisplay(hotkey.vk);
+    return text;
 }
 
 std::wstring FormatHotkeyVirtualKey(UINT vk) {
@@ -3714,18 +3872,68 @@ void MoveClipboardSelection(int delta) {
         return;
     }
 
-    LRESULT selected = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
+    const LRESULT previousSelection = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
+    LRESULT selected = previousSelection;
     if (selected == LB_ERR) {
+        // Nothing selected yet: land on the first entry regardless of direction.
         selected = 0;
-    }
-    selected += delta;
-    if (selected < 0) {
-        selected = 0;
-    }
-    if (selected >= count) {
-        selected = count - 1;
+    } else {
+        selected += delta;
+        if (selected < 0) {
+            selected = 0;
+        }
+        if (selected >= count) {
+            selected = count - 1;
+        }
     }
     SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+
+    // Keep the selection visible while the hotkey walks through the list. An
+    // owner-drawn listbox does not scroll itself when LB_SETCURSEL is used.
+    RECT listRect {};
+    GetClientRect(g_state.clipboardList, &listRect);
+    const LRESULT measuredItemHeight = SendMessageW(g_state.clipboardList, LB_GETITEMHEIGHT, 0, 0);
+    const int itemHeight = measuredItemHeight > 0 ? static_cast<int>(measuredItemHeight) : std::max(1, ClipboardListItemHeight());
+    const LRESULT pageSize = std::max<LRESULT>(1, (listRect.bottom - listRect.top) / itemHeight);
+    const LRESULT topIndex = SendMessageW(g_state.clipboardList, LB_GETTOPINDEX, 0, 0);
+    if (selected < topIndex) {
+        SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(selected), 0);
+    } else if (selected >= topIndex + pageSize) {
+        SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(std::max<LRESULT>(0, selected - pageSize + 1)), 0);
+    }
+
+    // Only the two affected rows need repainting; rows are fully painted by
+    // DrawClipboardListItem, so no background erase is needed.
+    const auto invalidateRow = [](LRESULT row) {
+        if (row < 0) {
+            return;
+        }
+        RECT rowRect {};
+        const LRESULT firstVisible = SendMessageW(g_state.clipboardList, LB_GETTOPINDEX, 0, 0);
+        if (row < firstVisible) {
+            return;
+        }
+        if (SendMessageW(g_state.clipboardList, LB_GETITEMRECT, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&rowRect)) != LB_ERR) {
+            InvalidateRect(g_state.clipboardList, &rowRect, FALSE);
+        }
+    };
+    if (previousSelection != LB_ERR) {
+        invalidateRow(previousSelection);
+    }
+    invalidateRow(selected);
+    UpdateClipboardPreview();
+}
+
+void SelectFirstClipboardEntry() {
+    if (g_state.clipboardList == nullptr) {
+        return;
+    }
+    if (SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0) <= 0) {
+        return;
+    }
+    SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+    SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, 0, 0);
+    InvalidateRect(g_state.clipboardList, nullptr, FALSE);
     UpdateClipboardPreview();
 }
 
@@ -3803,6 +4011,10 @@ void ApplyClipboardFonts() {
         DeleteObject(g_state.clipboardFont);
         g_state.clipboardFont = nullptr;
     }
+    if (g_state.clipboardSelectedFont != nullptr) {
+        DeleteObject(g_state.clipboardSelectedFont);
+        g_state.clipboardSelectedFont = nullptr;
+    }
     if (g_state.clipboardPreviewFont != nullptr) {
         DeleteObject(g_state.clipboardPreviewFont);
         g_state.clipboardPreviewFont = nullptr;
@@ -3812,6 +4024,13 @@ void ApplyClipboardFonts() {
         g_state.dpi,
         g_state.launcherAppearance.resultFontFamily,
         g_state.launcherAppearance.resultFontPointSize);
+    // Semi-bold variant for the selected row; the list is owner-drawn, so the
+    // control font itself is only used for measuring.
+    g_state.clipboardSelectedFont = CreateConfiguredUiFont(
+        g_state.dpi,
+        g_state.launcherAppearance.resultFontFamily,
+        g_state.launcherAppearance.resultFontPointSize,
+        true);
     const int previewPointSize = g_state.launcherAppearance.resultFontPointSize > 0
         ? std::max(6, g_state.launcherAppearance.resultFontPointSize - 2)
         : 9;
@@ -3823,20 +4042,30 @@ void ApplyClipboardFonts() {
     ApplyFont(g_state.clipboardList, g_state.clipboardFont);
     ApplyFont(g_state.clipboardPreview, g_state.clipboardPreviewFont);
     ApplyFont(g_state.clipboardHint, g_state.clipboardPreviewFont);
+    if (g_state.clipboardHint != nullptr) {
+        // Depends on the configured hotkey, so it is rebuilt with the fonts.
+        SetWindowTextW(g_state.clipboardHint, BuildClipboardHintText().c_str());
+    }
+
+    // Fixed-height owner-draw list: one height applies to every row, but it has
+    // to be pushed again after a font/DPI change.
+    if (g_state.clipboardList != nullptr) {
+        SendMessageW(g_state.clipboardList, LB_SETITEMHEIGHT, 0, static_cast<LPARAM>(ClipboardListItemHeight()));
+    }
 }
 
 // SetForegroundWindow can be refused because of the foreground lock; attaching
-// to the current foreground thread first makes the launcher popups reliable.
-void ForceForegroundWindow(HWND window) {
+// to the current foreground thread first lifts that restriction. Callers retry
+// on a timer, because detaching again may hand the foreground back.
+bool ForceForegroundWindow(HWND window) {
     if (window == nullptr) {
-        return;
+        return false;
+    }
+    if (GetForegroundWindow() == window) {
+        return true;
     }
 
     const HWND foreground = GetForegroundWindow();
-    if (foreground == window) {
-        return;
-    }
-
     const DWORD foregroundThread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
     const DWORD currentThread = GetCurrentThreadId();
     const bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
@@ -3844,9 +4073,136 @@ void ForceForegroundWindow(HWND window) {
 
     BringWindowToTop(window);
     SetForegroundWindow(window);
+    SetActiveWindow(window);
 
     if (attached) {
         AttachThreadInput(currentThread, foregroundThread, FALSE);
+    }
+    return GetForegroundWindow() == window;
+}
+
+// Blends overlay into base, overlayWeightPercent percent of the way (0..100).
+COLORREF BlendColor(COLORREF base, COLORREF overlay, int overlayWeightPercent) {
+    const int weight = std::clamp(overlayWeightPercent, 0, 100);
+    const auto mix = [weight](int from, int to) {
+        return static_cast<int>((from * (100 - weight) + to * weight) / 100);
+    };
+    return RGB(
+        mix(GetRValue(base), GetRValue(overlay)),
+        mix(GetGValue(base), GetGValue(overlay)),
+        mix(GetBValue(base), GetBValue(overlay)));
+}
+
+// Number of lines BuildClipboardHintText() produces.
+int ClipboardHintLineCount() {
+    return g_state.clipboardConfig.hotkey.vk == 0U ? 1 : 2;
+}
+
+// Help text under the list. The first line documents the hotkey cycling when a
+// clipboard hotkey is configured.
+std::wstring BuildClipboardHintText() {
+    const std::wstring actions = L"Enter / Ctrl+C copy    Del remove    Ctrl+Del clear all    Esc close";
+    if (g_state.clipboardConfig.hotkey.vk == 0U) {
+        return actions;
+    }
+
+    std::wstring cycling = L"Tap " + FormatHotkeyForDisplay(g_state.clipboardConfig.hotkey) + L" again to step down";
+    if (ClipboardUpHotkeyAvailable()) {
+        cycling += L", " + FormatHotkeyForDisplay(MakeClipboardUpHotkey()) + L" to step up";
+    }
+    cycling += L"; release/pause to paste";
+    return cycling + L"\r\n" + actions;
+}
+
+// Owner-drawn rows: fixed height across the whole list.
+int ClipboardListItemHeight() {
+    const int textHeight = MeasureFontTextHeight(g_state.clipboardFont);
+    return std::max(Scale(34), textHeight + Scale(16));
+}
+
+// Draws one history row: a separator line between entries, a filled highlight
+// with a left accent bar for the selected row.
+void DrawClipboardListItem(const DRAWITEMSTRUCT& draw) {
+    if (draw.hDC == nullptr) {
+        return;
+    }
+
+    // itemID is (UINT)-1 when the listbox draws an empty-area focus indicator
+    // instead of an entry.
+    const bool hasEntry =
+        draw.itemID != static_cast<UINT>(-1) &&
+        static_cast<size_t>(draw.itemData) < g_state.clipboardEntries.size();
+    const size_t itemIndex = hasEntry ? static_cast<size_t>(draw.itemData) : size_t {0};
+    const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+    const COLORREF background = g_state.launcherAppearance.backgroundColor;
+    const COLORREF textColor = selected ? RGB(255, 255, 255) : g_state.launcherAppearance.textColor;
+    const COLORREF selectedBackground = g_state.launcherAppearance.accentColor;
+
+    RECT row = draw.rcItem;
+    const HBRUSH backgroundBrush = CreateSolidBrush(
+        selected ? selectedBackground : BlendColor(background, g_state.launcherAppearance.searchBackgroundColor, 55));
+    if (backgroundBrush != nullptr) {
+        FillRect(draw.hDC, &row, backgroundBrush);
+        DeleteObject(backgroundBrush);
+    }
+
+    if (selected) {
+        // Left accent bar makes the selected row unmistakable.
+        RECT accentBar = row;
+        accentBar.right = accentBar.left + Scale(4);
+        const HBRUSH accentBrush = CreateSolidBrush(BlendColor(selectedBackground, RGB(255, 255, 255), 35));
+        if (accentBrush != nullptr) {
+            FillRect(draw.hDC, &accentBar, accentBrush);
+            DeleteObject(accentBrush);
+        }
+    } else if (hasEntry && itemIndex + 1 < g_state.clipboardEntries.size()) {
+        // Separator between entries (but not under the last one).
+        const HPEN separatorPen = CreatePen(PS_SOLID, 1, g_state.launcherAppearance.borderColor);
+        if (separatorPen != nullptr) {
+            const HGDIOBJ oldPen = SelectObject(draw.hDC, separatorPen);
+            MoveToEx(draw.hDC, row.left, row.bottom - 1, nullptr);
+            LineTo(draw.hDC, row.right, row.bottom - 1);
+            SelectObject(draw.hDC, oldPen);
+            DeleteObject(separatorPen);
+        }
+    }
+
+    // No ODS_FOCUS rectangle: the filled highlight, the accent bar and the
+    // bold font already make the selected row unmistakable.
+
+    if (!hasEntry) {
+        return;
+    }
+
+    HFONT font = selected ? g_state.clipboardSelectedFont : g_state.clipboardFont;
+    if (font == nullptr) {
+        font = g_state.clipboardFont;
+    }
+    const HGDIOBJ oldFont = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
+    const int oldBkMode = SetBkMode(draw.hDC, TRANSPARENT);
+    const COLORREF oldTextColor = SetTextColor(draw.hDC, textColor);
+
+    RECT textRect = row;
+    textRect.left += Scale(14);
+    // Leave room for the rank marker drawn on the right of the selected row.
+    textRect.right -= selected ? Scale(60) : Scale(12);
+    const std::wstring label = BuildClipboardPreviewText(g_state.clipboardEntries[itemIndex].text);
+    DrawTextW(draw.hDC, label.c_str(), static_cast<int>(label.size()), &textRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    if (selected) {
+        // Rank hint on the right edge, so the order is obvious while cycling.
+        const std::wstring rank = L"#" + std::to_wstring(itemIndex + 1);
+        RECT rankRect = row;
+        rankRect.left = rankRect.right - Scale(56);
+        rankRect.right -= Scale(10);
+        SetTextColor(draw.hDC, BlendColor(selectedBackground, RGB(255, 255, 255), 70));
+        DrawTextW(draw.hDC, rank.c_str(), static_cast<int>(rank.size()), &rankRect, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    }
+
+    SetTextColor(draw.hDC, oldTextColor);
+    SetBkMode(draw.hDC, oldBkMode);
+    if (oldFont != nullptr) {
+        SelectObject(draw.hDC, oldFont);
     }
 }
 
@@ -3882,7 +4238,9 @@ void LayoutClipboardWindow() {
 
     const int width = Scale(760);
     const int margin = Scale(16);
-    int listItemHeight = Scale(36);
+    // The row height is fixed by the owner-drawn list, so the popup always shows
+    // exactly the configured number of entries.
+    int listItemHeight = ClipboardListItemHeight();
     if (g_state.clipboardList != nullptr) {
         const LRESULT measuredHeight = SendMessageW(g_state.clipboardList, LB_GETITEMHEIGHT, 0, 0);
         if (measuredHeight > 0) {
@@ -3891,7 +4249,9 @@ void LayoutClipboardWindow() {
     }
     const int listHeight = listItemHeight * g_state.clipboardConfig.visibleItemCount;
     const int previewHeight = Scale(96);
-    const int hintHeight = std::max(Scale(20), MeasureFontTextHeight(g_state.clipboardPreviewFont) + Scale(6));
+    const int hintHeight = std::max(
+        Scale(20),
+        MeasureFontTextHeight(g_state.clipboardPreviewFont) * ClipboardHintLineCount() + Scale(6));
     const int height = margin * 4 + listHeight + previewHeight + hintHeight;
     const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
     const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 6;
@@ -3907,10 +4267,22 @@ void HideClipboardHistory() {
     // Callers that want focus restored capture clipboardReturnWindow before
     // hiding; clearing it here avoids stealing focus on a later unrelated hide.
     g_state.clipboardReturnWindow = nullptr;
+    g_state.clipboardCycleActive = false;
+    g_state.clipboardCycleKeyHeld = false;
+    g_state.clipboardCycleLastPressTick = 0;
+    g_state.clipboardShownTick = 0;
+    g_state.clipboardLostFocusTicks = 0;
+    // PasteSelectedClipboardEntry() sets this again after hiding, so hiding on
+    // its own (Esc, focus loss) discards any pending paste.
+    g_state.clipboardPasteTarget = nullptr;
+    if (g_state.clipboardWindow != nullptr) {
+        KillTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId);
+        KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
+        KillTimer(g_state.clipboardWindow, kClipboardPasteTimerId);
+    }
     if (g_state.clipboardWindow == nullptr || IsWindowVisible(g_state.clipboardWindow) == FALSE) {
         return;
     }
-    KillTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId);
     ShowWindow(g_state.clipboardWindow, SW_HIDE);
 }
 
@@ -3929,10 +4301,20 @@ void ShowClipboardHistory() {
 
     g_state.clipboardWindowActivated = false;
     g_state.clipboardVisibilityTicks = 0;
+    g_state.clipboardLostFocusTicks = 0;
+    g_state.clipboardShownTick = GetTickCount64();
+    g_state.clipboardCycleActive = false;
+    g_state.clipboardCycleKeyHeld = false;
+    g_state.clipboardCycleLastPressTick = 0;
     ReloadClipboardHistory();
+    // The popup always starts on the newest entry, so a single hotkey press can
+    // already paste it.
+    SelectFirstClipboardEntry();
     LayoutClipboardWindow();
     ShowWindow(g_state.clipboardWindow, SW_SHOW);
-    ForceForegroundWindow(g_state.clipboardWindow);
+    if (ForceForegroundWindow(g_state.clipboardWindow)) {
+        g_state.clipboardWindowActivated = true;
+    }
     SetFocus(g_state.clipboardList);
     // Fallback for the case where the foreground lock refuses the activation
     // and WM_ACTIVATE never arrives: once the popup has been active, close it
@@ -3940,29 +4322,157 @@ void ShowClipboardHistory() {
     SetTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId, kClipboardVisibilityTimerIntervalMs, nullptr);
 }
 
-void ToggleClipboardHistory() {
-    if (g_state.clipboardWindow != nullptr && IsWindowVisible(g_state.clipboardWindow) != FALSE) {
-        HideClipboardHistory();
+// ---------------------------------------------------------------------------
+// Clipboard hotkey cycling
+//
+// The hotkey opens the popup on the newest entry. Pressing it again while the
+// popup is open walks down the list; the sequence ends when the hotkey's
+// modifiers are released (for chords) or when a modifier-less hotkey goes idle,
+// and that end pastes the entry that ended up selected.
+// ---------------------------------------------------------------------------
+
+// Hotkey chord that moves the selection up: the base hotkey plus Shift. It is
+// only usable when the base hotkey does not already contain Shift.
+HotkeyConfig MakeClipboardUpHotkey() {
+    HotkeyConfig upHotkey = g_state.clipboardConfig.hotkey;
+    upHotkey.modifiers |= MOD_SHIFT;
+    return upHotkey;
+}
+
+// Shift+hotkey moves the selection up, but only when Shift is not already part
+// of the base hotkey; otherwise both chords would be identical.
+bool ClipboardUpHotkeyAvailable() {
+    return (g_state.clipboardConfig.hotkey.modifiers & MOD_SHIFT) == 0U;
+}
+
+// Starts watching for the end of the current press sequence. The press that
+// opened the popup only starts the sequence; it does not move the selection.
+void StartClipboardCycleSequence() {
+    g_state.clipboardCycleActive = true;
+    g_state.clipboardCycleKeyHeld = true;
+    g_state.clipboardCycleLastPressTick = GetTickCount64();
+    if (g_state.clipboardWindow != nullptr) {
+        SetTimer(g_state.clipboardWindow, kClipboardCycleTimerId, kClipboardCycleTimerIntervalMs, nullptr);
+    }
+}
+
+void EndClipboardCycleSequence() {
+    if (g_state.clipboardWindow != nullptr) {
+        KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
+    }
+    g_state.clipboardCycleActive = false;
+    g_state.clipboardCycleKeyHeld = false;
+    g_state.clipboardCycleLastPressTick = 0;
+    // PasteSelectedClipboardEntry() re-activates the window the popup was
+    // opened from and only injects Ctrl+V once it really has the foreground.
+    PasteSelectedClipboardEntry();
+}
+
+// Abandons the current sequence without pasting: the user took over with the
+// keyboard/mouse or closed the popup.
+void CancelClipboardCycleSequence() {
+    if (g_state.clipboardWindow != nullptr) {
+        KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
+    }
+    g_state.clipboardCycleActive = false;
+    g_state.clipboardCycleKeyHeld = false;
+    g_state.clipboardCycleLastPressTick = 0;
+}
+
+// Called for every clipboard-hotkey press; moveUp is true for the Shift variant.
+void HandleClipboardHotkeyPress(bool moveUp) {
+    const bool visible = g_state.clipboardWindow != nullptr && IsWindowVisible(g_state.clipboardWindow) != FALSE;
+    if (!visible) {
+        ShowClipboardHistory();
+        if (g_state.clipboardWindow == nullptr || IsWindowVisible(g_state.clipboardWindow) == FALSE) {
+            return;
+        }
+        // The popup opens on the newest entry; this press only starts the
+        // sequence, so releasing the chord pastes that first entry.
+        StartClipboardCycleSequence();
         return;
     }
-    ShowClipboardHistory();
+
+    if (!g_state.clipboardCycleActive) {
+        // Opened some other way (e.g. /clipboard): arm the sequence. Like the
+        // opening press, this one keeps the entry the popup is showing.
+        StartClipboardCycleSequence();
+        return;
+    }
+
+    // Auto-repeat of a held key must not walk the list. A repeat only happens
+    // while the key is physically down, so a press that arrives while the key
+    // reads "up" is a genuine new press even if the 15 ms poller has not
+    // noticed the release yet.
+    if (g_state.clipboardCycleKeyHeld &&
+        (GetAsyncKeyState(static_cast<int>(g_state.clipboardConfig.hotkey.vk)) & 0x8000) != 0) {
+        return;
+    }
+
+    g_state.clipboardCycleKeyHeld = true;
+    g_state.clipboardCycleLastPressTick = GetTickCount64();
+    MoveClipboardSelection(moveUp ? -1 : 1);
+    if (g_state.clipboardWindow != nullptr) {
+        SetTimer(g_state.clipboardWindow, kClipboardCycleTimerId, kClipboardCycleTimerIntervalMs, nullptr);
+    }
+}
+
+// Called from the cycle timer: detects the end of the press sequence.
+//
+// Chord hotkeys (Ctrl/Alt/Shift/Win) keep the sequence alive while any of their
+// modifiers is held; releasing them pastes the selected entry. A modifier-less
+// hotkey (e.g. an F-key) has nothing to watch, so its sequence ends once no new
+// press arrived within kClipboardCycleIdleMs.
+void PollClipboardCycleSequence() {
+    if (!g_state.clipboardCycleActive) {
+        if (g_state.clipboardWindow != nullptr) {
+            KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
+        }
+        return;
+    }
+
+    const bool keyDown = (GetAsyncKeyState(static_cast<int>(g_state.clipboardConfig.hotkey.vk)) & 0x8000) != 0;
+    if (!keyDown) {
+        g_state.clipboardCycleKeyHeld = false;
+    }
+
+    // The injected Ctrl+V must not be combined with anything the user is still
+    // holding, so the chord (and Shift, which only steers the direction) has to
+    // be fully released first. A modifier-less hotkey has no chord to watch.
+    const bool requiredModifiersHeld =
+        g_state.clipboardConfig.hotkey.modifiers != 0U &&
+        AreHotkeyRequiredModifiersHeld(g_state.clipboardConfig.hotkey.modifiers);
+    const bool shiftHeld = IsModifierDown(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+    if (keyDown || requiredModifiersHeld || shiftHeld) {
+        return;
+    }
+
+    if (g_state.clipboardConfig.hotkey.modifiers == 0U &&
+        (GetTickCount64() - g_state.clipboardCycleLastPressTick) < kClipboardCycleIdleMs) {
+        return;
+    }
+
+    EndClipboardCycleSequence();
 }
 
 void CopySelectedClipboardEntry() {
     const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    const HWND returnWindow = g_state.clipboardReturnWindow;
     if (!index) {
+        HideClipboardHistory();
         return;
     }
 
     const std::wstring text = g_state.clipboardEntries[*index].text;
+    // Hide before copying: CopyTextToClipboard() would otherwise refresh the
+    // still-visible list and make the popup flicker while it closes.
+    HideClipboardHistory();
     if (!CopyTextToClipboard(text)) {
         return;
     }
 
     // Return focus to the window that opened the popup so the user can paste
     // right away with Ctrl+V.
-    const HWND returnWindow = g_state.clipboardReturnWindow;
-    HideClipboardHistory();
     if (returnWindow != nullptr && IsWindow(returnWindow) != FALSE) {
         ForceForegroundWindow(returnWindow);
     }
@@ -3987,6 +4497,76 @@ void ClearClipboardHistory() {
     ReloadClipboardHistory();
 }
 
+// Sends Ctrl+V to whatever window regains the foreground. The keystroke is
+// injected through SendInput so it goes through the normal input queue (a
+// PostMessage of WM_KEYDOWN is ignored by most applications).
+void InjectPasteKeystroke() {
+    INPUT inputs[4] {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = static_cast<WORD>(VK_CONTROL);
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = static_cast<WORD>('V');
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = static_cast<WORD>('V');
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = static_cast<WORD>(VK_CONTROL);
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    for (INPUT& input : inputs) {
+        input.ki.dwExtraInfo = kInjectedHotkeyExtraInfo;
+    }
+    SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT));
+}
+
+void PasteSelectedClipboardEntry() {
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    const HWND returnWindow = g_state.clipboardReturnWindow;
+    if (!index) {
+        HideClipboardHistory();
+        return;
+    }
+
+    // Copy what was selected before hiding: HideClipboardHistory() clears the
+    // return window, and copying while visible would refresh (and flicker) the
+    // list that is already on its way out.
+    const std::wstring text = g_state.clipboardEntries[*index].text;
+    HideClipboardHistory();
+    if (!CopyTextToClipboard(text)) {
+        return;
+    }
+
+    if (returnWindow == nullptr || IsWindow(returnWindow) == FALSE) {
+        return;
+    }
+
+    // Return focus to the window the popup was opened from, then paste there.
+    ForceForegroundWindow(returnWindow);
+    g_state.clipboardPasteTarget = returnWindow;
+
+    if (g_state.clipboardWindow != nullptr) {
+        // Give the target a moment to finish taking the foreground, then paste.
+        SetTimer(g_state.clipboardWindow, kClipboardPasteTimerId, kClipboardPasteDelayMs, nullptr);
+    } else {
+        InjectPasteIntoClipboardTarget();
+    }
+}
+
+void InjectPasteIntoClipboardTarget() {
+    const HWND target = g_state.clipboardPasteTarget;
+    g_state.clipboardPasteTarget = nullptr;
+    if (target == nullptr || IsWindow(target) == FALSE) {
+        return;
+    }
+    if (GetForegroundWindow() != target) {
+        ForceForegroundWindow(target);
+        if (GetForegroundWindow() != target) {
+            AppendHotkeyDebugLog(L"Skipped pasting: the target window did not take the foreground.");
+            return;
+        }
+    }
+    InjectPasteKeystroke();
+}
+
 bool IsClipboardWindow(HWND window) {
     return IsChildOrSameWindow(g_state.clipboardWindow, window);
 }
@@ -3995,17 +4575,39 @@ bool IsClipboardWindow(HWND window) {
 // (or by the low-level hook) and never reaches this list box; toggling while
 // the popup is open is handled by the WM_HOTKEY path instead.
 LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    // Clicking the list takes over from the hotkey sequence.
+    if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MOUSEWHEEL) {
+        CancelClipboardCycleSequence();
+    }
+    // The hotkey may be an Alt chord; swallow the system-key messages of that
+    // key so the popup never enters menu mode (which would beep and could steal
+    // focus). Anything else, e.g. Alt+F4, still goes through.
+    if (message == WM_SYSCHAR) {
+        // No menu here, so this only exists to beep.
+        return 0;
+    }
+    if ((message == WM_SYSKEYDOWN || message == WM_SYSKEYUP) &&
+        (wParam == g_state.clipboardConfig.hotkey.vk || wParam == VK_MENU)) {
+        // Swallowing Alt itself keeps the popup out of the (blocking) menu
+        // mode loop, which would otherwise start on a plain Alt press.
+        return 0;
+    }
     if (message == WM_KEYDOWN) {
         const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        // Any manual navigation cancels the hotkey sequence, otherwise the
+        // pending paste would still fire while the user browses by hand.
         if (wParam == VK_UP) {
+            CancelClipboardCycleSequence();
             MoveClipboardSelection(-1);
             return 0;
         }
         if (wParam == VK_DOWN) {
+            CancelClipboardCycleSequence();
             MoveClipboardSelection(1);
             return 0;
         }
         if (wParam == VK_RETURN || (controlDown && wParam == 'C')) {
+            CancelClipboardCycleSequence();
             CopySelectedClipboardEntry();
             return 0;
         }
@@ -4014,6 +4616,7 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
             return 0;
         }
         if (wParam == VK_DELETE) {
+            CancelClipboardCycleSequence();
             if (controlDown) {
                 ClearClipboardHistory();
             } else {
@@ -4028,9 +4631,38 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
 LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE:
-        g_state.clipboardList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_LIST)), g_state.instance, nullptr);
+        // Owner-drawn so entries can be separated visually and the selected row
+        // can be highlighted; LBS_HASSTRINGS keeps LB_GETTEXT working.
+        g_state.clipboardList = CreateWindowExW(
+            0,
+            L"LISTBOX",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL |
+                LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            0,
+            0,
+            0,
+            0,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_LIST)),
+            g_state.instance,
+            nullptr);
         g_state.clipboardPreview = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_PREVIEW)), g_state.instance, nullptr);
-        g_state.clipboardHint = CreateWindowExW(0, L"STATIC", L"Enter / Ctrl+C copy    Del remove    Ctrl+Del clear all    Esc close", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_HINT)), g_state.instance, nullptr);
+        g_state.clipboardHint = CreateWindowExW(
+            0,
+            L"STATIC",
+            BuildClipboardHintText().c_str(),
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            0,
+            0,
+            0,
+            0,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_HINT)),
+            g_state.instance,
+            nullptr);
+        // Creates the fonts, applies them to all three controls, rebuilds the
+        // hint text and pushes the owner-draw row height.
         ApplyClipboardFonts();
         g_state.clipboardListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.clipboardList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ClipboardListProc)));
         LayoutClipboardWindow();
@@ -4057,12 +4689,29 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         EndPaint(window, &ps);
         return 0;
     }
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (measure != nullptr && measure->CtlID == static_cast<UINT>(IDC_CLIPBOARD_LIST)) {
+            measure->itemHeight = static_cast<UINT>(ClipboardListItemHeight());
+            return TRUE;
+        }
+        break;
+    }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (draw != nullptr && draw->CtlID == static_cast<UINT>(IDC_CLIPBOARD_LIST)) {
+            DrawClipboardListItem(*draw);
+            return TRUE;
+        }
+        break;
+    }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
             UpdateClipboardPreview();
             return 0;
         }
         if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+            CancelClipboardCycleSequence();
             CopySelectedClipboardEntry();
             return 0;
         }
@@ -4081,38 +4730,70 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         SetTextColor(dc, control == g_state.clipboardHint ? g_state.launcherAppearance.subtleTextColor : g_state.launcherAppearance.textColor);
         return reinterpret_cast<LRESULT>(g_state.clipboardBackgroundBrush != nullptr ? g_state.clipboardBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     }
-    case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) {
-            HideClipboardHistory();
+    case WM_SYSCHAR:
+        // See ClipboardListProc: no menu, so there is nothing to beep about.
+        return 0;
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+        // See ClipboardListProc: Alt is a valid hotkey modifier here.
+        if (wParam == g_state.clipboardConfig.hotkey.vk || wParam == VK_MENU) {
             return 0;
         }
-        g_state.clipboardWindowActivated = true;
-        return 0;
+        break;
+    // Activation is tracked from GetForegroundWindow in the visibility timer
+    // instead of handling WM_ACTIVATE: the hotkey modifier going in and out of
+    // menu mode can deactivate the popup right after it opens, while a click
+    // elsewhere must still close it.
     case WM_TIMER:
+        if (wParam == kClipboardCycleTimerId) {
+            PollClipboardCycleSequence();
+            return 0;
+        }
+        if (wParam == kClipboardPasteTimerId) {
+            KillTimer(window, kClipboardPasteTimerId);
+            InjectPasteIntoClipboardTarget();
+            return 0;
+        }
         if (wParam == kClipboardVisibilityTimerId) {
             const HWND foregroundWindow = GetForegroundWindow();
             if (foregroundWindow != nullptr && IsClipboardWindow(foregroundWindow)) {
                 g_state.clipboardWindowActivated = true;
-                g_state.clipboardVisibilityTicks = 0;
+                g_state.clipboardLostFocusTicks = 0;
                 return 0;
             }
 
-            // Once the popup has held focus, another foreground window means
-            // the user clicked away and the popup should close.
-            if (g_state.clipboardWindowActivated) {
+            // Until the popup has held the foreground once, keep retrying: the
+            // foreground lock can reject the first activation attempt.
+            if (!g_state.clipboardWindowActivated) {
+                ++g_state.clipboardVisibilityTicks;
+                if (ForceForegroundWindow(window)) {
+                    g_state.clipboardWindowActivated = true;
+                    SetFocus(g_state.clipboardList);
+                } else if (g_state.clipboardVisibilityTicks >= kClipboardVisibilityGiveUpTicks) {
+                    // Leave the popup usable (the user can still click it); just
+                    // stop polling for activation.
+                    KillTimer(window, kClipboardVisibilityTimerId);
+                }
+                return 0;
+            }
+
+            // It had the foreground and lost it. Ignore transient focus loss
+            // right after showing, and while the hotkey chord is still held:
+            // Alt/Ctrl can push the popup out of the foreground for a moment
+            // and an in-progress cycle must survive that. A modifier-less
+            // hotkey has no chord to hold, so focus loss always wins there.
+            if (g_state.clipboardCycleActive &&
+                g_state.clipboardConfig.hotkey.modifiers != 0U &&
+                AreHotkeyRequiredModifiersHeld(g_state.clipboardConfig.hotkey.modifiers)) {
+                g_state.clipboardLostFocusTicks = 0;
+                return 0;
+            }
+            if ((GetTickCount64() - g_state.clipboardShownTick) < kClipboardFocusGraceMs) {
+                g_state.clipboardLostFocusTicks = 0;
+                return 0;
+            }
+            if (++g_state.clipboardLostFocusTicks >= kClipboardLostFocusTicks) {
                 HideClipboardHistory();
-                return 0;
-            }
-
-            // Otherwise give it a moment to take focus, retrying once in case
-            // the foreground lock won the first attempt.
-            ++g_state.clipboardVisibilityTicks;
-            if (g_state.clipboardVisibilityTicks == 1) {
-                ForceForegroundWindow(g_state.clipboardWindow);
-            } else if (g_state.clipboardVisibilityTicks >= kClipboardVisibilityGiveUpTicks) {
-                // Leave the popup usable (the user can still click it); just
-                // stop polling for activation.
-                KillTimer(g_state.clipboardWindow, kClipboardVisibilityTimerId);
             }
             return 0;
         }
@@ -4134,9 +4815,13 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
 void UninstallClipboardHotkey() {
     if (g_state.hostWindow != nullptr) {
         UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_CLIPBOARD);
+        UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_CLIPBOARD_UP);
     }
     g_state.clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
+    g_state.clipboardUpHotkeyBackend = HotkeyBackend::RegisterHotKey;
     g_state.clipboardHotkeyArmed = false;
+    g_state.clipboardUpHotkeyArmed = false;
+    g_state.clipboardUpHotkeyRegistered = false;
 }
 
 void RegisterClipboardHotkey() {
@@ -4148,21 +4833,58 @@ void RegisterClipboardHotkey() {
         return;
     }
 
+    const bool shiftVariant = ClipboardUpHotkeyAvailable();
+    const HotkeyConfig upHotkey = MakeClipboardUpHotkey();
+
     if ((g_state.clipboardConfig.hotkey.modifiers & MOD_WIN) != 0U) {
         // See RegisterLauncherHotkey: the low-level hook is the only reliable
-        // way to stop Explorer from acting on Win+key chords.
+        // way to stop Explorer from acting on Win+key chords. The hook handles
+        // both the base chord and its Shift variant.
         g_state.clipboardHotkeyBackend = HotkeyBackend::KeyboardHook;
+        g_state.clipboardUpHotkeyBackend = HotkeyBackend::KeyboardHook;
+        g_state.clipboardUpHotkeyRegistered = shiftVariant;
         AppendHotkeyDebugLog(L"Clipboard Win hotkey uses keyboard hook: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
-    } else if (RegisterHotKey(
-                   g_state.hostWindow,
-                   ID_HOTKEY_CLIPBOARD,
-                   g_state.clipboardConfig.hotkey.modifiers,
-                   g_state.clipboardConfig.hotkey.vk) == FALSE) {
-        g_state.clipboardHotkeyBackend = HotkeyBackend::KeyboardHook;
-        AppendHotkeyDebugLog(L"Clipboard hotkey fell back to keyboard hook: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
-    } else {
-        AppendHotkeyDebugLog(L"Clipboard hotkey registered via RegisterHotKey: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+        return;
     }
+
+    // The Shift variant (selection up) is a second global registration with
+    // the same key and one extra modifier.
+    const bool baseRegistered = RegisterHotKey(
+        g_state.hostWindow,
+        ID_HOTKEY_CLIPBOARD,
+        g_state.clipboardConfig.hotkey.modifiers,
+        g_state.clipboardConfig.hotkey.vk) != FALSE;
+    const bool upRegistered = shiftVariant &&
+        RegisterHotKey(
+            g_state.hostWindow,
+            ID_HOTKEY_CLIPBOARD_UP,
+            upHotkey.modifiers,
+            upHotkey.vk) != FALSE;
+
+    if (!baseRegistered) {
+        // RegisterHotKey failed (chord taken by another app): fall back to the
+        // low-level hook, which also covers the Shift variant.
+        UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_CLIPBOARD);
+        UnregisterHotKey(g_state.hostWindow, ID_HOTKEY_CLIPBOARD_UP);
+        g_state.clipboardHotkeyBackend = HotkeyBackend::KeyboardHook;
+        g_state.clipboardUpHotkeyBackend = HotkeyBackend::KeyboardHook;
+        g_state.clipboardUpHotkeyRegistered = shiftVariant;
+        // Not reported as a failure yet: the hook path below works too, and
+        // ConfigureKeyboardHook() reports it only if the hook cannot be
+        // installed either.
+        AppendHotkeyDebugLog(L"Clipboard hotkey fell back to keyboard hook: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey));
+        return;
+    }
+
+    if (shiftVariant && !upRegistered) {
+        // The base chord works, but Shift+chord is taken. Selection can still
+        // move up with the arrow keys inside the popup.
+        AppendHotkeyDebugLog(L"Clipboard Shift variant could not be registered: " + FormatHotkeyConfig(upHotkey));
+    }
+    g_state.clipboardUpHotkeyRegistered = upRegistered;
+    AppendHotkeyDebugLog(
+        L"Clipboard hotkey registered via RegisterHotKey: " + FormatHotkeyConfig(g_state.clipboardConfig.hotkey) +
+        (upRegistered ? L" (+Shift " + FormatHotkeyConfig(upHotkey) + L")" : L""));
 }
 
 std::vector<std::wstring> SplitCommandFields(std::wstring_view line) {
@@ -6586,7 +7308,12 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         }
         if (wParam == ID_HOTKEY_CLIPBOARD) {
             AppendHotkeyDebugLog(L"Received WM_HOTKEY for clipboard history.");
-            ToggleClipboardHistory();
+            HandleClipboardHotkeyPress(false);
+            return 0;
+        }
+        if (wParam == ID_HOTKEY_CLIPBOARD_UP) {
+            AppendHotkeyDebugLog(L"Received WM_HOTKEY for clipboard history (Shift).");
+            HandleClipboardHotkeyPress(true);
             return 0;
         }
         for (const ManagedHotkey& hotkey : g_state.managedHotkeys) {
@@ -6838,6 +7565,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_state.clipboardFont != nullptr) {
         DeleteObject(g_state.clipboardFont);
         g_state.clipboardFont = nullptr;
+    }
+    if (g_state.clipboardSelectedFont != nullptr) {
+        DeleteObject(g_state.clipboardSelectedFont);
+        g_state.clipboardSelectedFont = nullptr;
     }
     if (g_state.clipboardPreviewFont != nullptr) {
         DeleteObject(g_state.clipboardPreviewFont);

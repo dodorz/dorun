@@ -20,6 +20,10 @@ COPY_COMMAND_HOTKEY: '^+c'
 # Ditto-like clipboard text history.
 # The popup hotkey uses the same modifier syntax as Command.conf hotkeys
 # (^ = Ctrl, ! = Alt, + = Shift, @ = Win) and is global while DoRun runs.
+# Tapping the hotkey again steps the selection down; releasing its modifiers
+# pastes the selected entry. Shift+hotkey steps up (when Shift is not already
+# part of the hotkey). A hotkey without modifiers (e.g. F8) ends the sequence
+# after a short pause instead.
 CLIPBOARD_HISTORY_ENABLED: true
 CLIPBOARD_HOTKEY: '^`'
 CLIPBOARD_HISTORY_MAX_ROWS: 500
