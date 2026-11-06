@@ -17,7 +17,7 @@ Main capabilities:
 - Custom commands from `Command.conf`.
 - Built-in slash commands such as `/reload`, `/kill`, `/config`, and `/cmdconfig`.
 - Optional launcher-scoped hotkey to copy the selected command line to the clipboard.
-- Ditto-like clipboard history: a global hotkey opens a floating list of recent clipboard text, newest first.
+- Ditto-like clipboard history: one hotkey steps through recent clipboard text and pastes the selection, with a floating list window (`/clipboard`) for browsing.
 - Managed hotkeys that launch specific commands directly.
 - `STARTUP` tasks that run when DoRun starts in startup mode.
 - Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
@@ -80,7 +80,20 @@ In the popup:
 | `Ctrl+Delete` | Clear the whole history |
 | `Esc` | Close without copying |
 
-The popup also closes when it loses focus. Entries are stored as plain text in `%LOCALAPPDATA%\DoRun\clipboard-history.txt`; copying the selected entry returns focus to the window you came from, so `Ctrl+V` pastes it right away. Only text formats are captured — images and files are not part of the history. `/clipboard` opens the same popup from the launcher.
+DoRun can also drive the popup with the clipboard hotkey itself, so the whole cycle stays on one chord:
+
+1. **First press** opens the popup with the newest entry selected.
+2. **Further presses**, while the hotkey's modifiers (Ctrl/Alt/Shift/Win) stay held, move the selection down one entry each.
+3. **Releasing the modifiers** puts the selected entry on the clipboard and pastes it into the window you came from by injecting `Ctrl+V` there.
+4. **Shift+hotkey** moves the selection up instead — with the default hotkey (`Ctrl` plus the backtick key), holding Shift as well walks back towards the newest entry. This variant is only registered when Shift is not already part of the base hotkey.
+
+When the hotkey has no modifiers (for example an `F` key such as `F8`), there is no modifier release that could mark the end of the sequence, so consecutive presses with less than ~0.7 s between them are treated as one sequence, and the paste happens once the presses stop.
+
+Walking the list with the hotkey and with `Up` / `Down` are alternatives: pressing a key or clicking in the list abandons the hotkey sequence, so nothing is pasted behind your back.
+
+The popup closes when it loses focus or when `Esc` is pressed. Entries are stored as plain text in `%LOCALAPPDATA%\DoRun\clipboard-history.txt`; pasting returns focus to the window you came from and the injected `Ctrl+V` lands there. Only text formats are captured — images and files are not part of the history. `/clipboard` opens the same popup from the launcher.
+
+In the list, entries are separated by a thin divider line and the selected entry is drawn with a filled highlight, a left accent bar, a bold font, and its rank (`#1`, `#2`, …) on the right.
 
 ### Forcing a console window
 
