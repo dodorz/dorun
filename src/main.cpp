@@ -286,6 +286,8 @@ struct AppState {
     std::vector<ManagedHotkey> managedHotkeys;
     std::vector<HotkeyRegistrationFailure> hotkeyRegistrationFailures;
     std::array<MonitoredConfigFile, 2> monitoredConfigFiles {};
+    // Periodic forced reload (CONFIG_AUTO_RELOAD_SECONDS). 0 disables it.
+    int configAutoReloadSeconds = 0;
     SearchQueryState lastSearch {};
     ULONGLONG lastSearchInputTick = 0;
     bool deferredRefreshArmed = false;
@@ -342,6 +344,12 @@ constexpr UINT_PTR kClipboardVisibilityTimerId = 8;
 constexpr UINT_PTR kClipboardCycleTimerId = 9;
 // Delays the injected Ctrl+V slightly so focus has settled in the target app.
 constexpr UINT_PTR kClipboardPasteTimerId = 10;
+constexpr UINT_PTR kConfigAutoReloadTimerId = 11;
+constexpr int kDefaultConfigAutoReloadSeconds = 0;
+// One week; only a sanity cap for absurd values in the config file.
+constexpr int kMaxConfigAutoReloadSeconds = 7 * 24 * 60 * 60;
+// Short retry while the user is typing in the launcher.
+constexpr UINT kConfigAutoReloadRetryIntervalMs = 1000;
 constexpr UINT kClipboardVisibilityTimerIntervalMs = 100;
 // ~1.5s of retries for the popup to become the foreground window.
 constexpr int kClipboardVisibilityGiveUpTicks = 15;
@@ -415,6 +423,8 @@ void LoadCronTasks();
 void LoadManagedHotkeys();
 void LoadCopyCommandHotkeyConfig();
 void LoadClipboardConfig();
+void LoadConfigReloadConfig();
+void StartConfigAutoReloadTimer();
 void LoadClipboardEntriesFromFile();
 void RegisterClipboardHotkey();
 void UninstallClipboardHotkey();
@@ -2135,6 +2145,24 @@ void LoadHotkeyConfig() {
     }
     if (g_state.hotkey.vk == 0U) {
         g_state.hotkey.vk = VK_SPACE;
+    }
+}
+
+// Periodic forced reload of DoRun.yaml and Command.conf.
+//
+// `CONFIG_AUTO_RELOAD_SECONDS` is the interval in seconds; 0 disables the
+// periodic reload entirely. Negative values are treated as 0.
+void LoadConfigReloadConfig() {
+    g_state.configAutoReloadSeconds = kDefaultConfigAutoReloadSeconds;
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        return;
+    }
+
+    if (const std::optional<int> seconds = ParseYamlInt(content, L"CONFIG_AUTO_RELOAD_SECONDS")) {
+        g_state.configAutoReloadSeconds = std::clamp(*seconds, 0, kMaxConfigAutoReloadSeconds);
     }
 }
 
@@ -6030,6 +6058,25 @@ void StartConfigWatchTimer() {
     }
 }
 
+// (Re)arms the periodic forced reload timer from the current setting.
+// An interval of 0 (the default) disables the timer.
+void StartConfigAutoReloadTimer() {
+    if (g_state.hostWindow == nullptr) {
+        return;
+    }
+
+    KillTimer(g_state.hostWindow, kConfigAutoReloadTimerId);
+    const int seconds = std::clamp(g_state.configAutoReloadSeconds, 0, kMaxConfigAutoReloadSeconds);
+    if (seconds <= 0) {
+        return;
+    }
+
+    // The cap keeps the millisecond value well inside UINT's range.
+    const UINT intervalMs = static_cast<UINT>(seconds) * 1000U;
+    SetTimer(g_state.hostWindow, kConfigAutoReloadTimerId, intervalMs, nullptr);
+    AppendHotkeyDebugLog(L"Config auto reload enabled: " + std::to_wstring(seconds) + L"s");
+}
+
 bool IsReservedGroupName(std::wstring_view name) {
     const std::wstring lower = Lowercase(name);
     return lower == L"cron" || lower == L"hotkey" || lower == L"hotkeys";
@@ -6712,6 +6759,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     LoadManagedHotkeys();
     LoadCopyCommandHotkeyConfig();
     LoadClipboardConfig();
+    LoadConfigReloadConfig();
     RefreshMonitoredConfigFiles();
     UpdateUiFont(g_state.dpi);
     g_state.hotkeyRegistrationFailures.clear();
@@ -6737,6 +6785,8 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     ApplyFont(g_state.resultList, g_state.resultFont);
     ApplyFont(g_state.descriptionText, g_state.descriptionFont);
     LayoutLauncher();
+    // The reload may have changed CONFIG_AUTO_RELOAD_SECONDS.
+    StartConfigAutoReloadTimer();
     RequestLauncherDataRefresh(true, true);
     if (hideLauncherOnSuccess) {
         HideLauncher();
@@ -7341,6 +7391,22 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         }
         return 0;
     }
+    if (message == WM_TIMER && wParam == kConfigAutoReloadTimerId) {
+        if (ShouldDeferRefreshForActiveTyping()) {
+            // Retry shortly so a long interval cannot postpone the reload for
+            // a whole period just because the user was typing.
+            SetTimer(
+                g_state.hostWindow,
+                kConfigAutoReloadTimerId,
+                kConfigAutoReloadRetryIntervalMs,
+                nullptr);
+            return 0;
+        }
+        // ReloadAllConfiguration reloads CONFIG_AUTO_RELOAD_SECONDS and re-arms
+        // this timer with the (possibly changed) interval.
+        ReloadAllConfiguration(false);
+        return 0;
+    }
     if (message == kMessageSingletonShowLauncher) {
         ShowLauncher();
         return 0;
@@ -7493,6 +7559,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadManagedHotkeys();
     LoadCopyCommandHotkeyConfig();
     LoadClipboardConfig();
+    LoadConfigReloadConfig();
     RefreshMonitoredConfigFiles();
 
     if (!InitializeWindows()) {
@@ -7522,6 +7589,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         RunCronTasks();
         StartCronTimer();
         StartConfigWatchTimer();
+        StartConfigAutoReloadTimer();
         RequestLauncherDataRefresh(true, true);
     }
 

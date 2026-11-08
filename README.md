@@ -23,7 +23,7 @@ Main capabilities:
 - Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
 - `CRON` tasks for scheduled launches.
 - Usage history stored in SQLite with ranking, decay, pruning, recency, and optional fuzzy matching.
-- Live config reload support for `DoRun.yaml` and `Command.conf`.
+- Live config reload support for `DoRun.yaml` and `Command.conf`, with an optional periodic forced reload.
 
 ## Built-in commands
 
@@ -109,6 +109,17 @@ Prefix a search with `!` to force the selected item to show its console window f
 
 `DoRun.exe /reload` is the command-line equivalent of the `/reload` slash command. It is convenient for scripts that edit `DoRun.yaml` or `Command.conf` and want the changes applied immediately.
 
+### Periodic auto reload
+
+DoRun watches both config files and reloads them when their timestamp changes. In addition, the whole configuration can be reloaded on a fixed period, which is useful when files are edited through tools that preserve timestamps or when a reload must happen unconditionally:
+
+```yaml
+# Reload both config files every N seconds. 0 (the default) disables it.
+CONFIG_AUTO_RELOAD_SECONDS: 300
+```
+
+Set it to `0` to turn the periodic reload off. The interval is re-read on every reload, so changing the value takes effect without restarting DoRun. A pending periodic reload is postponed for a moment while the launcher is open and the search box is being typed in.
+
 ## Configuration files
 
 DoRun uses two main config files:
@@ -191,6 +202,7 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `HOTKEY_VK`
 - `HOTKEY_DEBUG_LOG`
 - `COPY_COMMAND_HOTKEY`
+- `CONFIG_AUTO_RELOAD_SECONDS`
 - `CLIPBOARD_HISTORY_ENABLED`
 - `CLIPBOARD_HOTKEY`
 - `CLIPBOARD_HISTORY_MAX_ROWS`

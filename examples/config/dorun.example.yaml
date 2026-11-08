@@ -17,6 +17,11 @@ HOTKEY_DEBUG_LOG: false
 # Defaults to `^+c` when unset. Leave empty or set to `none` to disable.
 COPY_COMMAND_HOTKEY: '^+c'
 
+# Automatically reload DoRun.yaml and Command.conf every N seconds.
+# 0 (the default) disables the periodic reload; edits are then only applied
+# when the files change on disk, via `/reload`, or `DoRun.exe /reload`.
+CONFIG_AUTO_RELOAD_SECONDS: 0
+
 # Ditto-like clipboard text history.
 # The popup hotkey uses the same modifier syntax as Command.conf hotkeys
 # (^ = Ctrl, ! = Alt, + = Shift, @ = Win) and is global while DoRun runs.
