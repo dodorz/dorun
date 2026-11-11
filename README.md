@@ -306,10 +306,13 @@ The GitHub Actions build workflow:
 
 - supports manual runs via `workflow_dispatch`
 - accepts version tags with or without a leading `v`
-- only auto-builds pushed version tags when `major.minor.patch` changes
-- skips auto-builds for build-only tag bumps
-- publishes a GitHub Release for manual versioned runs and for pushed tags whose `major.minor.patch` changed
+- builds **every** pushed version tag, including build-only bumps
+- checks the tag against `src/version.h` and fails the run when they disagree, so a release can never ship a binary whose `FileVersion` differs from its tag
+- requires the tag to point at the commit that gets built
+- publishes a GitHub Release for the first run of a new tag; re-pushing or moving an existing tag only rebuilds artifacts, and a manual run replaces the assets of an existing release
 - packages artifacts as `DoRun-<version>-windows-x64.zip`
+
+Publishing a release therefore needs three things to agree: the pushed tag, the `src/version.h` at that commit, and the assets built from it. Bump `src/version.h` in the same commit that you tag.
 
 ## Versioning
 
@@ -325,7 +328,7 @@ Release tags use the `v<version>` format, for example:
 v0.2.1.27
 ```
 
-See `VERSIONING.md` for the project rules.
+`src/version.h` is the single source of truth for the version. The CI compares it with the pushed tag (or with the tag passed to a manual run) and refuses to release when they differ.
 
 ## Notes
 

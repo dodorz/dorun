@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Optional version tag, with or without leading v
+        description: Optional version tag, with or without leading v. Leave empty for a dev build.
         required: false
         type: string
 
@@ -26,84 +26,202 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A manual run on a branch would build master while claiming a tag's
+      # version, so fetch the tags and check out the requested tag first.
+      - name: Checkout requested release tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        shell: pwsh
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $raw = $env:MANUAL_VERSION.Trim()
+          $numeric = $raw -replace '^v', ''
+
+          git fetch --tags --force origin
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cannot fetch tags from origin."
+          }
+
+          $tag = ""
+          foreach ($candidate in @("v$numeric", $numeric)) {
+            git rev-parse --verify --quiet "refs/tags/${candidate}^{commit}" *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $tag = $candidate
+              break
+            }
+          }
+          if (-not $tag) {
+            throw "Tag $numeric does not exist on origin (checked v$numeric and $numeric)."
+          }
+
+          git checkout --force "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cannot check out tag $tag."
+          }
+          Write-Host "Checked out tag $tag"
+
       - name: Resolve version and release gate
         id: version
         shell: pwsh
         env:
           MANUAL_VERSION: ${{ github.event.inputs.version || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = "Stop"
+          $versionTagPattern = '^v?(\d+\.\d+\.\d+\.\d+)$'
+
+          # Tag lookups below compare tag objects, so make sure every tag of
+          # origin is present locally.
+          git fetch --tags --force origin *> $null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cannot fetch tags from origin."
+          }
+
+          # src/version.h is the single source of truth. This is what the
+          # binaries' FileVersion is compiled from, so a tag that disagrees
+          # with it must fail instead of shipping a mislabelled release.
+          function ConvertFrom-VersionHeader([string] $Content) {
+            $parts = @{}
+            foreach ($name in "MAJOR", "MINOR", "PATCH", "BUILD") {
+              $match = [regex]::Match($Content, "#define\s+DORUN_VERSION_$name\s+(\d+)")
+              if (-not $match.Success) {
+                throw "src/version.h is missing DORUN_VERSION_$name"
+              }
+              $parts[$name] = [int]$match.Groups[1].Value
+            }
+            return [version]("{0}.{1}.{2}.{3}" -f $parts["MAJOR"], $parts["MINOR"], $parts["PATCH"], $parts["BUILD"])
+          }
+
+          function Get-ReleasedVersion([string] $Tag) {
+            $url = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$Tag"
+            $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+            try {
+              Invoke-RestMethod -Uri $url -Headers $headers -Method Get *> $null
+              return $true
+            } catch {
+              $status = $null
+              if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = [int]$_.Exception.Response.StatusCode
+              }
+              if ($status -eq 404) {
+                return $false
+              }
+              throw
+            }
+          }
+
           $rawVersion = ""
-          $isRelease = "false"
-          $shouldBuild = "true"
-          $publishRelease = "false"
           $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)
 
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $rawVersion = $env:GITHUB_REF_NAME
-          } elseif (-not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)) {
+          } elseif ($isManualVersionedBuild) {
             $rawVersion = $env:MANUAL_VERSION
           }
 
-          if (-not [string]::IsNullOrWhiteSpace($rawVersion)) {
-            if ($rawVersion -notmatch '^v?\d+\.\d+\.\d+\.\d+$') {
-              throw "Version tag must match vmajor.minor.patch.build or major.minor.patch.build: $rawVersion"
-            }
+          $tagName = ""
+          $publishRelease = "false"
 
-            if ($rawVersion -match '^v') {
-              $version = $rawVersion
-            } else {
-              $version = "v$rawVersion"
-            }
+          if ([string]::IsNullOrWhiteSpace($rawVersion)) {
+            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+            Write-Host "Dev build: $version (no version tag, no release)"
+          } elseif ($rawVersion -match $versionTagPattern) {
+            $numericVersion = [regex]::Match($rawVersion, $versionTagPattern).Groups[1].Value
+            $taggedVersion = [version]$numericVersion
+            $version = "v$numericVersion"
+            $headSha = (git rev-parse HEAD | Out-String).Trim()
 
-            $currentSeries = ($version -replace '^v', '') -replace '\.\d+$', ''
-            $previousTag = ""
-            try {
-              $previousTag = (git describe --tags --abbrev=0 HEAD~1 2>$null) ?? ""
-            } catch {
-              $previousTag = ""
-            }
-
-            if (-not $previousTag) {
-              $isRelease = "true"
-            } else {
-              if ($previousTag -notmatch '^v') {
-                $previousTag = "v$previousTag"
-              }
-              $previousSeries = ($previousTag -replace '^v', '') -replace '\.\d+$', ''
-              if ($currentSeries -ne $previousSeries) {
-                $isRelease = "true"
-              } elseif (-not $isManualVersionedBuild) {
-                $shouldBuild = "false"
+            # Tags exist both as v0.3.0.51 and 0.3.0.51, and a commit can
+            # carry more than one version tag. Prefer the tag that triggered
+            # this run, then any tag on this commit that names this version.
+            $headTags = @(git tag --points-at HEAD | ForEach-Object { $_.Trim() })
+            $tagName = ""
+            $preferred = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "" }
+            $candidates = @()
+            if ($preferred) {
+              $candidates += $preferred
+              if ($preferred -match '^v') {
+                $candidates += ($preferred -replace '^v', '')
+              } else {
+                $candidates += "v$preferred"
               }
             }
-
-            if ($env:GITHUB_REF_TYPE -eq "tag" -and $isRelease -eq "true") {
-              $publishRelease = "true"
+            $candidates += $headTags
+            foreach ($tag in $candidates) {
+              $match = [regex]::Match($tag, $versionTagPattern)
+              if (-not $match.Success) {
+                continue
+              }
+              if ([version]$match.Groups[1].Value -ne $taggedVersion) {
+                continue
+              }
+              if ($headTags -notcontains $tag) {
+                continue
+              }
+              $tagName = $tag
+              break
             }
-            if ($isManualVersionedBuild) {
+            if (-not $tagName) {
+              throw "No tag for $numericVersion points at HEAD ($headSha). Tag the built commit, or run the workflow for the tag ref."
+            }
+
+            $headerVersion = ConvertFrom-VersionHeader (git show "${headSha}:src/version.h" | Out-String)
+            if ($headerVersion -ne $taggedVersion) {
+              throw "Tag $tagName does not match src/version.h ($headerVersion). Bump src/version.h in the same commit that is tagged."
+            }
+            Write-Host "Tag $tagName matches src/version.h ($headerVersion)"
+
+            # Informational: what release came before this one, compared by
+            # version number over all tags reachable from HEAD. Merges and
+            # moved tags no longer make this comparison wrong.
+            $previous = $null
+            foreach ($tag in (git tag --merged HEAD | ForEach-Object { $_.Trim() })) {
+              $match = [regex]::Match($tag, $versionTagPattern)
+              if (-not $match.Success) {
+                continue
+              }
+              $candidate = [version]$match.Groups[1].Value
+              if ($candidate -lt $taggedVersion -and (-not $previous -or $candidate -gt $previous.Version)) {
+                $previous = [pscustomobject]@{ Tag = $tag; Version = $candidate }
+              }
+            }
+            if ($previous) {
+              Write-Host "Previous reachable version: $($previous.Tag) ($($previous.Version))"
+            } else {
+              Write-Host "No older reachable version; this is the first release."
+            }
+
+            $alreadyReleased = Get-ReleasedVersion $tagName
+            if ($env:GITHUB_REF_TYPE -eq "tag") {
+              # Re-pushed or moved tags must not clobber an existing release;
+              # a manual run is the documented way to repair one.
+              if ($alreadyReleased) {
+                Write-Host "Release $tagName already exists; skipping publish (use a manual run to replace its assets)."
+                $publishRelease = "false"
+              } else {
+                $publishRelease = "true"
+              }
+            } else {
               $publishRelease = "true"
             }
           } else {
-            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+            throw "Version must match v<major>.<minor>.<patch>.<build> or <major>.<minor>.<patch>.<build>: $rawVersion"
           }
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "should_build=$shouldBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "publish_release=$publishRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Build static release
-        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat StaticRelease x64
 
       - name: Build dynamic release
-        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat Release x64
 
       - name: Package executables
-        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
@@ -118,48 +236,52 @@ jobs:
           Compress-Archive -Path (Join-Path $dynamicStage "DoRun.exe") -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
 
       - name: Upload build artifacts
-        if: steps.version.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DoRun-${{ steps.version.outputs.version }}-windows-x64
           path: dist/*.zip
 
-      - name: Verify manual release tag exists
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+      - name: Verify release target
+        if: steps.version.outputs.publish_release == 'true'
         shell: pwsh
         env:
-          MANUAL_VERSION: ${{ github.event.inputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag_name }}
         run: |
-          $rawVersion = $env:MANUAL_VERSION
-          $version = if ($rawVersion -match '^v') { $rawVersion } else { "v$rawVersion" }
-          git rev-parse --verify "$version" *> $null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Manual release version tag does not exist locally after checkout: $version"
+          $ErrorActionPreference = "Stop"
+          $headSha = (git rev-parse HEAD | Out-String).Trim()
+
+          $remoteLines = @(git ls-remote --tags origin "refs/tags/$($env:RELEASE_TAG)")
+          if ($LASTEXITCODE -ne 0 -or $remoteLines.Count -eq 0) {
+            throw "Tag $($env:RELEASE_TAG) does not exist on origin. Push the tag before publishing a release."
           }
 
-          git ls-remote --exit-code --tags origin "$version" *> $null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Manual release version tag does not exist on origin: $version"
+          $entries = @($remoteLines | ForEach-Object {
+            $parts = $_ -split "\s+"
+            [pscustomobject]@{ Sha = $parts[0]; Ref = $parts[1] }
+          })
+          $directSha = ($entries | Where-Object { $_.Ref -eq "refs/tags/$($env:RELEASE_TAG)" } | ForEach-Object { $_.Sha } | Select-Object -First 1)
+          $peeledSha = ($entries | Where-Object { $_.Ref -eq "refs/tags/$($env:RELEASE_TAG)^{}" } | ForEach-Object { $_.Sha } | Select-Object -First 1)
+          $remoteSha = if ($peeledSha) { $peeledSha } else { $directSha }
+
+          if (-not $remoteSha) {
+            throw "Cannot read the commit of tag $($env:RELEASE_TAG) on origin."
           }
+          if ($remoteSha -ne $headSha) {
+            throw "Origin tag $($env:RELEASE_TAG) is $remoteSha but this run built $headSha."
+          }
+          Write-Host "Releasing $($env:RELEASE_TAG) at $headSha"
 
       - name: Publish GitHub Release
-        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.publish_release == 'true'
+        if: steps.version.outputs.publish_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.version.outputs.tag_name }}
           name: DoRun ${{ steps.version.outputs.version }}
           files: dist/*.zip
 
-      - name: Note manual dev build
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version == ''
+      - name: Note artifact-only build
+        if: steps.version.outputs.publish_release != 'true'
         shell: pwsh
         run: |
-          Write-Host "Manual build ran without version input; artifact version falls back to dev-<sha>, and no GitHub Release is created."
-          Write-Host "Set workflow_dispatch input 'version' to create a versioned zip and release."
-
-      - name: Note build-only tag skip
-        if: github.ref_type == 'tag' && steps.version.outputs.should_build != 'true'
-        shell: pwsh
-        run: |
-          Write-Host "Skipped build because only the build segment changed for ${{ steps.version.outputs.version }}"
-          Write-Host "Manual workflow_dispatch with a version input can still force a build if needed."
+          Write-Host "Built ${{ steps.version.outputs.version }} as a workflow artifact only; no GitHub Release was created."
+          Write-Host "Re-run the workflow manually with this version to publish or repair the release."
