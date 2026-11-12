@@ -50,3 +50,6 @@ Thumbs.db
 Desktop.ini
 VERSIONING.md 
 AGENTS.md
+/docs/verification/reports/
+/docs/verification/*.log
+/docs/verification/tool/*.exe
