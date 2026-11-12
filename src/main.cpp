@@ -119,6 +119,17 @@ struct ViewerConfig {
     std::wstring commandLine;
 };
 
+// Per-invocation aliasc stderr files. aliasc reports diagnostics such as a
+// broken ShortcutMap YAML on stderr and still exits 0, so the text has to be
+// captured and surfaced or the failure stays invisible.
+struct AliasCompilerStderrPaths {
+    std::wstring version;
+    std::wstring powershell;
+    std::wstring cmd;
+    std::wstring posix;
+    std::wstring list;
+};
+
 struct AliasSupportConfig {
     std::wstring sourcePath;
     std::wstring compilerCommand;
@@ -136,6 +147,7 @@ struct AliasSupportConfig {
     std::wstring shortcutMapPath;
     std::wstring configPath;
     std::wstring supportDirectory;
+    AliasCompilerStderrPaths stderrPaths;
 };
 
 struct HistoryInfo {
@@ -332,6 +344,11 @@ struct AppState {
     std::vector<CronTask> cronTasks;
     std::vector<ManagedHotkey> managedHotkeys;
     std::vector<HotkeyRegistrationFailure> hotkeyRegistrationFailures;
+    // aliasc diagnostics (e.g. an unparsable ShortcutMap) that still need to be
+    // shown; reported once per distinct text so a persistent error does not
+    // pop up on every config reload.
+    std::wstring reportedAliasDiagnostics;
+    bool pendingAliasDiagnosticsNotice = false;
     std::array<MonitoredConfigFile, 2> monitoredConfigFiles {};
     // Periodic forced reload (CONFIG_AUTO_RELOAD_SECONDS). 0 disables it.
     int configAutoReloadSeconds = 0;
@@ -558,6 +575,11 @@ bool ParseManagedHotkeySpec(std::wstring_view text, HotkeyConfig* hotkey);
 std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey);
 void AddHotkeyRegistrationFailure(std::wstring label, std::wstring spec, DWORD errorCode);
 void ShowHotkeyRegistrationFailures();
+void ReportAliasCompilerDiagnostics(const std::wstring& diagnostics);
+std::wstring CollectAliasCompilerDiagnostics();
+void ShowPendingAliasDiagnosticsNotice();
+void AppendUtf8TextFile(const std::wstring& path, std::wstring_view content);
+std::wstring FormatLocalTimestampPrefix();
 void ConfigureKeyboardHook();
 void ReloadAllConfiguration(bool hideLauncherOnSuccess);
 void AppendHotkeyDebugLog(std::wstring_view line);
@@ -1266,11 +1288,19 @@ std::wstring BuildAliasCompilerArguments(
     return arguments;
 }
 
+// aliasc exits 0 even when it drops an invalid ShortcutMap, so every invocation
+// redirects stderr into a file that the import cycle reads back and reports.
 bool RunAliasCompiler(
     std::wstring_view compilerCommand,
     std::wstring_view arguments,
-    std::wstring_view workingDirectory) {
-    const std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments);
+    std::wstring_view workingDirectory,
+    std::wstring_view stderrPath = {}) {
+    std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments);
+    if (!stderrPath.empty()) {
+        std::error_code error;
+        std::filesystem::remove(std::wstring(stderrPath), error);
+        command += L" 2> " + QuoteCommandLineArgument(std::wstring(stderrPath));
+    }
     return RunProcessAndWaitHidden(L"cmd.exe /d /c \"" + command + L"\"", workingDirectory);
 }
 
@@ -1278,9 +1308,15 @@ bool RunAliasCompilerToFile(
     std::wstring_view compilerCommand,
     std::wstring_view arguments,
     std::wstring_view outputPath,
-    std::wstring_view workingDirectory) {
-    const std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments) +
+    std::wstring_view workingDirectory,
+    std::wstring_view stderrPath = {}) {
+    std::wstring command = std::wstring(compilerCommand) + L" " + std::wstring(arguments) +
         L" > " + QuoteCommandLineArgument(std::wstring(outputPath));
+    if (!stderrPath.empty()) {
+        std::error_code error;
+        std::filesystem::remove(std::wstring(stderrPath), error);
+        command += L" 2> " + QuoteCommandLineArgument(std::wstring(stderrPath));
+    }
     return RunProcessAndWaitHidden(L"cmd.exe /d /c \"" + command + L"\"", workingDirectory);
 }
 
@@ -1331,6 +1367,7 @@ bool CompileAliasArtifacts() {
 
     const std::wstring workingDirectory = ResolveAliasWorkingDirectory();
     const std::wstring shortcutMapPath = g_state.aliasSupport.shortcutMapPath;
+    const AliasCompilerStderrPaths& stderrPaths = g_state.aliasSupport.stderrPaths;
     const bool powershellCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         BuildAliasCompilerArguments(
@@ -1340,7 +1377,8 @@ bool CompileAliasArtifacts() {
             g_state.aliasSupport.powershellOutputPath,
             L"windows",
             shortcutMapPath),
-        workingDirectory);
+        workingDirectory,
+        stderrPaths.powershell);
     const bool cmdCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         BuildAliasCompilerArguments(
@@ -1350,7 +1388,8 @@ bool CompileAliasArtifacts() {
             g_state.aliasSupport.cmdOutputPath,
             L"windows",
             shortcutMapPath),
-        workingDirectory);
+        workingDirectory,
+        stderrPaths.cmd);
     const bool posixCompiled = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         BuildAliasCompilerArguments(
@@ -1360,7 +1399,8 @@ bool CompileAliasArtifacts() {
             g_state.aliasSupport.posixOutputPath,
             L"auto",
             shortcutMapPath),
-        workingDirectory);
+        workingDirectory,
+        stderrPaths.posix);
 
     if (cmdCompiled) {
         SaveUtf8TextFile(
@@ -1387,7 +1427,127 @@ bool CompileAliasArtifacts() {
             L". " + QuoteForShellScript(g_state.aliasSupport.posixOutputPath) + L"\n");
     }
 
+    // Only a non-zero exit is reported here. A broken ShortcutMap still exits
+    // 0, so it is caught after the list step instead.
+    if (!powershellCompiled || !cmdCompiled || !posixCompiled) {
+        ReportAliasCompilerDiagnostics(CollectAliasCompilerDiagnostics());
+    }
     return powershellCompiled;
+}
+
+// aliasc writes diagnostics (broken ShortcutMap YAML, unreadable source, ...)
+// to stderr while still exiting 0, so a bad ShortcutMap silently produces an
+// import that is missing every mapped entry. Collect what the last cycle said.
+std::wstring CollapseAliasDiagnosticText(const std::wstring& text) {
+    // aliasc errors span several lines (message, source line, caret marker).
+    // Keeping them on one line keeps the debug log greppable.
+    std::wstring collapsed;
+    collapsed.reserve(text.size());
+    bool previousWasSeparator = false;
+    for (const wchar_t ch : text) {
+        const bool isSeparator = ch == L'\r' || ch == L'\n' || ch == L'\t';
+        if (isSeparator) {
+            if (!previousWasSeparator) {
+                collapsed += L" | ";
+            }
+            previousWasSeparator = true;
+            continue;
+        }
+        previousWasSeparator = false;
+        collapsed += ch;
+    }
+    return Trim(collapsed);
+}
+
+std::wstring CollectAliasCompilerDiagnostics() {
+    const AliasCompilerStderrPaths& paths = g_state.aliasSupport.stderrPaths;
+    const std::wstring* diagnosticFiles[] = {
+        &paths.list,
+        &paths.powershell,
+        &paths.cmd,
+        &paths.posix,
+        &paths.version,
+    };
+
+    std::wstring diagnostics;
+    for (const std::wstring* path : diagnosticFiles) {
+        if (path->empty()) {
+            continue;
+        }
+        const std::wstring text = Trim(LoadUtf8TextFile(*path));
+        if (text.empty() || diagnostics.find(text) != std::wstring::npos) {
+            continue;
+        }
+        if (!diagnostics.empty()) {
+            diagnostics += L"\n";
+        }
+        diagnostics += text;
+    }
+    return diagnostics;
+}
+
+void ReportAliasCompilerDiagnostics(const std::wstring& diagnostics) {
+    const std::wstring diagnosticsLogPath =
+        g_state.aliasSupport.supportDirectory.empty()
+            ? std::wstring()
+            : (std::filesystem::path(g_state.aliasSupport.supportDirectory) /
+               L"aliasc-diagnostics.log").wstring();
+
+    if (diagnostics.empty()) {
+        if (!g_state.reportedAliasDiagnostics.empty()) {
+            g_state.reportedAliasDiagnostics.clear();
+            g_state.pendingAliasDiagnosticsNotice = false;
+            if (!diagnosticsLogPath.empty()) {
+                AppendUtf8TextFile(diagnosticsLogPath, FormatLocalTimestampPrefix() + L"[cleared]\n");
+            }
+            AppendHotkeyDebugLog(L"aliasc diagnostics cleared.");
+        }
+        return;
+    }
+
+    // A persistent error would otherwise be re-logged on every import cycle.
+    if (diagnostics == g_state.reportedAliasDiagnostics) {
+        return;
+    }
+    g_state.reportedAliasDiagnostics = diagnostics;
+
+    // The hotkey debug log is opt-in, so the diagnostics also land in the
+    // alias-support directory where they are discoverable after the fact.
+    const std::wstring collapsed = CollapseAliasDiagnosticText(diagnostics);
+    if (!diagnosticsLogPath.empty()) {
+        AppendUtf8TextFile(diagnosticsLogPath, FormatLocalTimestampPrefix() + collapsed + L"\n");
+    }
+    AppendHotkeyDebugLog(L"aliasc diagnostics: " + collapsed);
+
+    // Reloads run in the background while the user is typing, so the actual
+    // message box is deferred until the launcher is shown next.
+    g_state.pendingAliasDiagnosticsNotice = true;
+}
+
+// Called from ShowLauncher: the import may have failed long before the user
+// opened the launcher, and a modal box at that point would steal focus.
+void ShowPendingAliasDiagnosticsNotice() {
+    if (!g_state.pendingAliasDiagnosticsNotice || g_state.reportedAliasDiagnostics.empty()) {
+        return;
+    }
+    if (g_state.hostWindow == nullptr) {
+        return;
+    }
+
+    g_state.pendingAliasDiagnosticsNotice = false;
+    const std::wstring message =
+        L"aliasc reported a problem while importing aliases and ShortcutMap entries:\n\n" +
+        g_state.reportedAliasDiagnostics +
+        L"\n\nEntries from the failed source are missing until this is fixed.\n"
+        L"Details: " + g_state.aliasSupport.supportDirectory +
+        L"\\aliasc-diagnostics.log";
+    // The launcher is not visible yet, so the box has to claim the foreground
+    // itself; otherwise a warning nobody sees is the only notification.
+    MessageBoxW(
+        g_state.launcherWindow != nullptr ? g_state.launcherWindow : g_state.hostWindow,
+        message.c_str(),
+        L"DoRun Alias Import",
+        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 std::wstring MakeAliasRunnerCommandLine(std::wstring_view runnerPath, std::wstring_view aliasName) {
@@ -1528,11 +1688,24 @@ void ConfigureAliasSupport(const std::wstring& configPath, const std::wstring& c
     g_state.aliasSupport.powershellRunnerPath = (supportDirectory / L"aliasc-powershell-runner.ps1").wstring();
     g_state.aliasSupport.posixOutputPath = (supportDirectory / L"aliasc-posix.sh").wstring();
     g_state.aliasSupport.posixBootstrapPath = (supportDirectory / L"aliasc-posix-bootstrap.sh").wstring();
+    g_state.aliasSupport.stderrPaths.version = (supportDirectory / L"aliasc-version.stderr.txt").wstring();
+    g_state.aliasSupport.stderrPaths.powershell = (supportDirectory / L"aliasc-powershell.stderr.txt").wstring();
+    g_state.aliasSupport.stderrPaths.cmd = (supportDirectory / L"aliasc-cmd.stderr.txt").wstring();
+    g_state.aliasSupport.stderrPaths.posix = (supportDirectory / L"aliasc-posix.stderr.txt").wstring();
+    g_state.aliasSupport.stderrPaths.list = (supportDirectory / L"aliasc-list.stderr.txt").wstring();
     g_state.aliasSupport.compilerReady = RunAliasCompiler(
         g_state.aliasSupport.compilerCommand,
         L"--version",
-        std::filesystem::path(configPath).parent_path().wstring());
+        std::filesystem::path(configPath).parent_path().wstring(),
+        g_state.aliasSupport.stderrPaths.version);
     if (!g_state.aliasSupport.compilerReady) {
+        // A missing or broken aliasc disables the whole import; say so instead
+        // of silently dropping every alias and ShortcutMap entry.
+        std::wstring diagnostics = CollectAliasCompilerDiagnostics();
+        if (diagnostics.empty()) {
+            diagnostics = L"Compiler command failed: " + g_state.aliasSupport.compilerCommand;
+        }
+        ReportAliasCompilerDiagnostics(diagnostics);
         return;
     }
 
@@ -3547,11 +3720,9 @@ std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey) {
     return text;
 }
 
-void AppendHotkeyDebugLog(std::wstring_view line) {
-    if (!g_state.hotkey.debugLoggingEnabled) {
-        return;
-    }
-
+// Shared timestamp prefix so the hotkey debug log and the alias diagnostics log
+// can be compared line by line.
+std::wstring FormatLocalTimestampPrefix() {
     SYSTEMTIME localTime {};
     GetLocalTime(&localTime);
 
@@ -3566,8 +3737,15 @@ void AppendHotkeyDebugLog(std::wstring_view line) {
         localTime.wMinute,
         localTime.wSecond,
         localTime.wMilliseconds);
+    return prefix;
+}
 
-    std::wstring message = prefix;
+void AppendHotkeyDebugLog(std::wstring_view line) {
+    if (!g_state.hotkey.debugLoggingEnabled) {
+        return;
+    }
+
+    std::wstring message = FormatLocalTimestampPrefix();
     message += line;
     message += L"\n";
     AppendUtf8TextFile(GetHotkeyDebugLogPath(), message);
@@ -6831,21 +7009,30 @@ void LoadAliasCommandItems(bool appendToResultItems) {
             g_state.aliasSupport.compilerCommand,
             plainListArguments + L" --format tsv",
             listFilePath,
-            workingDirectory);
+            workingDirectory,
+            g_state.aliasSupport.stderrPaths.list);
     }
     if (!listed) {
         listed = RunAliasCompilerToFile(
             g_state.aliasSupport.compilerCommand,
             plainListArguments,
             listFilePath,
-            workingDirectory);
+            workingDirectory,
+            g_state.aliasSupport.stderrPaths.list);
     }
     if (!listed) {
+        // Even a failed list can carry the reason (e.g. an unreadable source),
+        // so report what ran before bailing out.
+        ReportAliasCompilerDiagnostics(CollectAliasCompilerDiagnostics());
         if (g_state.aliasImportCache.valid) {
             AppendAliasItemsToCollections(g_state.aliasImportCache.items, appendToResultItems);
         }
         return;
     }
+    // The list step is where an invalid ShortcutMap turns into a silently
+    // short import (aliasc still exits 0), so surface its stderr before the
+    // shortened item list is cached.
+    ReportAliasCompilerDiagnostics(CollectAliasCompilerDiagnostics());
 
     std::wstringstream stream(LoadUtf8TextFile(listFilePath));
     std::wstring line;
@@ -8558,6 +8745,10 @@ void ShowLauncher() {
     LayoutLauncher();
     ClearCopyFeedback(false);
     UpdateSelectedItemDescription();
+    // Report a failed alias import before the launcher becomes visible: the
+    // notice is modal, and showing it afterwards would leave the launcher
+    // hidden by the visibility timer when the box takes the foreground.
+    ShowPendingAliasDiagnosticsNotice();
     ShowWindow(g_state.launcherWindow, SW_SHOW);
     SetForegroundWindow(g_state.launcherWindow);
     SetFocus(g_state.searchEdit);
