@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -55,10 +56,39 @@ struct ClipboardConfig {
     HotkeyConfig hotkey {};
     int maxRows = 500;
     int visibleItemCount = 12;
+    bool captureText = true;
+    bool captureRichText = true;
+    bool captureImages = true;
+    bool captureFiles = true;
 };
 
+enum class ClipboardEntryKind {
+    Text,
+    RichText,
+    Image,
+    Files,
+};
+
+// One history entry mirrors the representations the source application put on
+// the clipboard (Explorer copies files, Word copies RTF plus plain text, Paint
+// copies a DIB). Text is kept inline; RTF and image payloads are stored as blob
+// files inside the clipboard store, named after a content hash so an identical
+// re-copy reuses the same blob.
 struct ClipboardEntry {
+    ClipboardEntryKind kind = ClipboardEntryKind::Text;
+    // Plain-text payload; empty for file and image entries.
     std::wstring text;
+    // CF_HDROP paths for file entries.
+    std::vector<std::wstring> files;
+    // Blob hash of the Rich Text Format payload, 0 when there is none.
+    ULONGLONG rtfHash = 0;
+    // Blob hash of the DIB payload, 0 when there is none.
+    ULONGLONG imageHash = 0;
+    // Clipboard identifier the image blob was captured from (CF_DIB or
+    // CF_DIBV5) so it is restored under the same format.
+    DWORD imageFormat = 0;
+    int imageWidth = 0;
+    int imageHeight = 0;
 };
 
 struct LauncherAppearanceConfig {
@@ -245,6 +275,12 @@ struct AppState {
     HFONT clipboardPreviewFont = nullptr;
     HBRUSH clipboardBackgroundBrush = nullptr;
     std::vector<ClipboardEntry> clipboardEntries;
+    // Decoded image thumbnails keyed by blob hash, with insertion/recency order
+    // for eviction. A single slot would re-decode the DIB of every image row on
+    // each WM_DRAWITEM pass.
+    std::unordered_map<ULONGLONG, HBITMAP> clipboardThumbnails;
+    std::vector<ULONGLONG> clipboardThumbnailOrder;
+
     HWND clipboardReturnWindow = nullptr;
     DWORD lastClipboardSequenceNumber = 0;
     HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -370,8 +406,21 @@ constexpr UINT kClipboardPasteDelayMs = 120;
 constexpr UINT kClipboardPollIntervalMs = 400;
 constexpr size_t kClipboardPreviewLength = 240;
 constexpr size_t kClipboardPreviewPopupLimit = 1200;
-// Very large payloads (e.g. whole-document copies) are not worth persisting.
+// Very large text payloads (e.g. whole-document copies) are not worth
+// persisting, but the matching RTF/image blob still is, so it has a separate
+// and larger budget.
 constexpr size_t kClipboardMaxEntryLength = 512 * 1024;
+constexpr size_t kClipboardMaxBlobBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr size_t kClipboardMaxFileCount = 200;
+// The history file itself, plus the blob directory next to it.
+constexpr wchar_t kClipboardHistoryMagic[] = L"DoRunClipboardHistoryV2";
+constexpr wchar_t kClipboardBlobDirectoryName[] = L"clipboard-blobs";
+// "Rich Text Format" is the name Windows registers as CF_RTF.
+constexpr wchar_t kClipboardRtfFormatName[] = L"Rich Text Format";
+// "Preferred DropEffect" carries DROPEFFECT_COPY for file copies.
+constexpr wchar_t kClipboardDropEffectFormatName[] = L"Preferred DropEffect";
+// How many decoded thumbnails stay cached; one full popup page is plenty.
+constexpr size_t kClipboardThumbnailCacheLimit = 12;
 constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
@@ -451,6 +500,21 @@ void PasteSelectedClipboardEntry();
 void InjectPasteKeystroke();
 void InjectPasteIntoClipboardTarget();
 void DrawClipboardListItem(const DRAWITEMSTRUCT& draw);
+bool DrawClipboardImageThumbnail(HDC dc, const ClipboardEntry& entry, RECT thumbnailRect);
+HBITMAP LoadClipboardImageBitmap(const ClipboardEntry& entry);
+std::wstring BuildClipboardEntryLabel(const ClipboardEntry& entry);
+std::wstring BuildClipboardEntryDescription(const ClipboardEntry& entry);
+std::wstring BuildClipboardImageSummary(int width, int height, DWORD format);
+std::wstring GetClipboardEntriesPath();
+std::wstring GetClipboardBlobDirectory();
+void SaveClipboardEntriesToFile(bool pruneBlobs);
+std::wstring ClipboardBlobPath(ULONGLONG hash, bool richText);
+std::vector<char> ReadClipboardBlob(ULONGLONG hash, bool richText);
+bool ClipboardEntriesMatch(const ClipboardEntry& left, const ClipboardEntry& right);
+void PruneClipboardBlobs();
+void ResetClipboardThumbnailCache();
+std::vector<char> ConvertClipboardDibToBitmapInfoHeader(const std::vector<char>& dib);
+size_t ClipboardDibHeaderBytes(const std::vector<char>& dib);
 int ClipboardListItemHeight();
 int ClipboardHintLineCount();
 std::wstring BuildClipboardHintText();
@@ -460,7 +524,13 @@ bool AreHotkeyRequiredModifiersHeld(UINT modifiers);
 COLORREF BlendColor(COLORREF base, COLORREF overlay, int overlayWeightPercent);
 bool IsClipboardWindow(HWND window);
 bool CopyTextToClipboard(std::wstring_view text);
-void AddClipboardEntry(std::wstring text);
+bool SetClipboardFormatData(UINT format, const void* data, size_t size);
+bool SetClipboardUnicodeText(std::wstring_view text);
+bool SetClipboardDropFiles(const std::vector<std::wstring>& files);
+bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry);
+void AddClipboardEntry(ClipboardEntry entry);
+void StoreClipboardEntry(ClipboardEntry entry, const std::vector<char>& rtfData, const std::vector<char>& imageData);
+bool CaptureClipboardEntry(ClipboardEntry* entry, std::vector<char>* rtfData, std::vector<char>* imageData);
 void ApplyClipboardFonts();
 void CopySelectedCommandLine();
 void ClearCopyFeedback(bool refreshDescription = true);
@@ -2301,6 +2371,18 @@ void LoadClipboardConfig() {
     if (const std::optional<int> visibleItemCount = ParseYamlInt(content, L"CLIPBOARD_VISIBLE_ITEM_COUNT")) {
         g_state.clipboardConfig.visibleItemCount = std::clamp(*visibleItemCount, 1, 40);
     }
+    if (const std::optional<bool> captureText = ParseYamlBool(content, L"CLIPBOARD_CAPTURE_TEXT")) {
+        g_state.clipboardConfig.captureText = *captureText;
+    }
+    if (const std::optional<bool> captureRichText = ParseYamlBool(content, L"CLIPBOARD_CAPTURE_RICH_TEXT")) {
+        g_state.clipboardConfig.captureRichText = *captureRichText;
+    }
+    if (const std::optional<bool> captureImages = ParseYamlBool(content, L"CLIPBOARD_CAPTURE_IMAGES")) {
+        g_state.clipboardConfig.captureImages = *captureImages;
+    }
+    if (const std::optional<bool> captureFiles = ParseYamlBool(content, L"CLIPBOARD_CAPTURE_FILES")) {
+        g_state.clipboardConfig.captureFiles = *captureFiles;
+    }
 
     const std::optional<std::wstring> hotkeySpec = ParseYamlString(content, L"CLIPBOARD_HOTKEY");
     if (!hotkeySpec) {
@@ -3694,51 +3776,276 @@ void LoadHistoryCache() {
     sqlite3_close(database);
 }
 
+
 // ---------------------------------------------------------------------------
-// Clipboard history storage (plain text entries, newest first).
+// Clipboard history storage
+//
+// The history is an index file (one entry per line, newest first) plus a blob
+// directory holding the Rich Text Format and image payloads. Blobs are named
+// after a content hash, so an identical re-copy reuses the existing file and
+// entries only carry the hash instead of megabytes of DIB bytes.
 // ---------------------------------------------------------------------------
 
-std::wstring GetClipboardEntriesPath() {
+std::wstring GetClipboardStoreDirectory() {
     const std::wstring localAppDataDirectory = GetLocalAppDataDirectory();
     if (localAppDataDirectory.empty()) {
-        return (std::filesystem::path(GetModuleDirectory()) / L"clipboard-history.txt").wstring();
+        return GetModuleDirectory();
     }
-    return (std::filesystem::path(localAppDataDirectory) / L"clipboard-history.txt").wstring();
+    return localAppDataDirectory;
 }
 
-// Entries are stored one per line, so control characters are escaped.
-void SaveClipboardEntriesToFile() {
-    std::wstring content;
-    for (const ClipboardEntry& entry : g_state.clipboardEntries) {
-        std::wstring escaped;
-        escaped.reserve(entry.text.size());
-        for (const wchar_t ch : entry.text) {
-            switch (ch) {
-            case L'\\':
-                escaped += L"\\\\";
-                break;
-            case L'\n':
-                escaped += L"\\n";
-                break;
-            case L'\r':
-                escaped += L"\\r";
-                break;
-            case L'\t':
-                escaped += L"\\t";
-                break;
-            default:
-                escaped.push_back(ch);
-                break;
-            }
+std::wstring GetClipboardEntriesPath() {
+    return (std::filesystem::path(GetClipboardStoreDirectory()) / L"clipboard-history.txt").wstring();
+}
+
+std::wstring GetClipboardBlobDirectory() {
+    return (std::filesystem::path(GetClipboardStoreDirectory()) / kClipboardBlobDirectoryName).wstring();
+}
+
+std::wstring ClipboardBlobFileName(ULONGLONG hash, bool richText) {
+    wchar_t buffer[32] {};
+    swprintf_s(buffer, L"%016llX", static_cast<unsigned long long>(hash));
+    return std::wstring(buffer) + (richText ? L".rtf" : L".dib");
+}
+
+std::wstring ClipboardBlobPath(ULONGLONG hash, bool richText) {
+    return (std::filesystem::path(GetClipboardBlobDirectory()) / ClipboardBlobFileName(hash, richText)).wstring();
+}
+
+// FNV-1a 64-bit: stable across runs, which is all the blob names need. A zero
+// hash is reserved for "no blob", so it is remapped. The distinct high bits are
+// also mixed in at the end so two different payloads cannot collide after a
+// single multiply step.
+ULONGLONG HashClipboardBytes(const void* data, size_t size) {
+    ULONGLONG hash = 1469598103934665603ULL;
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 32;
+    hash *= 0x9E3779B97F4A7C15ULL;
+    hash ^= hash >> 29;
+    return hash == 0 ? 1 : hash;
+}
+
+bool WriteClipboardBlob(ULONGLONG hash, bool richText, const std::vector<char>& data) {
+    if (hash == 0 || data.empty()) {
+        return false;
+    }
+    const std::wstring path = ClipboardBlobPath(hash, richText);
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        // Same content hash: the existing blob is byte-identical.
+        return true;
+    }
+
+    const std::filesystem::path directory = std::filesystem::path(path).parent_path();
+    if (!directory.empty()) {
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            return false;
         }
-        content += escaped;
+    }
+
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream.is_open()) {
+        return false;
+    }
+    stream.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return stream.good();
+}
+
+std::vector<char> ReadClipboardBlob(ULONGLONG hash, bool richText) {
+    std::vector<char> data;
+    if (hash == 0) {
+        return data;
+    }
+    std::ifstream stream(ClipboardBlobPath(hash, richText), std::ios::binary);
+    if (!stream.is_open()) {
+        return data;
+    }
+    data.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    return data;
+}
+
+// Deletes blobs that no history entry references any more.
+void PruneClipboardBlobs() {
+    const std::wstring directory = GetClipboardBlobDirectory();
+    std::error_code error;
+    if (!std::filesystem::exists(directory, error)) {
+        return;
+    }
+
+    std::unordered_set<std::wstring> referenced;
+    for (const ClipboardEntry& entry : g_state.clipboardEntries) {
+        if (entry.rtfHash != 0) {
+            referenced.insert(ClipboardBlobFileName(entry.rtfHash, true));
+        }
+        if (entry.imageHash != 0) {
+            referenced.insert(ClipboardBlobFileName(entry.imageHash, false));
+        }
+    }
+
+    for (const auto& item : std::filesystem::directory_iterator(directory, error)) {
+        if (error) {
+            return;
+        }
+        const std::wstring fileName = item.path().filename().wstring();
+        if (referenced.find(fileName) != referenced.end()) {
+            continue;
+        }
+        std::error_code removeError;
+        std::filesystem::remove(item.path(), removeError);
+    }
+}
+
+const wchar_t* ClipboardEntryKindToken(ClipboardEntryKind kind) {
+    switch (kind) {
+    case ClipboardEntryKind::RichText:
+        return L"rtf";
+    case ClipboardEntryKind::Image:
+        return L"image";
+    case ClipboardEntryKind::Files:
+        return L"files";
+    case ClipboardEntryKind::Text:
+    default:
+        return L"text";
+    }
+}
+
+bool ParseClipboardEntryKind(std::wstring_view token, ClipboardEntryKind* kind) {
+    if (kind == nullptr) {
+        return false;
+    }
+    if (token == L"rtf") {
+        *kind = ClipboardEntryKind::RichText;
+    } else if (token == L"image") {
+        *kind = ClipboardEntryKind::Image;
+    } else if (token == L"files") {
+        *kind = ClipboardEntryKind::Files;
+    } else if (token == L"text") {
+        *kind = ClipboardEntryKind::Text;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// True when both entries describe the same clipboard payload. Blob payloads are
+// compared by their content hash, so nothing has to be read from disk.
+bool ClipboardEntriesMatch(const ClipboardEntry& left, const ClipboardEntry& right) {
+    return left.kind == right.kind &&
+        left.text == right.text &&
+        left.files == right.files &&
+        left.rtfHash == right.rtfHash &&
+        left.imageHash == right.imageHash;
+}
+
+std::wstring JoinClipboardPaths(const std::vector<std::wstring>& paths) {
+    std::wstring joined;
+    for (size_t index = 0; index < paths.size(); ++index) {
+        if (index > 0) {
+            // Paths never contain control characters, so a unit separator is
+            // safe once the whole field has been escaped.
+            joined.push_back(static_cast<wchar_t>(0x1F));
+        }
+        joined += paths[index];
+    }
+    return joined;
+}
+
+std::vector<std::wstring> SplitClipboardPaths(std::wstring_view joined) {
+    std::vector<std::wstring> paths;
+    size_t start = 0;
+    while (start <= joined.size()) {
+        size_t end = joined.find(static_cast<wchar_t>(0x1F), start);
+        if (end == std::wstring_view::npos) {
+            end = joined.size();
+        }
+        if (end > start) {
+            paths.push_back(std::wstring(joined.substr(start, end - start)));
+        }
+        if (end >= joined.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+    return paths;
+}
+
+// Hash and dimension fields are written with std::to_wstring, so only plain
+// decimal digits are expected back. Any other input is treated as absent.
+ULONGLONG ParseClipboardHash(std::wstring_view text) {
+    if (text.empty()) {
+        return 0;
+    }
+    unsigned long long value = 0;
+    for (const wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9') {
+            return 0;
+        }
+        const unsigned long long digit = static_cast<unsigned long long>(ch - L'0');
+        if (value > (std::numeric_limits<unsigned long long>::max() - digit) / 10) {
+            return 0;
+        }
+        value = value * 10 + digit;
+    }
+    return static_cast<ULONGLONG>(value);
+}
+
+int ParseClipboardInt(std::wstring_view text) {
+    if (text.empty()) {
+        return 0;
+    }
+    long value = 0;
+    for (const wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9') {
+            return 0;
+        }
+        const int digit = static_cast<int>(ch - L'0');
+        if (value > (static_cast<long>(std::numeric_limits<int>::max()) - digit) / 10) {
+            return 0;
+        }
+        value = value * 10 + digit;
+    }
+    return static_cast<int>(value);
+}
+
+void SaveClipboardEntriesToFile(bool pruneBlobs) {
+    std::wstring content = kClipboardHistoryMagic;
+    content += L"\n";
+    for (const ClipboardEntry& entry : g_state.clipboardEntries) {
+        content += ClipboardEntryKindToken(entry.kind);
+        content += L"\t";
+        content += EscapeCacheField(entry.text);
+        content += L"\t";
+        content += EscapeCacheField(JoinClipboardPaths(entry.files));
+        content += L"\t";
+        content += std::to_wstring(entry.imageFormat);
+        content += L"\t";
+        content += std::to_wstring(entry.imageWidth);
+        content += L"\t";
+        content += std::to_wstring(entry.imageHeight);
+        content += L"\t";
+        content += std::to_wstring(entry.rtfHash);
+        content += L"\t";
+        content += std::to_wstring(entry.imageHash);
         content += L"\n";
     }
 
     const std::wstring path = GetClipboardEntriesPath();
     std::error_code error;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+    // The store directory also holds the blob folder, which pruning may need to
+    // walk even when the index itself is unchanged.
+    std::filesystem::create_directories(GetClipboardBlobDirectory(), error);
     SaveUtf8TextFile(path, content);
+    if (pruneBlobs) {
+        // Only expired entries need this; saving on every copy would scan the
+        // blob directory needlessly.
+        PruneClipboardBlobs();
+    }
 }
 
 void TrimClipboardEntries() {
@@ -3748,120 +4055,250 @@ void TrimClipboardEntries() {
     }
 }
 
+// Loads the v2 index. Files written by older DoRun versions are plain text, one
+// entry per line, and are migrated in place.
 void LoadClipboardEntriesFromFile() {
     g_state.clipboardEntries.clear();
+    ResetClipboardThumbnailCache();
 
     const std::wstring content = LoadUtf8TextFile(GetClipboardEntriesPath());
     if (content.empty()) {
         return;
     }
 
+    std::vector<std::wstring> lines;
     for (size_t index = 0; index < content.size();) {
         size_t end = content.find(L'\n', index);
         if (end == std::wstring::npos) {
             end = content.size();
         }
-
         std::wstring line = content.substr(index, end - index);
         index = end + 1;
         if (!line.empty() && line.back() == L'\r') {
             line.pop_back();
         }
+        lines.push_back(std::move(line));
+    }
 
-        std::wstring text;
-        text.reserve(line.size());
-        for (size_t pos = 0; pos < line.size(); ++pos) {
-            const wchar_t ch = line[pos];
-            if (ch == L'\\' && pos + 1 < line.size()) {
-                const wchar_t next = line[++pos];
-                if (next == L'n') {
-                    text.push_back(L'\n');
-                } else if (next == L'r') {
-                    text.push_back(L'\r');
-                } else if (next == L't') {
-                    text.push_back(L'\t');
-                } else {
-                    text.push_back(next);
-                }
-                continue;
-            }
-            text.push_back(ch);
-        }
+    const bool currentFormat = !lines.empty() && lines.front() == kClipboardHistoryMagic;
+    const size_t firstLine = currentFormat ? 1 : 0;
 
-        if (text.empty()) {
+    for (size_t lineIndex = firstLine; lineIndex < lines.size(); ++lineIndex) {
+        const std::wstring& line = lines[lineIndex];
+        if (line.empty()) {
             continue;
         }
 
+        if (!currentFormat) {
+            // Legacy plain-text entry: the whole line is one escaped text.
+            std::wstring text = UnescapeCacheField(line);
+            if (text.empty() || text.size() > kClipboardMaxEntryLength) {
+                continue;
+            }
+            ClipboardEntry legacyEntry {};
+            legacyEntry.kind = ClipboardEntryKind::Text;
+            legacyEntry.text = std::move(text);
+            g_state.clipboardEntries.push_back(std::move(legacyEntry));
+            continue;
+        }
+
+        std::vector<std::wstring> fields;
+        std::wstring current;
+        bool escaped = false;
+        for (const wchar_t ch : line) {
+            if (!escaped && ch == L'\t') {
+                fields.push_back(std::move(current));
+                current.clear();
+                continue;
+            }
+            current.push_back(ch);
+            if (escaped) {
+                escaped = false;
+            } else if (ch == L'\\') {
+                escaped = true;
+            }
+        }
+        fields.push_back(std::move(current));
+
         ClipboardEntry entry {};
-        entry.text = std::move(text);
+        if (fields.size() < 2 || !ParseClipboardEntryKind(fields[0], &entry.kind)) {
+            continue;
+        }
+        entry.text = UnescapeCacheField(fields[1]);
+        if (fields.size() > 2) {
+            entry.files = SplitClipboardPaths(UnescapeCacheField(fields[2]));
+        }
+        if (fields.size() > 3) {
+            entry.imageFormat = static_cast<DWORD>(ParseClipboardInt(fields[3]));
+        }
+        if (fields.size() > 4) {
+            entry.imageWidth = ParseClipboardInt(fields[4]);
+        }
+        if (fields.size() > 5) {
+            entry.imageHeight = ParseClipboardInt(fields[5]);
+        }
+        if (fields.size() > 6) {
+            entry.rtfHash = ParseClipboardHash(fields[6]);
+        }
+        if (fields.size() > 7) {
+            entry.imageHash = ParseClipboardHash(fields[7]);
+        }
+
+        const bool empty = entry.text.empty() && entry.files.empty() && entry.rtfHash == 0 && entry.imageHash == 0;
+        if (empty) {
+            continue;
+        }
+        if (entry.text.size() > kClipboardMaxEntryLength) {
+            entry.text.clear();
+        }
         g_state.clipboardEntries.push_back(std::move(entry));
     }
 
     TrimClipboardEntries();
+    if (!currentFormat && !g_state.clipboardEntries.empty()) {
+        // Migrated from the legacy format, so rewrite the index now.
+        SaveClipboardEntriesToFile(false);
+    }
 }
 
-void AddClipboardEntry(std::wstring text) {
-    if (text.empty() || text.size() > kClipboardMaxEntryLength) {
+// Adds an entry to the history. Blobs must already be on disk; re-copying an
+// existing payload moves that entry back to the top instead of duplicating it.
+void AddClipboardEntry(ClipboardEntry entry) {
+    if (entry.text.size() > kClipboardMaxEntryLength) {
+        entry.text.clear();
+    }
+    const bool empty = entry.text.empty() && entry.files.empty() && entry.rtfHash == 0 && entry.imageHash == 0;
+    if (empty) {
         return;
     }
 
-    // Re-copying an older entry moves it back to the top; an unchanged newest
-    // entry is left alone so polling does not churn the list.
+    // An unchanged newest entry is left alone so polling does not churn the
+    // list; a re-copy of an older entry moves it back to the top.
     const auto existing = std::find_if(
         g_state.clipboardEntries.begin(),
         g_state.clipboardEntries.end(),
-        [&text](const ClipboardEntry& entry) { return entry.text == text; });
+        [&entry](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, entry); });
     if (existing != g_state.clipboardEntries.end()) {
         if (existing == g_state.clipboardEntries.begin()) {
             return;
         }
-        ClipboardEntry entry = std::move(*existing);
+        ClipboardEntry moved = std::move(*existing);
         g_state.clipboardEntries.erase(existing);
-        g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(entry));
-        SaveClipboardEntriesToFile();
+        g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(moved));
+        SaveClipboardEntriesToFile(false);
         return;
     }
 
-    ClipboardEntry entry {};
-    entry.text = std::move(text);
     g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(entry));
-
+    const size_t previousCount = g_state.clipboardEntries.size();
     TrimClipboardEntries();
-    SaveClipboardEntriesToFile();
+    SaveClipboardEntriesToFile(g_state.clipboardEntries.size() != previousCount);
 }
 
-bool GetClipboardUnicodeText(std::wstring* text) {
-    if (text == nullptr) {
+// Persists the entry's blobs (reusing byte-identical ones already on disk) and
+// then adds it to the history.
+void StoreClipboardEntry(ClipboardEntry entry, const std::vector<char>& rtfData, const std::vector<char>& imageData) {
+    if (entry.rtfHash != 0 && !rtfData.empty()) {
+        WriteClipboardBlob(entry.rtfHash, true, rtfData);
+    }
+    if (entry.imageHash != 0 && !imageData.empty()) {
+        WriteClipboardBlob(entry.imageHash, false, imageData);
+    }
+    AddClipboardEntry(std::move(entry));
+}
+
+// Copies a global-memory clipboard payload into a byte vector. Returns false
+// when the handle is missing, empty, or larger than the blob budget.
+bool ReadClipboardBlobData(HANDLE handle, std::vector<char>* data) {
+    if (handle == nullptr || data == nullptr) {
         return false;
     }
-    text->clear();
-
-    if (OpenClipboard(g_state.hostWindow) == FALSE) {
+    const size_t size = GlobalSize(handle);
+    if (size == 0 || size > kClipboardMaxBlobBytes) {
         return false;
     }
+    const void* pointer = GlobalLock(handle);
+    if (pointer == nullptr) {
+        return false;
+    }
+    data->assign(static_cast<const char*>(pointer), static_cast<const char*>(pointer) + size);
+    GlobalUnlock(handle);
+    return true;
+}
 
-    bool success = false;
-    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
-    if (handle != nullptr) {
-        const wchar_t* data = static_cast<const wchar_t*>(GlobalLock(handle));
-        if (data != nullptr) {
-            // CF_UNICODETEXT is NUL terminated, but GlobalSize bounds the scan
-            // in case the producer forgot the terminator.
-            const size_t maxLength = GlobalSize(handle) / sizeof(wchar_t);
-            if (maxLength > 0) {
-                size_t length = 0;
-                while (length < maxLength && data[length] != L'\0') {
-                    ++length;
-                }
-                text->assign(data, length);
-                success = true;
-            }
-            GlobalUnlock(handle);
+bool ReadClipboardTextData(HANDLE handle, std::wstring* text) {
+    if (handle == nullptr || text == nullptr) {
+        return false;
+    }
+    const wchar_t* data = static_cast<const wchar_t*>(GlobalLock(handle));
+    if (data == nullptr) {
+        return false;
+    }
+    // CF_UNICODETEXT is NUL terminated, but GlobalSize bounds the scan in case
+    // the producer forgot the terminator.
+    const size_t maxLength = GlobalSize(handle) / sizeof(wchar_t);
+    size_t length = 0;
+    while (length < maxLength && data[length] != L'\0') {
+        ++length;
+    }
+    text->assign(data, length);
+    GlobalUnlock(handle);
+    return true;
+}
+
+// CF_HDROP wraps a DROPFILES header followed by the file list. The paths are
+// enumerated with DragQueryFileW, which also copes with long names.
+std::vector<std::wstring> ReadClipboardDropFiles(HANDLE handle) {
+    std::vector<std::wstring> paths;
+    if (handle == nullptr) {
+        return paths;
+    }
+    // A CF_HDROP value *is* an HGLOBAL holding a DROPFILES header plus the path
+    // list, and DragQueryFileW expects exactly that handle, not a locked
+    // pointer, so the handle is passed through unchanged.
+    const HDROP drop = reinterpret_cast<HDROP>(handle);
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    const UINT limit = static_cast<UINT>(std::min<size_t>(count, kClipboardMaxFileCount));
+    for (UINT index = 0; index < limit; ++index) {
+        const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+        if (length == 0) {
+            continue;
+        }
+        std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+        if (DragQueryFileW(drop, index, buffer.data(), length + 1) != 0) {
+            paths.emplace_back(buffer.data());
         }
     }
+    return paths;
+}
 
-    CloseClipboard();
-    return success;
+// Reads the DIB header so the entry can show its pixel size; a raw DIB carries
+// no compression/format label beyond the header flags.
+void ReadClipboardImageSize(const std::vector<char>& dib, int* width, int* height) {
+    if (width == nullptr || height == nullptr) {
+        return;
+    }
+    *width = 0;
+    *height = 0;
+    if (dib.size() < sizeof(BITMAPINFOHEADER)) {
+        return;
+    }
+    const BITMAPINFOHEADER* header = reinterpret_cast<const BITMAPINFOHEADER*>(dib.data());
+    if (header->biSize < sizeof(BITMAPINFOHEADER)) {
+        return;
+    }
+    *width = static_cast<int>(header->biWidth);
+    *height = static_cast<int>(header->biHeight < 0 ? -header->biHeight : header->biHeight);
+}
+
+// A one-line description shown in the preview pane for non-text entries.
+std::wstring BuildClipboardImageSummary(int width, int height, DWORD format) {
+    std::wstring summary = L"Image";
+    if (width > 0 && height > 0) {
+        summary += L" " + std::to_wstring(width) + L"x" + std::to_wstring(height);
+    }
+    summary += format == CF_DIBV5 ? L" (32-bit DIB)" : L" (DIB)";
+    return summary;
 }
 
 void StartClipboardPolling() {
@@ -3881,6 +4318,82 @@ void StopClipboardPolling() {
     }
 }
 
+// Reads the whole clipboard once and turns it into a history entry. Returns
+// false only when the clipboard could not be opened (another process is
+// holding it), so the poller can retry that tick instead of skipping the
+// payload; a true return with an empty entry means nothing worth storing.
+//
+// Files win over everything else because Explorer puts CF_HDROP on the
+// clipboard together with the file names as text, and the user copied files.
+bool CaptureClipboardEntry(ClipboardEntry* entry, std::vector<char>* rtfData, std::vector<char>* imageData) {
+    if (entry == nullptr || rtfData == nullptr || imageData == nullptr) {
+        return false;
+    }
+    entry->rtfHash = 0;
+    entry->imageHash = 0;
+    rtfData->clear();
+    imageData->clear();
+
+    if (OpenClipboard(g_state.hostWindow) == FALSE) {
+        return false;
+    }
+
+    const ClipboardConfig& config = g_state.clipboardConfig;
+
+    // The clipboard is already open here, so IsClipboardFormatAvailable() (which
+    // opens it on its own) must not be used; a missing format simply makes
+    // GetClipboardData() return NULL.
+    if (config.captureFiles) {
+        entry->files = ReadClipboardDropFiles(GetClipboardData(CF_HDROP));
+        if (!entry->files.empty()) {
+            entry->kind = ClipboardEntryKind::Files;
+            CloseClipboard();
+            return true;
+        }
+    }
+
+    if (config.captureImages) {
+        // CF_DIBV5 first: it keeps the alpha channel and colour space that a
+        // plain CF_DIB conversion would flatten.
+        for (const UINT format : { static_cast<UINT>(CF_DIBV5), static_cast<UINT>(CF_DIB) }) {
+            if (!ReadClipboardBlobData(GetClipboardData(format), imageData)) {
+                continue;
+            }
+            entry->kind = ClipboardEntryKind::Image;
+            entry->imageFormat = format;
+            entry->imageHash = HashClipboardBytes(imageData->data(), imageData->size());
+            ReadClipboardImageSize(*imageData, &entry->imageWidth, &entry->imageHeight);
+            // The summary doubles as the stored text, so an image entry is
+            // comparable with itself and readable in the preview pane.
+            entry->text = BuildClipboardImageSummary(entry->imageWidth, entry->imageHeight, entry->imageFormat);
+            CloseClipboard();
+            return true;
+        }
+    }
+
+    const bool wantsText = config.captureText || config.captureRichText;
+    if (wantsText) {
+        ReadClipboardTextData(GetClipboardData(CF_UNICODETEXT), &entry->text);
+    }
+
+    if (config.captureRichText) {
+        // Word, WordPad, and most browsers publish the registered
+        // "Rich Text Format" clipboard format alongside plain text.
+        const UINT rtfFormat = RegisterClipboardFormatW(kClipboardRtfFormatName);
+        if (rtfFormat != 0 &&
+            ReadClipboardBlobData(GetClipboardData(rtfFormat), rtfData) && !rtfData->empty()) {
+            entry->kind = ClipboardEntryKind::RichText;
+            entry->rtfHash = HashClipboardBytes(rtfData->data(), rtfData->size());
+        }
+    }
+
+    if (entry->kind != ClipboardEntryKind::RichText) {
+        entry->kind = ClipboardEntryKind::Text;
+    }
+    CloseClipboard();
+    return true;
+}
+
 void PollClipboardForChanges() {
     if (!g_state.clipboardConfig.enabled) {
         return;
@@ -3893,32 +4406,45 @@ void PollClipboardForChanges() {
         return;
     }
 
-    std::wstring text;
-    if (!GetClipboardUnicodeText(&text)) {
-        // Another process may be holding the clipboard open; retry on the next
-        // tick instead of marking this sequence number as consumed.
+    ClipboardEntry entry {};
+    std::vector<char> rtfData;
+    std::vector<char> imageData;
+    if (!CaptureClipboardEntry(&entry, &rtfData, &imageData)) {
         return;
     }
+    // The sequence number is consumed even when the payload is not worth
+    // storing, otherwise every tick would retry the same clipboard.
     g_state.lastClipboardSequenceNumber = sequenceNumber;
-    if (text.empty()) {
+
+    const bool hasText = !entry.text.empty() && (g_state.clipboardConfig.captureText || entry.kind == ClipboardEntryKind::RichText);
+    const bool hasRichText = entry.rtfHash != 0 && g_state.clipboardConfig.captureRichText;
+    const bool hasImage = entry.imageHash != 0 && g_state.clipboardConfig.captureImages;
+    const bool hasFiles = !entry.files.empty() && g_state.clipboardConfig.captureFiles;
+    if (!hasText && !hasRichText && !hasImage && !hasFiles) {
         return;
     }
-    if (!g_state.clipboardEntries.empty() && g_state.clipboardEntries.front().text == text) {
+    if (!g_state.clipboardEntries.empty() && ClipboardEntriesMatch(g_state.clipboardEntries.front(), entry)) {
         return;
     }
 
-    AddClipboardEntry(std::move(text));
+    StoreClipboardEntry(std::move(entry), rtfData, imageData);
     if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
         ReloadClipboardHistory();
     }
 }
 
-// Collapses newlines/tabs into single spaces for the compact list labels.
+// Collapses newlines/tabs into single spaces for the compact list labels. Only
+// a bounded prefix is scanned: rows are repainted often and entries can hold
+// hundreds of kilobytes of text.
 std::wstring BuildClipboardPreviewText(std::wstring_view text) {
+    constexpr size_t scanLimit = kClipboardPreviewLength * 4;
+    const std::wstring_view scan = text.size() > scanLimit ? text.substr(0, scanLimit) : text;
+    const bool truncated = text.size() > scanLimit;
+
     std::wstring preview;
-    preview.reserve(text.size());
+    preview.reserve(std::min(scan.size(), kClipboardPreviewLength));
     bool previousWasSpace = false;
-    for (const wchar_t ch : text) {
+    for (const wchar_t ch : scan) {
         const bool isSpace = ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == L' ';
         if (isSpace) {
             if (!previousWasSpace && !preview.empty()) {
@@ -3929,16 +4455,115 @@ std::wstring BuildClipboardPreviewText(std::wstring_view text) {
         }
         previousWasSpace = false;
         preview.push_back(ch);
+        if (preview.size() >= kClipboardPreviewLength) {
+            break;
+        }
     }
     preview = Trim(preview);
     if (preview.empty()) {
         return L"(whitespace only)";
     }
-    if (preview.size() > kClipboardPreviewLength) {
-        preview.resize(kClipboardPreviewLength);
+    if (preview.size() >= kClipboardPreviewLength || truncated) {
+        preview.resize(std::min(preview.size(), kClipboardPreviewLength));
         preview += L"...";
     }
     return preview;
+}
+
+// Badge shown in front of every list row, so the kind is obvious while cycling.
+const wchar_t* ClipboardEntryBadge(ClipboardEntryKind kind) {
+    switch (kind) {
+    case ClipboardEntryKind::RichText:
+        return L"[RTF]";
+    case ClipboardEntryKind::Image:
+        return L"[IMG]";
+    case ClipboardEntryKind::Files:
+        return L"[FILE]";
+    case ClipboardEntryKind::Text:
+    default:
+        return L"[TEXT]";
+    }
+}
+
+// One-line label for a list row: a kind badge plus a short description of the
+// payload (file count, image size, collapsed text).
+std::wstring BuildClipboardEntryLabel(const ClipboardEntry& entry) {
+    std::wstring label = ClipboardEntryBadge(entry.kind);
+    label += L" ";
+
+    switch (entry.kind) {
+    case ClipboardEntryKind::Files: {
+        if (entry.files.empty()) {
+            return label + L"(no files)";
+        }
+        const std::wstring firstName = std::filesystem::path(entry.files.front()).filename().wstring();
+        label += firstName.empty() ? entry.files.front() : firstName;
+        if (entry.files.size() > 1) {
+            label += L" +" + std::to_wstring(entry.files.size() - 1) + L" more";
+        }
+        return label;
+    }
+    case ClipboardEntryKind::Image: {
+        std::wstring summary = L"Image";
+        if (entry.imageWidth > 0 && entry.imageHeight > 0) {
+            summary += L" " + std::to_wstring(entry.imageWidth) + L"x" + std::to_wstring(entry.imageHeight);
+        }
+        return label + summary;
+    }
+    case ClipboardEntryKind::RichText:
+    case ClipboardEntryKind::Text:
+    default:
+        if (entry.text.empty()) {
+            return entry.kind == ClipboardEntryKind::RichText ? label + L"(rich text)" : label + L"(empty)";
+        }
+        return label + BuildClipboardPreviewText(entry.text);
+    }
+}
+
+// Multi-line description for the preview pane below the list.
+std::wstring BuildClipboardEntryDescription(const ClipboardEntry& entry) {
+    switch (entry.kind) {
+    case ClipboardEntryKind::Files: {
+        std::wstring description = entry.files.size() == 1
+            ? L"1 file\r\n"
+            : std::to_wstring(entry.files.size()) + L" files\r\n";
+        size_t shown = 0;
+        for (const std::wstring& path : entry.files) {
+            if (shown >= 6) {
+                description += L"...";
+                break;
+            }
+            description += path;
+            description += L"\r\n";
+            ++shown;
+        }
+        return Trim(description);
+    }
+    case ClipboardEntryKind::Image:
+        return BuildClipboardImageSummary(entry.imageWidth, entry.imageHeight, entry.imageFormat) +
+            L"\r\nStored as a raw device-independent bitmap; pasting restores it as an image.";
+    case ClipboardEntryKind::RichText: {
+        std::wstring description = L"Rich text (RTF)";
+        if (!entry.text.empty()) {
+            std::wstring plain = entry.text;
+            if (plain.size() > kClipboardPreviewPopupLimit) {
+                plain.resize(kClipboardPreviewPopupLimit);
+                plain += L"...";
+            }
+            description += L"\r\n\r\n" + plain;
+        }
+        return description;
+    }
+    case ClipboardEntryKind::Text:
+    default: {
+        std::wstring text = entry.text;
+        if (text.size() > kClipboardPreviewPopupLimit) {
+            text.resize(kClipboardPreviewPopupLimit);
+            text += L"...";
+        }
+        return text;
+    }
+    }
 }
 
 void MoveClipboardSelection(int delta) {
@@ -4040,20 +4665,18 @@ void UpdateClipboardPreview() {
         SetWindowTextW(
             g_state.clipboardPreview,
             g_state.clipboardEntries.empty()
-                ? L"Clipboard history is empty. Copy some text to start collecting entries."
+                ? L"Clipboard history is empty. Copy text, images, rich text, or files to start collecting entries."
                 : L"");
         return;
     }
 
-    std::wstring text = g_state.clipboardEntries[*index].text;
-    if (text.size() > kClipboardPreviewPopupLimit) {
-        text.resize(kClipboardPreviewPopupLimit);
-        text += L"...";
-    }
-    SetWindowTextW(g_state.clipboardPreview, text.c_str());
+
+    const std::wstring description = BuildClipboardEntryDescription(g_state.clipboardEntries[*index]);
+    SetWindowTextW(g_state.clipboardPreview, description.c_str());
 }
 
 void ReloadClipboardHistory() {
+    ResetClipboardThumbnailCache();
     if (g_state.clipboardList == nullptr) {
         return;
     }
@@ -4063,7 +4686,7 @@ void ReloadClipboardHistory() {
     SendMessageW(g_state.clipboardList, LB_RESETCONTENT, 0, 0);
 
     for (size_t index = 0; index < g_state.clipboardEntries.size(); ++index) {
-        const std::wstring label = BuildClipboardPreviewText(g_state.clipboardEntries[index].text);
+        const std::wstring label = BuildClipboardEntryLabel(g_state.clipboardEntries[index]);
         const LRESULT inserted = SendMessageW(g_state.clipboardList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         if (inserted >= 0) {
             SendMessageW(g_state.clipboardList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(index));
@@ -4077,6 +4700,17 @@ void ReloadClipboardHistory() {
             selection = 0;
         }
         SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(selection), 0);
+    }
+
+    // Image entries make every row taller, so the height is re-pushed and the
+    // popup re-laid out whenever the content (or the fonts) change.
+    const int itemHeight = ClipboardListItemHeight();
+    const LRESULT currentHeight = SendMessageW(g_state.clipboardList, LB_GETITEMHEIGHT, 0, 0);
+    if (currentHeight <= 0 || static_cast<int>(currentHeight) != itemHeight) {
+        SendMessageW(g_state.clipboardList, LB_SETITEMHEIGHT, 0, static_cast<LPARAM>(itemHeight));
+        if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+            LayoutClipboardWindow();
+        }
     }
 
     SendMessageW(g_state.clipboardList, WM_SETREDRAW, TRUE, 0);
@@ -4192,10 +4826,20 @@ std::wstring BuildClipboardHintText() {
     return cycling + L"\r\n" + actions;
 }
 
-// Owner-drawn rows: fixed height across the whole list.
+// Owner-drawn rows: fixed height across the whole list. Image entries get a
+// taller row so their thumbnail stays legible; the height is pushed to the
+// listbox again whenever the history content changes.
 int ClipboardListItemHeight() {
     const int textHeight = MeasureFontTextHeight(g_state.clipboardFont);
-    return std::max(Scale(34), textHeight + Scale(16));
+    int height = std::max(Scale(34), textHeight + Scale(16));
+    const bool hasImage = std::any_of(
+        g_state.clipboardEntries.begin(),
+        g_state.clipboardEntries.end(),
+        [](const ClipboardEntry& entry) { return entry.kind == ClipboardEntryKind::Image; });
+    if (hasImage) {
+        height = std::max(height, Scale(52));
+    }
+    return height;
 }
 
 // Draws one history row: a separator line between entries, a filled highlight
@@ -4264,7 +4908,16 @@ void DrawClipboardListItem(const DRAWITEMSTRUCT& draw) {
     textRect.left += Scale(14);
     // Leave room for the rank marker drawn on the right of the selected row.
     textRect.right -= selected ? Scale(60) : Scale(12);
-    const std::wstring label = BuildClipboardPreviewText(g_state.clipboardEntries[itemIndex].text);
+    // Thumbnail for image entries, drawn between the accent bar and the label.
+    if (g_state.clipboardEntries[itemIndex].kind == ClipboardEntryKind::Image) {
+        const int thumbEdge = row.bottom - row.top - Scale(8);
+        RECT thumbRect { textRect.left, row.top + Scale(4), textRect.left + thumbEdge, row.top + Scale(4) + thumbEdge };
+        if (DrawClipboardImageThumbnail(draw.hDC, g_state.clipboardEntries[itemIndex], thumbRect)) {
+            textRect.left = thumbRect.right + Scale(10);
+        }
+    }
+
+    const std::wstring label = BuildClipboardEntryLabel(g_state.clipboardEntries[itemIndex]);
     DrawTextW(draw.hDC, label.c_str(), static_cast<int>(label.size()), &textRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     if (selected) {
@@ -4282,6 +4935,266 @@ void DrawClipboardListItem(const DRAWITEMSTRUCT& draw) {
     if (oldFont != nullptr) {
         SelectObject(draw.hDC, oldFont);
     }
+}
+
+// Loads a history image into an HBITMAP for the row thumbnail. The blob is a
+// raw DIB (the CF_DIB layout), which CreateDIBitmap can consume directly. When
+// the DIB is taller than the thumbnail box the bitmap is stretched on draw.
+// Byte offset of the pixel bits inside a packed DIB, and how many bytes the
+// header/palette/mask block occupies. Both are needed to hand the DIB to
+// CreateDIBitmap with a correctly shaped BITMAPINFO.
+// Re-packs a packed DIB that uses a V4/V5 header into the 40-byte
+// BITMAPINFOHEADER layout that CF_DIB consumers understand. The pixel bits are
+// copied unchanged; only the header, masks, and palette are laid out anew.
+std::vector<char> ConvertClipboardDibToBitmapInfoHeader(const std::vector<char>& dib) {
+    std::vector<char> result;
+    if (dib.size() < sizeof(BITMAPV5HEADER)) {
+        return result;
+    }
+
+    const BITMAPV5HEADER* source = reinterpret_cast<const BITMAPV5HEADER*>(dib.data());
+    if (source->bV5Size < sizeof(BITMAPINFOHEADER) || source->bV5Width <= 0 || source->bV5BitCount == 0) {
+        return result;
+    }
+    const size_t sourceHeaderBytes = ClipboardDibHeaderBytes(dib);
+    if (sourceHeaderBytes == 0) {
+        return result;
+    }
+
+    BITMAPINFOHEADER header {};
+    header.biSize = sizeof(BITMAPINFOHEADER);
+    header.biWidth = source->bV5Width;
+    header.biHeight = source->bV5Height;
+    header.biPlanes = source->bV5Planes;
+    header.biBitCount = source->bV5BitCount;
+    header.biCompression = source->bV5Compression;
+    header.biSizeImage = source->bV5SizeImage;
+    header.biXPelsPerMeter = source->bV5XPelsPerMeter;
+    header.biYPelsPerMeter = source->bV5YPelsPerMeter;
+    header.biClrUsed = source->bV5ClrUsed;
+    header.biClrImportant = source->bV5ClrImportant;
+
+    // A V5 header carries the colour masks inline; the 40-byte layout expects
+    // them right after the header instead, so the compression flag is kept and
+    // the masks are appended below.
+    result.resize(sizeof(BITMAPINFOHEADER), 0);
+    std::memcpy(result.data(), &header, sizeof(header));
+
+    if (header.biCompression == BI_BITFIELDS && header.biBitCount >= 16) {
+        const DWORD masks[3] = { source->bV5RedMask, source->bV5GreenMask, source->bV5BlueMask };
+        const char* maskBytes = reinterpret_cast<const char*>(masks);
+        result.insert(result.end(), maskBytes, maskBytes + sizeof(masks));
+    } else if (header.biBitCount <= 8) {
+        const size_t paletteEntries = header.biClrUsed != 0
+            ? static_cast<size_t>(header.biClrUsed)
+            : (static_cast<size_t>(1) << header.biBitCount);
+        const size_t paletteBytes = paletteEntries * sizeof(RGBQUAD);
+        if (sourceHeaderBytes < sizeof(BITMAPV5HEADER) + paletteBytes) {
+            result.clear();
+            return result;
+        }
+        result.insert(
+            result.end(),
+            dib.begin() + static_cast<ptrdiff_t>(sizeof(BITMAPV5HEADER)),
+            dib.begin() + static_cast<ptrdiff_t>(sizeof(BITMAPV5HEADER) + paletteBytes));
+    }
+
+    // Everything after the source header block is the pixel data (plus any
+    // trailing colour profile, which loose CF_DIB readers ignore).
+    result.insert(result.end(), dib.begin() + static_cast<ptrdiff_t>(sourceHeaderBytes), dib.end());
+    return result;
+}
+
+size_t ClipboardDibHeaderBytes(const std::vector<char>& dib) {
+    if (dib.size() < sizeof(BITMAPINFOHEADER)) {
+        return 0;
+    }
+    const BITMAPINFOHEADER* header = reinterpret_cast<const BITMAPINFOHEADER*>(dib.data());
+    if (header->biSize < sizeof(BITMAPINFOHEADER) || header->biSize > dib.size() || header->biWidth <= 0) {
+        return 0;
+    }
+    if (header->biHeight == 0) {
+        return 0;
+    }
+
+    size_t offset = header->biSize;
+    if (header->biBitCount <= 8) {
+        // A palette follows the header; biClrUsed overrides the implied size.
+        const size_t paletteEntries = header->biClrUsed != 0
+            ? static_cast<size_t>(header->biClrUsed)
+            : (static_cast<size_t>(1) << header->biBitCount);
+        offset += paletteEntries * sizeof(RGBQUAD);
+    } else if (header->biCompression == BI_BITFIELDS && header->biSize == sizeof(BITMAPINFOHEADER)) {
+        // Pre-V4 headers keep the three colour masks right after the header.
+        offset += 3 * sizeof(DWORD);
+    }
+    return offset < dib.size() ? offset : 0;
+}
+
+// Creates a bitmap from a packed DIB. Compressed DIBs (BI_JPEG/BI_PNG) and
+// top-down DIBs (negative height) are normalised to a bottom-up BI_RGB/BITFIELDS
+// layout first, which CreateDIBitmap understands.
+HBITMAP CreateBitmapFromClipboardDib(const std::vector<char>& dib, int* outWidth, int* outHeight) {
+    const size_t headerBytes = ClipboardDibHeaderBytes(dib);
+    if (headerBytes == 0) {
+        return nullptr;
+    }
+    const size_t pixelOffset = headerBytes;
+
+    const BITMAPINFOHEADER* sourceHeader = reinterpret_cast<const BITMAPINFOHEADER*>(dib.data());
+    const int width = static_cast<int>(sourceHeader->biWidth);
+    const int sourceHeight = sourceHeader->biHeight < 0 ? -sourceHeader->biHeight : sourceHeader->biHeight;
+    if (width <= 0 || sourceHeight <= 0) {
+        return nullptr;
+    }
+
+    // Reinterpret the header block as BITMAPINFO: for a 40-byte header the
+    // trailing masks/palette live exactly where bmiColors expects them.
+    std::vector<char> infoBytes(dib.begin(), dib.begin() + static_cast<ptrdiff_t>(headerBytes));
+
+    std::vector<char> pixels;
+    const size_t available = dib.size() - pixelOffset;
+    if (sourceHeader->biHeight > 0) {
+        pixels.assign(dib.begin() + static_cast<ptrdiff_t>(pixelOffset), dib.end());
+    } else {
+        // Top-down DIB: flip the rows into the bottom-up layout.
+        const int bitCount = static_cast<int>(sourceHeader->biBitCount);
+        const size_t stride = ((static_cast<size_t>(width) * static_cast<size_t>(bitCount) + 31) / 32) * 4;
+        const size_t imageBytes = stride * static_cast<size_t>(sourceHeight);
+        if (imageBytes > available) {
+            return nullptr;
+        }
+        pixels.resize(imageBytes);
+        for (int row = 0; row < sourceHeight; ++row) {
+            const size_t sourceRow = static_cast<size_t>(row) * stride;
+            const size_t targetRow = static_cast<size_t>(sourceHeight - 1 - row) * stride;
+            std::memcpy(pixels.data() + targetRow, dib.data() + pixelOffset + sourceRow, stride);
+        }
+    }
+    if (pixels.empty()) {
+        return nullptr;
+    }
+
+    // Force a positive height: the pixel buffer was normalised above.
+    reinterpret_cast<BITMAPINFOHEADER*>(infoBytes.data())->biHeight = sourceHeight;
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr) {
+        return nullptr;
+    }
+    HBITMAP bitmap = CreateDIBitmap(
+        screenDc,
+        reinterpret_cast<const BITMAPINFOHEADER*>(infoBytes.data()),
+        CBM_INIT,
+        pixels.data(),
+        reinterpret_cast<const BITMAPINFO*>(infoBytes.data()),
+        DIB_RGB_COLORS);
+    ReleaseDC(nullptr, screenDc);
+
+    if (bitmap != nullptr && outWidth != nullptr && outHeight != nullptr) {
+        *outWidth = width;
+        *outHeight = sourceHeight;
+    }
+    return bitmap;
+}
+
+HBITMAP LoadClipboardImageBitmap(const ClipboardEntry& entry) {
+    if (entry.kind != ClipboardEntryKind::Image || entry.imageHash == 0) {
+        return nullptr;
+    }
+    const auto cached = g_state.clipboardThumbnails.find(entry.imageHash);
+    if (cached != g_state.clipboardThumbnails.end()) {
+        // Touch the entry so it survives the next eviction.
+        auto order = std::find(g_state.clipboardThumbnailOrder.begin(), g_state.clipboardThumbnailOrder.end(), entry.imageHash);
+        if (order != g_state.clipboardThumbnailOrder.end()) {
+            g_state.clipboardThumbnailOrder.erase(order);
+        }
+        g_state.clipboardThumbnailOrder.push_back(entry.imageHash);
+        return cached->second;
+    }
+
+    const std::vector<char> dib = ReadClipboardBlob(entry.imageHash, false);
+    int width = 0;
+    int height = 0;
+    HBITMAP bitmap = CreateBitmapFromClipboardDib(dib, &width, &height);
+    if (bitmap == nullptr) {
+        return nullptr;
+    }
+
+    if (g_state.clipboardThumbnailOrder.size() >= kClipboardThumbnailCacheLimit) {
+        const ULONGLONG oldest = g_state.clipboardThumbnailOrder.front();
+        g_state.clipboardThumbnailOrder.erase(g_state.clipboardThumbnailOrder.begin());
+        const auto victim = g_state.clipboardThumbnails.find(oldest);
+        if (victim != g_state.clipboardThumbnails.end()) {
+            DeleteObject(victim->second);
+            g_state.clipboardThumbnails.erase(victim);
+        }
+    }
+    g_state.clipboardThumbnails.emplace(entry.imageHash, bitmap);
+    g_state.clipboardThumbnailOrder.push_back(entry.imageHash);
+    return bitmap;
+}
+
+// Drops the cached thumbnails. Called whenever the history content changes, so a
+// deleted entry never leaves a bitmap pointing at a pruned blob.
+void ResetClipboardThumbnailCache() {
+    for (auto& item : g_state.clipboardThumbnails) {
+        DeleteObject(item.second);
+    }
+    g_state.clipboardThumbnails.clear();
+    g_state.clipboardThumbnailOrder.clear();
+}
+
+// Draws the image thumbnail inside thumbnailRect, preserving the aspect ratio.
+// Returns false when the entry has no usable image, so the caller can fall back
+// to a text-only row.
+bool DrawClipboardImageThumbnail(HDC dc, const ClipboardEntry& entry, RECT thumbnailRect) {
+    if (dc == nullptr || entry.kind != ClipboardEntryKind::Image) {
+        return false;
+    }
+    HBITMAP bitmap = LoadClipboardImageBitmap(entry);
+    if (bitmap == nullptr) {
+        return false;
+    }
+
+    HDC memoryDc = CreateCompatibleDC(dc);
+    if (memoryDc == nullptr) {
+        // The cache still owns the bitmap, so it is left alive here.
+        return false;
+    }
+    const HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+
+    const int boxWidth = thumbnailRect.right - thumbnailRect.left;
+    const int boxHeight = thumbnailRect.bottom - thumbnailRect.top;
+    // The DIB header records the pixel size of every cached bitmap, so this is
+    // authoritative even when several images are on screen at once.
+    const int sourceWidth = entry.imageWidth > 0 ? entry.imageWidth : boxWidth;
+    const int sourceHeight = entry.imageHeight > 0 ? entry.imageHeight : boxHeight;
+    int drawWidth = boxWidth;
+    int drawHeight = boxHeight;
+    if (sourceWidth > 0 && sourceHeight > 0) {
+        if (sourceWidth >= sourceHeight) {
+            drawHeight = std::max(1, MulDiv(boxWidth, sourceHeight, sourceWidth));
+        } else {
+            drawWidth = std::max(1, MulDiv(boxHeight, sourceWidth, sourceHeight));
+        }
+    }
+
+    RECT targetRect = thumbnailRect;
+    targetRect.left = thumbnailRect.left + (boxWidth - drawWidth) / 2;
+    targetRect.top = thumbnailRect.top + (boxHeight - drawHeight) / 2;
+    targetRect.right = targetRect.left + drawWidth;
+    targetRect.bottom = targetRect.top + drawHeight;
+
+    SetStretchBltMode(dc, HALFTONE);
+    SetBrushOrgEx(dc, 0, 0, nullptr);
+    StretchBlt(dc, targetRect.left, targetRect.top, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top,
+        memoryDc, 0, 0, sourceWidth, sourceHeight, SRCCOPY);
+
+    SelectObject(memoryDc, oldBitmap);
+    DeleteDC(memoryDc);
+    // LoadClipboardImageBitmap() already owns and caches the bitmap.
+    return true;
 }
 
 void ApplyClipboardAppearance() {
@@ -4541,11 +5454,11 @@ void CopySelectedClipboardEntry() {
         return;
     }
 
-    const std::wstring text = g_state.clipboardEntries[*index].text;
-    // Hide before copying: CopyTextToClipboard() would otherwise refresh the
-    // still-visible list and make the popup flicker while it closes.
+    const ClipboardEntry entry = g_state.clipboardEntries[*index];
+    // Hide before copying: the copy path refreshes the history, which would
+    // otherwise flicker the still-visible list while the popup closes.
     HideClipboardHistory();
-    if (!CopyTextToClipboard(text)) {
+    if (!CopyClipboardEntryToClipboard(entry)) {
         return;
     }
 
@@ -4565,13 +5478,13 @@ void DeleteSelectedClipboardEntry() {
     using EntryDifference = std::vector<ClipboardEntry>::difference_type;
     g_state.clipboardEntries.erase(
         g_state.clipboardEntries.begin() + static_cast<EntryDifference>(*index));
-    SaveClipboardEntriesToFile();
+    SaveClipboardEntriesToFile(true);
     ReloadClipboardHistory();
 }
 
 void ClearClipboardHistory() {
     g_state.clipboardEntries.clear();
-    SaveClipboardEntriesToFile();
+    SaveClipboardEntriesToFile(true);
     ReloadClipboardHistory();
 }
 
@@ -4607,9 +5520,9 @@ void PasteSelectedClipboardEntry() {
     // Copy what was selected before hiding: HideClipboardHistory() clears the
     // return window, and copying while visible would refresh (and flicker) the
     // list that is already on its way out.
-    const std::wstring text = g_state.clipboardEntries[*index].text;
+    const ClipboardEntry entry = g_state.clipboardEntries[*index];
     HideClipboardHistory();
-    if (!CopyTextToClipboard(text)) {
+    if (!CopyClipboardEntryToClipboard(entry)) {
         return;
     }
 
@@ -6822,6 +7735,10 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     } else {
         StopClipboardPolling();
         g_state.clipboardEntries.clear();
+        // The disabled feature drops its blobs as well, so the store does not
+        // keep megabytes of images nobody can reach.
+        SaveClipboardEntriesToFile(true);
+        ResetClipboardThumbnailCache();
         HideClipboardHistory();
     }
     if (g_state.clipboardWindow != nullptr) {
@@ -7060,6 +7977,38 @@ std::optional<std::wstring> BuildCopyableCommandText(size_t index) {
     return commandText;
 }
 
+// Writes CF_UNICODETEXT for a view without assuming the view's backing buffer
+// has a terminator right after it (substring views do not).
+
+// Copies a global memory block into the clipboard under the given format. The
+// caller keeps ownership of nothing: on success the clipboard owns the handle.
+bool SetClipboardFormatData(UINT format, const void* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return false;
+    }
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (handle == nullptr) {
+        return false;
+    }
+    void* buffer = GlobalLock(handle);
+    if (buffer == nullptr) {
+        GlobalFree(handle);
+        return false;
+    }
+    std::memcpy(buffer, data, size);
+    GlobalUnlock(handle);
+    if (SetClipboardData(format, handle) == nullptr) {
+        GlobalFree(handle);
+        return false;
+    }
+    return true;
+}
+
+bool SetClipboardUnicodeText(std::wstring_view text) {
+    const std::wstring owned(text);
+    return SetClipboardFormatData(CF_UNICODETEXT, owned.c_str(), (owned.size() + 1) * sizeof(wchar_t));
+}
+
 bool CopyTextToClipboard(std::wstring_view text) {
     HWND owner = g_state.launcherWindow;
     if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
@@ -7071,20 +8020,7 @@ bool CopyTextToClipboard(std::wstring_view text) {
 
     bool copied = false;
     if (EmptyClipboard() != FALSE) {
-        const size_t byteCount = (text.size() + 1) * sizeof(wchar_t);
-        HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, byteCount);
-        if (handle != nullptr) {
-            void* buffer = GlobalLock(handle);
-            if (buffer != nullptr) {
-                std::memcpy(buffer, text.data(), text.size() * sizeof(wchar_t));
-                static_cast<wchar_t*>(buffer)[text.size()] = L'\0';
-                GlobalUnlock(handle);
-                copied = SetClipboardData(CF_UNICODETEXT, handle) != nullptr;
-            }
-            if (!copied) {
-                GlobalFree(handle);
-            }
-        }
+        copied = SetClipboardUnicodeText(text);
     }
     CloseClipboard();
 
@@ -7092,7 +8028,150 @@ bool CopyTextToClipboard(std::wstring_view text) {
         // Record our own copies immediately instead of waiting for the poll,
         // and mark the sequence number as consumed so it is not read twice.
         g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
-        AddClipboardEntry(std::wstring(text));
+        ClipboardEntry entry {};
+        entry.kind = ClipboardEntryKind::Text;
+        entry.text = std::wstring(text);
+        AddClipboardEntry(std::move(entry));
+        if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+            ReloadClipboardHistory();
+        }
+    }
+    return copied;
+}
+
+// Writes CF_HDROP (a DROPFILES header followed by NUL-terminated full paths)
+// so pasting into Explorer moves/copies the real files back.
+bool SetClipboardDropFiles(const std::vector<std::wstring>& files) {
+    if (files.empty()) {
+        return false;
+    }
+
+    // Unicode DROPFILES: fWide = TRUE, then the paths each NUL terminated with
+    // one extra NUL closing the list.
+    size_t characterCount = 0;
+    for (const std::wstring& path : files) {
+        characterCount += path.size() + 1;
+    }
+    characterCount += 1;
+
+    const size_t headerSize = sizeof(DROPFILES);
+    const size_t size = headerSize + characterCount * sizeof(wchar_t);
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
+    if (handle == nullptr) {
+        return false;
+    }
+    DROPFILES* dropFiles = static_cast<DROPFILES*>(GlobalLock(handle));
+    if (dropFiles == nullptr) {
+        GlobalFree(handle);
+        return false;
+    }
+    dropFiles->pFiles = static_cast<DWORD>(headerSize);
+    dropFiles->fWide = TRUE;
+
+    wchar_t* cursor = reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(dropFiles) + headerSize);
+    for (const std::wstring& path : files) {
+        std::memcpy(cursor, path.c_str(), path.size() * sizeof(wchar_t));
+        cursor += path.size();
+        *cursor = L'\0';
+        ++cursor;
+    }
+    *cursor = L'\0';
+    GlobalUnlock(handle);
+
+    if (SetClipboardData(CF_HDROP, handle) == nullptr) {
+        GlobalFree(handle);
+        return false;
+    }
+
+    // Best effort, mirrors what Explorer does: the default drop effect is copy
+    // so a paste into an Explorer folder does not look like a move request.
+    const UINT dropEffectFormat = RegisterClipboardFormatW(kClipboardDropEffectFormatName);
+    if (dropEffectFormat != 0) {
+        const DWORD dropEffect = DROPEFFECT_COPY;
+        SetClipboardFormatData(dropEffectFormat, &dropEffect, sizeof(dropEffect));
+    }
+    return true;
+}
+
+// Puts a whole history entry back on the clipboard, including its rich text,
+// image, and file representations, and re-records it as the newest entry.
+bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry) {
+    HWND owner = g_state.launcherWindow;
+    if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+        owner = g_state.clipboardWindow;
+    }
+
+    if (OpenClipboard(owner) == FALSE) {
+        return false;
+    }
+
+    bool copied = false;
+    if (EmptyClipboard() != FALSE) {
+        bool wroteAnything = false;
+        std::wstring text = entry.text;
+
+        if (entry.kind == ClipboardEntryKind::Files) {
+            wroteAnything = SetClipboardDropFiles(entry.files) || wroteAnything;
+            if (!entry.files.empty()) {
+                // Explorer pastes fine with CF_HDROP alone, but Notepad and
+                // consoles fall back to text, so add the path list as text.
+                std::wstring joined;
+                for (const std::wstring& path : entry.files) {
+                    if (!joined.empty()) {
+                        joined += L"\r\n";
+                    }
+                    joined += path;
+                }
+                SetClipboardUnicodeText(joined);
+            }
+        } else if (entry.kind == ClipboardEntryKind::Image) {
+            const std::vector<char> dib = ReadClipboardBlob(entry.imageHash, false);
+            if (!dib.empty()) {
+                // Publish the format the payload was captured as. Older apps
+                // only look at CF_DIB, so a DIBV5 payload is also offered as
+                // CF_DIB; it keeps the smaller header subset they can read.
+                const UINT format = entry.imageFormat == CF_DIBV5 ? CF_DIBV5 : CF_DIB;
+                wroteAnything = SetClipboardFormatData(format, dib.data(), dib.size()) || wroteAnything;
+                if (format == CF_DIBV5) {
+                    // Older readers only look at CF_DIB, so repack the V5
+                    // header as the 40-byte variant as well.
+                    const std::vector<char> plainDib = ConvertClipboardDibToBitmapInfoHeader(dib);
+                    if (!plainDib.empty()) {
+                        SetClipboardFormatData(CF_DIB, plainDib.data(), plainDib.size());
+                    }
+                }
+            }
+        } else {
+            // Plain text first: every target understands it, and the RTF
+            // format on top lets Word/WordPad restore the formatting.
+            if (!text.empty()) {
+                wroteAnything = SetClipboardUnicodeText(text) || wroteAnything;
+            }
+            if (entry.rtfHash != 0) {
+                const std::vector<char> rtf = ReadClipboardBlob(entry.rtfHash, true);
+                if (!rtf.empty()) {
+                    const UINT rtfFormat = RegisterClipboardFormatW(kClipboardRtfFormatName);
+                    if (rtfFormat != 0) {
+                        // The registered RTF format is a byte stream, not a
+                        // NUL terminated string: copy it verbatim.
+                        wroteAnything = SetClipboardFormatData(rtfFormat, rtf.data(), rtf.size()) || wroteAnything;
+                    }
+                }
+            }
+        }
+
+        copied = wroteAnything;
+    }
+    CloseClipboard();
+
+    if (copied && g_state.clipboardConfig.enabled) {
+        // Record the copy at the top, as CopyTextToClipboard does for text.
+        g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+        ClipboardEntry recorded = entry;
+        if (recorded.kind == ClipboardEntryKind::Image && recorded.text.empty()) {
+            recorded.text = BuildClipboardImageSummary(recorded.imageWidth, recorded.imageHeight, recorded.imageFormat);
+        }
+        AddClipboardEntry(std::move(recorded));
         if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
             ReloadClipboardHistory();
         }

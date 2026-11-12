@@ -22,7 +22,7 @@ COPY_COMMAND_HOTKEY: '^+c'
 # when the files change on disk, via `/reload`, or `DoRun.exe /reload`.
 CONFIG_AUTO_RELOAD_SECONDS: 0
 
-# Ditto-like clipboard text history.
+# Ditto-like clipboard history: text, rich text (RTF), images, and files.
 # The popup hotkey uses the same modifier syntax as Command.conf hotkeys
 # (^ = Ctrl, ! = Alt, + = Shift, @ = Win) and is global while DoRun runs.
 # Tapping the hotkey again steps the selection down; releasing its modifiers
@@ -33,6 +33,13 @@ CLIPBOARD_HISTORY_ENABLED: true
 CLIPBOARD_HOTKEY: '^`'
 CLIPBOARD_HISTORY_MAX_ROWS: 500
 CLIPBOARD_VISIBLE_ITEM_COUNT: 12
+# Which clipboard representations are captured. Files win over images and text
+# when a copy provides several of them (Explorer also copies the file names as
+# text); images win over text (Paint and Snipping Tool copy a bitmap).
+CLIPBOARD_CAPTURE_TEXT: true
+CLIPBOARD_CAPTURE_RICH_TEXT: true
+CLIPBOARD_CAPTURE_IMAGES: true
+CLIPBOARD_CAPTURE_FILES: true
 
 # Launcher appearance.
 # `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.

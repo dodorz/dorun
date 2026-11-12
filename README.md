@@ -17,7 +17,7 @@ Main capabilities:
 - Custom commands from `Command.conf`.
 - Built-in slash commands such as `/reload`, `/kill`, `/config`, and `/cmdconfig`.
 - Optional launcher-scoped hotkey to copy the selected command line to the clipboard.
-- Ditto-like clipboard history: one hotkey steps through recent clipboard text and pastes the selection, with a floating list window (`/clipboard`) for browsing.
+- Ditto-like clipboard history: one hotkey steps through recent clipboard text, rich text, images, and files and pastes the selection, with a floating list window (`/clipboard`) for browsing.
 - Managed hotkeys that launch specific commands directly.
 - `STARTUP` tasks that run when DoRun starts in startup mode.
 - Named groups that run via `DoRun.exe -run <group>` (e.g. `-run work`).
@@ -59,7 +59,18 @@ The hotkey is handled only while the launcher window is focused, so it does not 
 
 ### Clipboard history
 
-DoRun can keep a Ditto-like history of clipboard **text**. While it is running, every new clipboard text is appended to the history (newest first), including text copied by DoRun itself.
+DoRun can keep a Ditto-like clipboard history of **text, rich text (RTF), images, and files**. While it is running, every new clipboard payload is appended to the history (newest first), including payloads copied by DoRun itself.
+
+Each entry records the representations that the source application put on the clipboard:
+
+| Kind | Captured as | Restored as |
+|---|---|---|
+| Text | `CF_UNICODETEXT` | `CF_UNICODETEXT` |
+| Rich text | `CF_UNICODETEXT` plus the registered `Rich Text Format` (RTF) blob | both formats, so WordPad/Word keep formatting and text-only targets still work |
+| Image | `CF_DIBV5`, falling back to `CF_DIB` | the same identifier it was captured with |
+| Files | `CF_HDROP` with up to 200 paths | `CF_HDROP` (+ `Preferred DropEffect` = copy) and the path list as text |
+
+A copy that provides several kinds is stored as one entry with the most specific kind: files beat images and text (Explorer also puts the file names on the clipboard as text when you copy files), and images beat text (Paint and Snipping Tool copy a bitmap plus a fallback text).
 
 Press the clipboard hotkey at any time to open a small floating window with the history:
 
@@ -68,6 +79,12 @@ CLIPBOARD_HISTORY_ENABLED: true     # master switch for the feature
 CLIPBOARD_HOTKEY: '^`'              # AutoHotkey-like syntax, default is Ctrl+`
 CLIPBOARD_HISTORY_MAX_ROWS: 500     # how many entries to keep
 CLIPBOARD_VISIBLE_ITEM_COUNT: 12    # rows visible in the popup
+
+# What to capture. Turn off the kinds you never paste.
+CLIPBOARD_CAPTURE_TEXT: true
+CLIPBOARD_CAPTURE_RICH_TEXT: true
+CLIPBOARD_CAPTURE_IMAGES: true
+CLIPBOARD_CAPTURE_FILES: true
 ```
 
 In the popup:
@@ -91,9 +108,16 @@ When the hotkey has no modifiers (for example an `F` key such as `F8`), there is
 
 Walking the list with the hotkey and with `Up` / `Down` are alternatives: pressing a key or clicking in the list abandons the hotkey sequence, so nothing is pasted behind your back.
 
-The popup closes when it loses focus or when `Esc` is pressed. Entries are stored as plain text in `%LOCALAPPDATA%\DoRun\clipboard-history.txt`; pasting returns focus to the window you came from and the injected `Ctrl+V` lands there. Only text formats are captured — images and files are not part of the history. `/clipboard` opens the same popup from the launcher.
+The popup closes when it loses focus or when `Esc` is pressed. Pasting returns focus to the window you came from and the injected `Ctrl+V` lands there, so files land in Explorer, images land in Paint/Word, and rich text keeps its formatting. `/clipboard` opens the same popup from the launcher.
 
-In the list, entries are separated by a thin divider line and the selected entry is drawn with a filled highlight, a left accent bar, a bold font, and its rank (`#1`, `#2`, …) on the right.
+The history is stored in `%LOCALAPPDATA%\DoRun\`:
+
+- `clipboard-history.txt` — the index, one entry per line, newest first. Each line records the kind, the plain text, the file paths, the image size/format, and the content hashes of the blobs.
+- `clipboard-blobs\` — the RTF and image payloads, named after their content hash (`<hash>.rtf`, `<hash>.dib`). Identical re-copies reuse the same blob, and blobs no longer referenced by any entry are deleted automatically.
+
+Text entries are capped at 512 KB, blobs at 16 MB, and an index written by an older DoRun (plain text, one entry per line) is migrated in place on first load.
+
+In the list, each row starts with a kind badge (`[TEXT]`, `[RTF]`, `[IMG]`, `[FILE]`), image rows show a real thumbnail, and file rows show the first file name plus `+N more`. Entries are separated by a thin divider line and the selected entry is drawn with a filled highlight, a left accent bar, a bold font, and its rank (`#1`, `#2`, …) on the right. The preview pane below the list shows the image size, the full file list, or the beginning of the text.
 
 ### Forcing a console window
 
@@ -210,6 +234,10 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `CLIPBOARD_HOTKEY`
 - `CLIPBOARD_HISTORY_MAX_ROWS`
 - `CLIPBOARD_VISIBLE_ITEM_COUNT`
+- `CLIPBOARD_CAPTURE_TEXT`
+- `CLIPBOARD_CAPTURE_RICH_TEXT`
+- `CLIPBOARD_CAPTURE_IMAGES`
+- `CLIPBOARD_CAPTURE_FILES`
 - `HISTORY_ENABLED`
 - `HISTORY_DB_PATH`
 - `HISTORY_RANK_SUM_LIMIT`
