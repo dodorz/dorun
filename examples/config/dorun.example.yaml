@@ -40,6 +40,16 @@ CLIPBOARD_CAPTURE_TEXT: true
 CLIPBOARD_CAPTURE_RICH_TEXT: true
 CLIPBOARD_CAPTURE_IMAGES: true
 CLIPBOARD_CAPTURE_FILES: true
+# Copy rich text back as plain text only, so no application receives the RTF
+# format any more (useful when pasting into editors that keep source formatting).
+CLIPBOARD_RICH_TEXT_AS_PLAIN: false
+# Never record what these applications copy. Values are matched against the
+# process file name and support `*` and `?` wildcards. Applications can also
+# opt out per copy with the standard Windows clipboard-history formats.
+CLIPBOARD_HISTORY_IGNORE_PROCESSES:
+  - "keepass*.exe"
+  - "1password.exe"
+  - "bitwarden.exe"
 
 # Launcher appearance.
 # `LAUNCHER_CORNER_RADIUS` uses pixels after DPI scaling. Set to 0 to disable rounded corners.

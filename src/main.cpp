@@ -60,6 +60,10 @@ struct ClipboardConfig {
     bool captureRichText = true;
     bool captureImages = true;
     bool captureFiles = true;
+    // When set, rich text entries are restored as plain text only.
+    bool richTextAsPlain = false;
+    // Process names (glob patterns) whose clipboard content is not captured.
+    std::vector<std::wstring> ignoredProcesses;
 };
 
 enum class ClipboardEntryKind {
@@ -280,6 +284,11 @@ struct AppState {
     // each WM_DRAWITEM pass.
     std::unordered_map<ULONGLONG, HBITMAP> clipboardThumbnails;
     std::vector<ULONGLONG> clipboardThumbnailOrder;
+    // Process that owns the clipboard, captured while it is open so the ignore
+    // list can be evaluated after CloseClipboard().
+    std::wstring clipboardSourceProcess;
+    // True when the copy carries an "do not monitor" format.
+    bool clipboardSourceExcluded = false;
 
     HWND clipboardReturnWindow = nullptr;
     DWORD lastClipboardSequenceNumber = 0;
@@ -421,6 +430,11 @@ constexpr wchar_t kClipboardRtfFormatName[] = L"Rich Text Format";
 constexpr wchar_t kClipboardDropEffectFormatName[] = L"Preferred DropEffect";
 // How many decoded thumbnails stay cached; one full popup page is plenty.
 constexpr size_t kClipboardThumbnailCacheLimit = 12;
+// Windows clipboard-history opt-out formats. Applications set these to keep a
+// copy out of clipboard managers: password managers use the first one, and
+// Windows itself sets them when an app is excluded from clipboard history.
+constexpr wchar_t kClipboardExcludeMonitorFormatName[] = L"ExcludeClipboardContentFromMonitorProcessing";
+constexpr wchar_t kClipboardCanIncludeFormatName[] = L"CanIncludeInClipboardHistory";
 constexpr size_t kMaxDisplayedResults = 100;
 constexpr wchar_t kBuiltinCommandPrefix[] = L"builtin:";
 constexpr wchar_t kFilesystemCacheMagic[] = L"DoRunFilesystemCacheV1";
@@ -488,7 +502,7 @@ void LayoutClipboardWindow();
 void ReloadClipboardHistory();
 void UpdateClipboardPreview();
 void SelectFirstClipboardEntry();
-void CopySelectedClipboardEntry();
+void CopySelectedClipboardEntry(bool asPlainText = false);
 void DeleteSelectedClipboardEntry();
 void ClearClipboardHistory();
 void HandleClipboardHotkeyPress(bool moveUp);
@@ -531,6 +545,11 @@ bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry);
 void AddClipboardEntry(ClipboardEntry entry);
 void StoreClipboardEntry(ClipboardEntry entry, const std::vector<char>& rtfData, const std::vector<char>& imageData);
 bool CaptureClipboardEntry(ClipboardEntry* entry, std::vector<char>* rtfData, std::vector<char>* imageData);
+std::wstring GetClipboardSourceProcessName();
+bool IsClipboardSourceIgnored(std::wstring_view processName);
+bool IsClipboardCaptureExcludedBySource();
+bool MatchesProcessPattern(std::wstring_view name, std::wstring_view pattern);
+bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry);
 void ApplyClipboardFonts();
 void CopySelectedCommandLine();
 void ClearCopyFeedback(bool refreshDescription = true);
@@ -2382,6 +2401,27 @@ void LoadClipboardConfig() {
     }
     if (const std::optional<bool> captureFiles = ParseYamlBool(content, L"CLIPBOARD_CAPTURE_FILES")) {
         g_state.clipboardConfig.captureFiles = *captureFiles;
+    }
+    if (const std::optional<bool> richTextAsPlain = ParseYamlBool(content, L"CLIPBOARD_RICH_TEXT_AS_PLAIN")) {
+        g_state.clipboardConfig.richTextAsPlain = *richTextAsPlain;
+    }
+
+    // Ignore list: process file names with `*`/`?` wildcards, for the apps that
+    // must never reach the history (password managers, banking clients, ...).
+    g_state.clipboardConfig.ignoredProcesses.clear();
+    for (const std::wstring& rawPattern : ParseYamlStringArray(content, L"CLIPBOARD_HISTORY_IGNORE_PROCESSES")) {
+        const std::wstring pattern = Trim(rawPattern);
+        if (pattern.empty()) {
+            continue;
+        }
+        // Allow a full path in the config; matching uses the bare file name.
+        const std::filesystem::path asPath(pattern);
+        const std::wstring fileName = asPath.filename().wstring();
+        if (!fileName.empty()) {
+            g_state.clipboardConfig.ignoredProcesses.push_back(fileName);
+        } else {
+            g_state.clipboardConfig.ignoredProcesses.push_back(pattern);
+        }
     }
 
     const std::optional<std::wstring> hotkeySpec = ParseYamlString(content, L"CLIPBOARD_HOTKEY");
@@ -4318,6 +4358,121 @@ void StopClipboardPolling() {
     }
 }
 
+// Lower-cased file name of the process that owns the given window, e.g.
+// "keepassxc.exe". An empty result means the name could not be determined, in
+// which case callers must not treat it as a match.
+std::wstring GetProcessImageNameForWindow(HWND window) {
+    if (window == nullptr) {
+        return L"";
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == 0) {
+        return L"";
+    }
+
+    // PROCESS_QUERY_LIMITED_INFORMATION works for elevated processes too, unlike
+    // PROCESS_QUERY_INFORMATION.
+    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return L"";
+    }
+
+    wchar_t buffer[MAX_PATH * 2] {};
+    DWORD size = static_cast<DWORD>(std::size(buffer));
+    const bool queried = QueryFullProcessImageNameW(process, 0, buffer, &size) != FALSE;
+    CloseHandle(process);
+    if (!queried || size == 0) {
+        return L"";
+    }
+    return Lowercase(std::filesystem::path(buffer).filename().wstring());
+}
+
+// Process name of the clipboard owner. GetClipboardOwner() returns NULL while
+// the source process is still alive, so a handle-based query is only attempted
+// when the clipboard is open; the foreground window is used as a fallback
+// because that is usually the application the user copied from.
+std::wstring GetClipboardSourceProcessName() {
+    const HWND owner = GetClipboardOwner();
+    if (owner != nullptr) {
+        const std::wstring ownerName = GetProcessImageNameForWindow(owner);
+        if (!ownerName.empty()) {
+            return ownerName;
+        }
+    }
+    return GetProcessImageNameForWindow(GetForegroundWindow());
+}
+
+// Glob matching for the ignore list: `*` matches any run of characters, `?`
+// matches exactly one. Matching is case-insensitive and works on the bare
+// process file name ("keepassxc.exe"), so a pattern rarely needs a full path.
+bool MatchesProcessPattern(std::wstring_view name, std::wstring_view pattern) {
+    const std::wstring loweredName = Lowercase(name);
+    const std::wstring loweredPattern = Lowercase(pattern);
+
+    // Iterative backtracking glob match: no recursion, no regex compile cost.
+    size_t nameIndex = 0;
+    size_t patternIndex = 0;
+    size_t starPatternIndex = std::wstring_view::npos;
+    size_t starNameIndex = 0;
+    while (nameIndex < loweredName.size()) {
+        if (patternIndex < loweredPattern.size() &&
+            (loweredPattern[patternIndex] == L'?' || loweredPattern[patternIndex] == loweredName[nameIndex])) {
+            ++nameIndex;
+            ++patternIndex;
+            continue;
+        }
+        if (patternIndex < loweredPattern.size() && loweredPattern[patternIndex] == L'*') {
+            starPatternIndex = patternIndex++;
+            starNameIndex = nameIndex;
+            continue;
+        }
+        if (starPatternIndex == std::wstring_view::npos) {
+            return false;
+        }
+        patternIndex = starPatternIndex + 1;
+        nameIndex = ++starNameIndex;
+    }
+    while (patternIndex < loweredPattern.size() && loweredPattern[patternIndex] == L'*') {
+        ++patternIndex;
+    }
+    return patternIndex == loweredPattern.size();
+}
+
+// True when the source application is on CLIPBOARD_HISTORY_IGNORE_PROCESSES.
+bool IsClipboardSourceIgnored(std::wstring_view processName) {
+    if (processName.empty()) {
+        return false;
+    }
+    for (const std::wstring& pattern : g_state.clipboardConfig.ignoredProcesses) {
+        if (!pattern.empty() && MatchesProcessPattern(processName, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when the copy itself asks clipboard managers not to record it.
+bool IsClipboardCaptureExcludedBySource() {
+    const UINT excludeFormat = RegisterClipboardFormatW(kClipboardExcludeMonitorFormatName);
+    if (excludeFormat != 0 && GetClipboardData(excludeFormat) != nullptr) {
+        return true;
+    }
+    const UINT canIncludeFormat = RegisterClipboardFormatW(kClipboardCanIncludeFormatName);
+    if (canIncludeFormat != 0) {
+        const HANDLE handle = GetClipboardData(canIncludeFormat);
+        if (handle != nullptr) {
+            const DWORD* value = static_cast<const DWORD*>(GlobalLock(handle));
+            if (value != nullptr) {
+                const DWORD allowed = *value;
+                GlobalUnlock(handle);
+                return allowed == 0;
+            }
+        }
+    }
+    return false;
+}
+
 // Reads the whole clipboard once and turns it into a history entry. Returns
 // false only when the clipboard could not be opened (another process is
 // holding it), so the poller can retry that tick instead of skipping the
@@ -4339,6 +4494,13 @@ bool CaptureClipboardEntry(ClipboardEntry* entry, std::vector<char>* rtfData, st
     }
 
     const ClipboardConfig& config = g_state.clipboardConfig;
+
+    // Owner window and the opt-out formats are only readable while the
+    // clipboard is open, so both are recorded here and acted on by the poller.
+    g_state.clipboardSourceExcluded = IsClipboardCaptureExcludedBySource();
+    if (!g_state.clipboardSourceExcluded) {
+        g_state.clipboardSourceProcess = GetClipboardSourceProcessName();
+    }
 
     // The clipboard is already open here, so IsClipboardFormatAvailable() (which
     // opens it on its own) must not be used; a missing format simply makes
@@ -4416,7 +4578,27 @@ void PollClipboardForChanges() {
     // storing, otherwise every tick would retry the same clipboard.
     g_state.lastClipboardSequenceNumber = sequenceNumber;
 
-    const bool hasText = !entry.text.empty() && (g_state.clipboardConfig.captureText || entry.kind == ClipboardEntryKind::RichText);
+    // Source-side opt-outs are checked after the read so the sequence number is
+    // still consumed; otherwise every tick would re-read the same clipboard.
+    // Both values were captured while the clipboard was open, because
+    // GetClipboardOwner() and the opt-out formats are only valid then.
+    if (g_state.clipboardSourceExcluded) {
+        g_state.clipboardSourceExcluded = false;
+        g_state.clipboardSourceProcess.clear();
+        AppendHotkeyDebugLog(L"Clipboard capture skipped: the source opted out of clipboard history.");
+        return;
+    }
+    const bool ignored = IsClipboardSourceIgnored(g_state.clipboardSourceProcess);
+    if (ignored) {
+        AppendHotkeyDebugLog(L"Clipboard capture skipped for ignored process: " + g_state.clipboardSourceProcess);
+    }
+    g_state.clipboardSourceProcess.clear();
+    if (ignored) {
+        return;
+    }
+
+    const ClipboardEntryKind kind = entry.kind;
+    const bool hasText = !entry.text.empty() && (g_state.clipboardConfig.captureText || kind == ClipboardEntryKind::RichText);
     const bool hasRichText = entry.rtfHash != 0 && g_state.clipboardConfig.captureRichText;
     const bool hasImage = entry.imageHash != 0 && g_state.clipboardConfig.captureImages;
     const bool hasFiles = !entry.files.empty() && g_state.clipboardConfig.captureFiles;
@@ -4805,15 +4987,19 @@ COLORREF BlendColor(COLORREF base, COLORREF overlay, int overlayWeightPercent) {
         mix(GetBValue(base), GetBValue(overlay)));
 }
 
-// Number of lines BuildClipboardHintText() produces.
+// Number of lines BuildClipboardHintText() produces: two action lines plus the
+// cycling line when a clipboard hotkey is configured.
 int ClipboardHintLineCount() {
-    return g_state.clipboardConfig.hotkey.vk == 0U ? 1 : 2;
+    return g_state.clipboardConfig.hotkey.vk == 0U ? 2 : 3;
 }
 
 // Help text under the list. The first line documents the hotkey cycling when a
 // clipboard hotkey is configured.
 std::wstring BuildClipboardHintText() {
-    const std::wstring actions = L"Enter / Ctrl+C copy    Del remove    Ctrl+Del clear all    Esc close";
+    // Two action lines: the paste/copy keys first, the destructive keys second.
+    const std::wstring actions =
+        L"Enter / Ctrl+C copy    Ctrl+Shift+C or Ctrl+T copies as plain text\r\n"
+        L"Del remove    Ctrl+Del clear all    Esc close";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5446,7 +5632,9 @@ void PollClipboardCycleSequence() {
     EndClipboardCycleSequence();
 }
 
-void CopySelectedClipboardEntry() {
+// asPlainText forces a text-only copy; otherwise the entry keeps every format
+// it was captured with.
+void CopySelectedClipboardEntry(bool asPlainText) {
     const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
     const HWND returnWindow = g_state.clipboardReturnWindow;
     if (!index) {
@@ -5458,7 +5646,10 @@ void CopySelectedClipboardEntry() {
     // Hide before copying: the copy path refreshes the history, which would
     // otherwise flicker the still-visible list while the popup closes.
     HideClipboardHistory();
-    if (!CopyClipboardEntryToClipboard(entry)) {
+    const bool copied = asPlainText
+        ? CopyClipboardEntryAsPlainText(entry)
+        : CopyClipboardEntryToClipboard(entry);
+    if (!copied) {
         return;
     }
 
@@ -5597,9 +5788,17 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
             MoveClipboardSelection(1);
             return 0;
         }
+        // Enter / Ctrl+C keep the captured formats; Ctrl+Shift+C (or
+        // Ctrl+T) flattens the entry to plain text.
         if (wParam == VK_RETURN || (controlDown && wParam == 'C')) {
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             CancelClipboardCycleSequence();
-            CopySelectedClipboardEntry();
+            CopySelectedClipboardEntry(controlDown && shiftDown);
+            return 0;
+        }
+        if (controlDown && wParam == 'T') {
+            CancelClipboardCycleSequence();
+            CopySelectedClipboardEntry(true);
             return 0;
         }
         if (wParam == VK_ESCAPE) {
@@ -8028,6 +8227,8 @@ bool CopyTextToClipboard(std::wstring_view text) {
         // Record our own copies immediately instead of waiting for the poll,
         // and mark the sequence number as consumed so it is not read twice.
         g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+        g_state.clipboardSourceProcess.clear();
+        g_state.clipboardSourceExcluded = false;
         ClipboardEntry entry {};
         entry.kind = ClipboardEntryKind::Text;
         entry.text = std::wstring(text);
@@ -8143,11 +8344,14 @@ bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry) {
             }
         } else {
             // Plain text first: every target understands it, and the RTF
-            // format on top lets Word/WordPad restore the formatting.
+            // format on top lets Word/WordPad restore the formatting. With
+            // CLIPBOARD_RICH_TEXT_AS_PLAIN the RTF format is simply not
+            // published, which turns every rich text copy into plain text.
             if (!text.empty()) {
                 wroteAnything = SetClipboardUnicodeText(text) || wroteAnything;
             }
-            if (entry.rtfHash != 0) {
+            const bool publishRichText = entry.rtfHash != 0 && !g_state.clipboardConfig.richTextAsPlain;
+            if (publishRichText) {
                 const std::vector<char> rtf = ReadClipboardBlob(entry.rtfHash, true);
                 if (!rtf.empty()) {
                     const UINT rtfFormat = RegisterClipboardFormatW(kClipboardRtfFormatName);
@@ -8167,10 +8371,51 @@ bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry) {
     if (copied && g_state.clipboardConfig.enabled) {
         // Record the copy at the top, as CopyTextToClipboard does for text.
         g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+        g_state.clipboardSourceProcess.clear();
+        g_state.clipboardSourceExcluded = false;
         ClipboardEntry recorded = entry;
         if (recorded.kind == ClipboardEntryKind::Image && recorded.text.empty()) {
             recorded.text = BuildClipboardImageSummary(recorded.imageWidth, recorded.imageHeight, recorded.imageFormat);
         }
+        AddClipboardEntry(std::move(recorded));
+        if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+            ReloadClipboardHistory();
+        }
+    }
+    return copied;
+}
+
+// Copies an entry as plain text only, dropping its RTF/image/file formats.
+// Used by the popup keys that intentionally flatten a rich copy.
+bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry) {
+    std::wstring text = entry.text;
+    if (text.empty()) {
+        // Image and file entries have no text payload of their own; use their
+        // human readable label instead of copying nothing.
+        text = BuildClipboardEntryDescription(entry);
+    }
+
+    HWND owner = g_state.launcherWindow;
+    if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+        owner = g_state.clipboardWindow;
+    }
+    if (OpenClipboard(owner) == FALSE) {
+        return false;
+    }
+
+    bool copied = false;
+    if (EmptyClipboard() != FALSE) {
+        copied = SetClipboardUnicodeText(text);
+    }
+    CloseClipboard();
+
+    if (copied && g_state.clipboardConfig.enabled) {
+        g_state.lastClipboardSequenceNumber = GetClipboardSequenceNumber();
+        g_state.clipboardSourceProcess.clear();
+        g_state.clipboardSourceExcluded = false;
+        ClipboardEntry recorded {};
+        recorded.kind = ClipboardEntryKind::Text;
+        recorded.text = text;
         AddClipboardEntry(std::move(recorded));
         if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
             ReloadClipboardHistory();

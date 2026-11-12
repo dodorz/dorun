@@ -85,7 +85,28 @@ CLIPBOARD_CAPTURE_TEXT: true
 CLIPBOARD_CAPTURE_RICH_TEXT: true
 CLIPBOARD_CAPTURE_IMAGES: true
 CLIPBOARD_CAPTURE_FILES: true
+
+# Copy rich text back as plain text only (no RTF format on the clipboard).
+CLIPBOARD_RICH_TEXT_AS_PLAIN: false
+
+# Applications whose clipboard content is never recorded. Values match the
+# process file name (not the window title) and accept `*` / `?` wildcards.
+CLIPBOARD_HISTORY_IGNORE_PROCESSES:
+  - "keepass*.exe"
+  - "1password.exe"
+  - "bitwarden.exe"
+  - "*bank*.exe"
 ```
+
+Two independent opt-outs also apply, without any configuration:
+
+- An application can mark its copy as private by putting the
+  `ExcludeClipboardContentFromMonitorProcessing` format on the clipboard, or by
+  setting `CanIncludeInClipboardHistory` to `0`. Both are the standard Windows
+  clipboard-history opt-outs and password managers use them, so such a copy is
+  skipped even when the process is not on the ignore list.
+- DoRun's own copies are re-recorded deliberately, so its own writes are never
+  blocked by the ignore list.
 
 In the popup:
 
@@ -93,6 +114,7 @@ In the popup:
 |---|---|
 | `Up` / `Down` | Move the selection; the full text is previewed below the list |
 | `Enter`, `Ctrl+C`, double-click | Copy the selected entry back to the clipboard and close |
+| `Ctrl+Shift+C`, `Ctrl+T` | Copy the selected entry as **plain text only**, dropping RTF/image/file formats |
 | `Delete` | Remove the selected entry |
 | `Ctrl+Delete` | Clear the whole history |
 | `Esc` | Close without copying |
@@ -238,6 +260,8 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `CLIPBOARD_CAPTURE_RICH_TEXT`
 - `CLIPBOARD_CAPTURE_IMAGES`
 - `CLIPBOARD_CAPTURE_FILES`
+- `CLIPBOARD_RICH_TEXT_AS_PLAIN`
+- `CLIPBOARD_HISTORY_IGNORE_PROCESSES`
 - `HISTORY_ENABLED`
 - `HISTORY_DB_PATH`
 - `HISTORY_RANK_SUM_LIMIT`
