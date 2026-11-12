@@ -354,17 +354,49 @@ The build script:
 
 ## GitHub Actions
 
-The GitHub Actions build workflow:
+`src/version.h` is the only input to the build workflow. Its four segments mean
+`major.minor.patch.build`, and a master push is handled entirely from that file:
 
-- supports manual runs via `workflow_dispatch`
-- accepts version tags with or without a leading `v`
-- builds **every** pushed version tag, including build-only bumps
-- checks the tag against `src/version.h` and fails the run when they disagree, so a release can never ship a binary whose `FileVersion` differs from its tag
-- requires the tag to point at the commit that gets built
-- publishes a GitHub Release for the first run of a new tag; re-pushing or moving an existing tag only rebuilds artifacts, and a manual run replaces the assets of an existing release
-- packages artifacts as `DoRun-<version>-windows-x64.zip`
+| Change in `src/version.h` | Tag | Artifact | GitHub Release |
+|---|---|---|---|
+| nothing (docs-only commit) | — | — | — |
+| `build` only | created automatically | — | — |
+| `patch` | created automatically | yes | — |
+| `minor` or `major` | created automatically | yes | yes |
 
-Publishing a release therefore needs three things to agree: the pushed tag, the `src/version.h` at that commit, and the assets built from it. Bump `src/version.h` in the same commit that you tag.
+Concretely, the workflow:
+
+- runs on every push to `master`, on version tags (with or without a leading
+  `v`), and on manual dispatch
+- creates the version tag itself when a master push introduces a new
+  `src/version.h`. Tags pushed with `GITHUB_TOKEN` do not start another run, so
+  each version is built exactly once
+- builds both binaries (static and dynamic) whenever a `major`, `minor`, or
+  `patch` segment changed, and uploads them as
+  `DoRun-<version>-windows-x64.zip` in the run's Artifacts section
+- publishes a GitHub Release only for a `major`/`minor` change, and only when
+  the tag is named exactly like `src/version.h` — a tag push is never released
+  under a different tag's name, and a build-only bump never creates a release
+- always builds on an explicit tag push (even when the tag name disagrees with
+  the header — the artifact then carries the header version), and on a manual
+  run; a manual run with a version input always publishes, which is the repair
+  path for a broken release
+- treats a manual run without a version input as a dev build
+  (`dev-<sha>`, artifact only)
+- never fails just because the version did not change; it simply has nothing to
+  do
+
+Bumping the version is therefore the whole release act:
+
+```bat
+:: 1) edit src/version.h (major/minor/patch/build)
+git commit -am "chore: bump version to 0.4.0.58"
+git push origin master
+```
+
+The push tags `0.4.0.58`, builds both binaries, and — because `minor` changed —
+publishes the release. A `build`-only bump tags without building, and a
+`patch`-only bump builds the artifacts without a release.
 
 ## Versioning
 
@@ -374,13 +406,16 @@ DoRun uses a four-part version number:
 major.minor.patch.build
 ```
 
-Release tags use the `v<version>` format, for example:
+Release tags use the `<version>` format (a leading `v` is also accepted):
 
 ```text
-v0.2.1.27
+0.4.0.58
+v0.4.0.58
 ```
 
-`src/version.h` is the single source of truth for the version. The CI compares it with the pushed tag (or with the tag passed to a manual run) and refuses to release when they differ.
+`src/version.h` is the single source of truth. `FileVersion` and `ProductVersion`
+are compiled from it, the automatic tag name is derived from it, and a release is
+only published when the tag agrees with it.
 
 ## Notes
 

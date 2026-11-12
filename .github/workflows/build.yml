@@ -2,6 +2,8 @@ name: Build
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*.*.*.*'
       - '*.*.*.*'
@@ -61,6 +63,25 @@ jobs:
           }
           Write-Host "Checked out tag $tag"
 
+      # Version policy. src/version.h is the only input: the four segments map to
+      # major, minor, patch, build (in that order).
+      #   * a master push that introduces a new version.h gets an automatic tag
+      #     named after it (a docs-only commit leaves version.h alone, so such a
+      #     push does nothing at all),
+      #   * a major, minor, or patch change builds both binaries and uploads them
+      #     as a workflow artifact,
+      #   * a major or minor change additionally publishes a GitHub Release, but
+      #     only when the tag that triggered the run (or the tag this run creates)
+      #     is named exactly like the header version,
+      #   * a build-only bump (same major.minor.patch) gets the tag and nothing
+      #     else,
+      #   * an explicit tag push always builds; it releases only when its name
+      #     matches the header, and never under a different tag's name,
+      #   * a manual run with a version is the repair path: it always builds and
+      #     always publishes (softprops replaces the existing assets),
+      #   * a manual run without a version is a dev build (artifact only).
+      # Tags pushed with GITHUB_TOKEN do not start another run, so each version is
+      # built exactly once.
       - name: Resolve version and release gate
         id: version
         shell: pwsh
@@ -78,9 +99,9 @@ jobs:
             throw "Cannot fetch tags from origin."
           }
 
-          # src/version.h is the single source of truth. This is what the
-          # binaries' FileVersion is compiled from, so a tag that disagrees
-          # with it must fail instead of shipping a mislabelled release.
+          # src/version.h is the single source of truth: it is what the binaries'
+          # FileVersion is compiled from, so it decides the version, the
+          # automatic tag name, and whether a release may be published.
           function ConvertFrom-VersionHeader([string] $Content) {
             $parts = @{}
             foreach ($name in "MAJOR", "MINOR", "PATCH", "BUILD") {
@@ -91,6 +112,22 @@ jobs:
               $parts[$name] = [int]$match.Groups[1].Value
             }
             return [version]("{0}.{1}.{2}.{3}" -f $parts["MAJOR"], $parts["MINOR"], $parts["PATCH"], $parts["BUILD"])
+          }
+
+          # .NET [version] only exposes Major/Minor/Build/Revision, so the
+          # four version.h segments must be mapped explicitly:
+          # major=Major, minor=Minor, patch=Build, build=Revision.
+          function Get-VersionSegments([version] $Value) {
+            return @{
+              Major = $Value.Major
+              Minor = $Value.Minor
+              Patch = $Value.Build
+              Build = $Value.Revision
+            }
+          }
+
+          function Format-Version([version] $Value) {
+            return "$($Value.Major).$($Value.Minor).$($Value.Build).$($Value.Revision)"
           }
 
           function Get-ReleasedVersion([string] $Tag) {
@@ -111,117 +148,210 @@ jobs:
             }
           }
 
-          $rawVersion = ""
-          $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($env:MANUAL_VERSION)
+          $headSha = (git rev-parse HEAD | Out-String).Trim()
+          $isBranchPush = $env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "branch"
+          $isTagPush = $env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "tag"
+          $manualVersion = $env:MANUAL_VERSION.Trim()
+          $isManualDevBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and [string]::IsNullOrWhiteSpace($manualVersion)
+          $isManualVersionedBuild = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($manualVersion)
 
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $rawVersion = $env:GITHUB_REF_NAME
-          } elseif ($isManualVersionedBuild) {
-            $rawVersion = $env:MANUAL_VERSION
+          # The header of the commit that is actually being built.
+          $headerVersion = ConvertFrom-VersionHeader (git show "${headSha}:src/version.h" | Out-String)
+          $pushedVersion = [version]$headerVersion
+          $numericVersion = Format-Version $pushedVersion
+          Write-Host "src/version.h at $headSha = $numericVersion"
+
+          # Every version tag reachable from HEAD, so merges and moved tags do
+          # not confuse the comparison.
+          $knownTags = @()
+          foreach ($tag in (git tag --merged HEAD | ForEach-Object { $_.Trim() })) {
+            $match = [regex]::Match($tag, $versionTagPattern)
+            if (-not $match.Success) {
+              continue
+            }
+            $knownTags += [pscustomobject]@{ Tag = $tag; Version = [version]$match.Groups[1].Value }
           }
 
-          $tagName = ""
-          $publishRelease = "false"
-
-          if ([string]::IsNullOrWhiteSpace($rawVersion)) {
-            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
-            Write-Host "Dev build: $version (no version tag, no release)"
-          } elseif ($rawVersion -match $versionTagPattern) {
-            $numericVersion = [regex]::Match($rawVersion, $versionTagPattern).Groups[1].Value
-            $taggedVersion = [version]$numericVersion
-            $version = "v$numericVersion"
-            $headSha = (git rev-parse HEAD | Out-String).Trim()
-
-            # Tags exist both as v0.3.0.51 and 0.3.0.51, and a commit can
-            # carry more than one version tag. Prefer the tag that triggered
-            # this run, then any tag on this commit that names this version.
-            $headTags = @(git tag --points-at HEAD | ForEach-Object { $_.Trim() })
-            $tagName = ""
-            $preferred = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "" }
-            $candidates = @()
-            if ($preferred) {
-              $candidates += $preferred
-              if ($preferred -match '^v') {
-                $candidates += ($preferred -replace '^v', '')
-              } else {
-                $candidates += "v$preferred"
-              }
+          # Highest version strictly below the header version.
+          $previous = $null
+          foreach ($entry in $knownTags) {
+            if ($entry.Version -lt $pushedVersion -and (-not $previous -or $entry.Version -gt $previous.Version)) {
+              $previous = $entry
             }
-            $candidates += $headTags
-            foreach ($tag in $candidates) {
-              $match = [regex]::Match($tag, $versionTagPattern)
-              if (-not $match.Success) {
-                continue
-              }
-              if ([version]$match.Groups[1].Value -ne $taggedVersion) {
-                continue
-              }
-              if ($headTags -notcontains $tag) {
-                continue
-              }
-              $tagName = $tag
+          }
+
+          $changedMajor = $false
+          $changedMinor = $false
+          $changedPatch = $false
+          if (-not $previous) {
+            Write-Host "No older version tag reachable from HEAD; treating every segment as changed."
+            $changedMajor = $true
+            $changedMinor = $true
+            $changedPatch = $true
+          } else {
+            Write-Host "Previous reachable version: $($previous.Tag) ($(Format-Version $previous.Version))"
+            $now = Get-VersionSegments $pushedVersion
+            $was = Get-VersionSegments $previous.Version
+            $changedMajor = $now.Major -ne $was.Major
+            $changedMinor = $now.Minor -ne $was.Minor
+            $changedPatch = $now.Patch -ne $was.Patch
+            Write-Host ("Changed segments: major={0} minor={1} patch={2} build={3}" -f `
+              $changedMajor, $changedMinor, $changedPatch, ($now.Build -ne $was.Build))
+          }
+          $changedVersionedSegment = $changedMajor -or $changedMinor -or $changedPatch
+
+          # A tag that already names this header version means version.h was
+          # bumped earlier; a branch push then has nothing new to tag or build.
+          $existingTagForVersion = $knownTags |
+            Where-Object { $_.Version -eq $pushedVersion } |
+            Select-Object -First 1
+          if ($existingTagForVersion) {
+            Write-Host "Version $numericVersion already tagged as $($existingTagForVersion.Tag)"
+          }
+
+          # Tags that point at the commit being built.
+          $currentTags = @(git tag --points-at HEAD | ForEach-Object { $_.Trim() })
+
+          # Tag on this exact commit whose name matches the header version.
+          $matchingTagOnHead = $null
+          foreach ($entry in $knownTags) {
+            if ($entry.Version -eq $pushedVersion -and $currentTags -contains $entry.Tag) {
+              $matchingTagOnHead = $entry
               break
             }
-            if (-not $tagName) {
-              throw "No tag for $numericVersion points at HEAD ($headSha). Tag the built commit, or run the workflow for the tag ref."
-            }
+          }
+          $tagMatchesHeader = $null -ne $matchingTagOnHead
 
-            $headerVersion = ConvertFrom-VersionHeader (git show "${headSha}:src/version.h" | Out-String)
-            if ($headerVersion -ne $taggedVersion) {
-              throw "Tag $tagName does not match src/version.h ($headerVersion). Bump src/version.h in the same commit that is tagged."
+          # For a tag push, the tag that triggered the run has to name the header
+          # version itself; a different tag on the same commit must not earn a
+          # release under its own name.
+          $pushedTagMatchesHeader = $false
+          if ($isTagPush) {
+            $pushedMatch = [regex]::Match($env:GITHUB_REF_NAME, $versionTagPattern)
+            if ($pushedMatch.Success -and [version]$pushedMatch.Groups[1].Value -eq $pushedVersion) {
+              $pushedTagMatchesHeader = $true
             }
-            Write-Host "Tag $tagName matches src/version.h ($headerVersion)"
+          }
 
-            # Informational: what release came before this one, compared by
-            # version number over all tags reachable from HEAD. Merges and
-            # moved tags no longer make this comparison wrong.
-            $previous = $null
-            foreach ($tag in (git tag --merged HEAD | ForEach-Object { $_.Trim() })) {
-              $match = [regex]::Match($tag, $versionTagPattern)
-              if (-not $match.Success) {
-                continue
-              }
-              $candidate = [version]$match.Groups[1].Value
-              if ($candidate -lt $taggedVersion -and (-not $previous -or $candidate -gt $previous.Version)) {
-                $previous = [pscustomobject]@{ Tag = $tag; Version = $candidate }
-              }
-            }
-            if ($previous) {
-              Write-Host "Previous reachable version: $($previous.Tag) ($($previous.Version))"
+          $version = "v$numericVersion"
+          $autoTag = "false"
+          $shouldBuild = "false"
+          $publishRelease = "false"
+          $tagName = if ($matchingTagOnHead) { $matchingTagOnHead.Tag } else { "" }
+
+          if ($isBranchPush) {
+            if ($existingTagForVersion) {
+              Write-Host "Nothing to do: ${pushedVersion} is already tagged; skipping tag, build, and release."
             } else {
-              Write-Host "No older reachable version; this is the first release."
-            }
-
-            $alreadyReleased = Get-ReleasedVersion $tagName
-            if ($env:GITHUB_REF_TYPE -eq "tag") {
-              # Re-pushed or moved tags must not clobber an existing release;
-              # a manual run is the documented way to repair one.
-              if ($alreadyReleased) {
-                Write-Host "Release $tagName already exists; skipping publish (use a manual run to replace its assets)."
-                $publishRelease = "false"
-              } else {
-                $publishRelease = "true"
+              # Fresh version introduced by this push: tag it, and build when a
+              # major, minor, or patch segment changed.
+              $autoTag = "true"
+              $shouldBuild = if ($changedVersionedSegment) { "true" } else { "false" }
+              if (-not $changedVersionedSegment) {
+                Write-Host "Build-only bump to ${numericVersion}: tagging without building."
               }
-            } else {
+              $tagName = $numericVersion
+            }
+          } elseif ($isTagPush) {
+            # An explicit tag push always builds, even when its name disagrees
+            # with the header; the artifact then carries the header version.
+            $shouldBuild = "true"
+            if (-not $pushedTagMatchesHeader) {
+              Write-Host "Tag $($env:GITHUB_REF_NAME) does not name the header version $numericVersion; building without releasing."
+            }
+            # Releases must be attributed to the tag that was pushed.
+            $tagName = if ($pushedTagMatchesHeader) { $env:GITHUB_REF_NAME } else { "" }
+          } elseif ($isManualVersionedBuild) {
+            # Manual runs choose the commit (an existing tag) explicitly; they
+            # keep working as the repair path for a broken release.
+            $shouldBuild = "true"
+          } elseif ($isManualDevBuild) {
+            $shouldBuild = "true"
+          }
+
+          # Release rules: the artifacts must exist, the tag must point at this
+          # very commit, and only a major/minor change earns a release. A manual
+          # versioned run is the documented repair path and always publishes.
+          if ($isManualVersionedBuild) {
+            $publishRelease = "true"
+          } elseif ($shouldBuild -eq "true" -and ($changedMajor -or $changedMinor)) {
+            if ($isBranchPush -and $autoTag -eq "true") {
+              # This run creates the tag itself right after the gate.
               $publishRelease = "true"
+            } elseif ($isTagPush -and $pushedTagMatchesHeader) {
+              $publishRelease = "true"
+            } else {
+              Write-Host "Refusing to publish: no tag pointing at $headSha is named $numericVersion."
             }
-          } else {
-            throw "Version must match v<major>.<minor>.<patch>.<build> or <major>.<minor>.<patch>.<build>: $rawVersion"
+          } elseif ($shouldBuild -eq "true") {
+            Write-Host "Patch-level change only: artifact is built, no release is published."
+          }
+
+          if ($publishRelease -eq "true") {
+            $alreadyReleased = Get-ReleasedVersion $tagName
+            if ($alreadyReleased -and -not $isManualVersionedBuild) {
+              Write-Host "Release $tagName already exists; keeping it (a manual run replaces its assets)."
+              $publishRelease = "false"
+            }
+          }
+
+          if ($isManualDevBuild) {
+            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+            $tagName = ""
+            $autoTag = "false"
+            $publishRelease = "false"
+            Write-Host "Dev build: $version (no tag, no release)"
           }
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "auto_tag=$autoTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_build=$shouldBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "publish_release=$publishRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      # version.h changed on master: create the tag here. It has to happen in
+      # this run, because a tag pushed with GITHUB_TOKEN does not start another
+      # workflow run (that also keeps the build count at one per version).
+      - name: Tag the new version
+        if: steps.version.outputs.auto_tag == 'true'
+        shell: pwsh
+        env:
+          NEW_TAG: ${{ steps.version.outputs.tag_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:NEW_TAG)) {
+            throw "No tag name resolved for the automatic tag."
+          }
+
+          $headSha = (git rev-parse HEAD | Out-String).Trim()
+          git rev-parse --verify --quiet "refs/tags/$($env:NEW_TAG)^{commit}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Tag $($env:NEW_TAG) already exists locally; leaving it alone."
+            exit 0
+          }
+
+          git tag $env:NEW_TAG $headSha
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not create tag $($env:NEW_TAG)."
+          }
+          git push origin "refs/tags/$($env:NEW_TAG)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not push tag $($env:NEW_TAG)."
+          }
+          Write-Host "Created and pushed tag $($env:NEW_TAG) at $headSha"
+
       - name: Build static release
+        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat StaticRelease x64
 
       - name: Build dynamic release
+        if: steps.version.outputs.should_build == 'true'
         shell: cmd
         run: build.bat Release x64
 
       - name: Package executables
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
@@ -236,6 +366,7 @@ jobs:
           Compress-Archive -Path (Join-Path $dynamicStage "DoRun.exe") -DestinationPath "dist\DoRun-$version-windows-x64.zip" -Force
 
       - name: Upload build artifacts
+        if: steps.version.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DoRun-${{ steps.version.outputs.version }}-windows-x64
@@ -280,8 +411,15 @@ jobs:
           files: dist/*.zip
 
       - name: Note artifact-only build
-        if: steps.version.outputs.publish_release != 'true'
+        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.publish_release != 'true'
         shell: pwsh
         run: |
           Write-Host "Built ${{ steps.version.outputs.version }} as a workflow artifact only; no GitHub Release was created."
-          Write-Host "Re-run the workflow manually with this version to publish or repair the release."
+          Write-Host "Download it from this run's Artifacts section, or re-run the workflow with a version input to publish a release."
+
+      - name: Note tag-only bump
+        if: steps.version.outputs.auto_tag == 'true' && steps.version.outputs.should_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Tagged ${{ steps.version.outputs.tag_name }} without building: only the build segment changed."
+          Write-Host "Run the workflow manually with version ${{ steps.version.outputs.tag_name }} to build it anyway."
