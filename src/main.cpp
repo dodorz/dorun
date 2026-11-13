@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <imm.h>
@@ -93,6 +94,9 @@ struct ClipboardEntry {
     DWORD imageFormat = 0;
     int imageWidth = 0;
     int imageHeight = 0;
+    // Pinned entries are kept at the top of the history and never dropped by the
+    // row limit until every unpinned entry is gone.
+    bool starred = false;
 };
 
 struct LauncherAppearanceConfig {
@@ -531,6 +535,10 @@ void PasteSelectedClipboardEntry();
 void InjectPasteKeystroke();
 void InjectPasteIntoClipboardTarget();
 void DrawClipboardListItem(const DRAWITEMSTRUCT& draw);
+void DrawClipboardStar(HDC dc, const RECT& starRect, bool starred, COLORREF strokeColor, COLORREF fillColor);
+RECT ClipboardStarRectForRow(const RECT& row);
+void SortClipboardEntries();
+void ToggleClipboardEntryStar(size_t index);
 bool DrawClipboardImageThumbnail(HDC dc, const ClipboardEntry& entry, RECT thumbnailRect);
 HBITMAP LoadClipboardImageBitmap(const ClipboardEntry& entry);
 std::wstring BuildClipboardEntryLabel(const ClipboardEntry& entry);
@@ -4249,6 +4257,8 @@ void SaveClipboardEntriesToFile(bool pruneBlobs) {
         content += std::to_wstring(entry.rtfHash);
         content += L"\t";
         content += std::to_wstring(entry.imageHash);
+        content += L"\t";
+        content += entry.starred ? L"1" : L"0";
         content += L"\n";
     }
 
@@ -4266,11 +4276,46 @@ void SaveClipboardEntriesToFile(bool pruneBlobs) {
     }
 }
 
+// Keeps starred entries before unstarred ones, preserving the newest-first order
+// inside each group. std::stable_sort is used so equal keys stay in place.
+void SortClipboardEntries() {
+    std::stable_sort(
+        g_state.clipboardEntries.begin(),
+        g_state.clipboardEntries.end(),
+        [](const ClipboardEntry& left, const ClipboardEntry& right) {
+            return left.starred && !right.starred;
+        });
+}
+
+// Enforces CLIPBOARD_HISTORY_MAX_ROWS. Starred entries are the last thing to go:
+// unstarred entries are dropped from the oldest end first, and only when nothing
+// unstarred is left are starred entries themselves evicted.
 void TrimClipboardEntries() {
     const size_t limit = static_cast<size_t>(std::clamp(g_state.clipboardConfig.maxRows, 1, 5000));
+
+    // Remove the oldest unstarred entry until the history fits or only starred
+    // entries remain.
+    for (size_t index = g_state.clipboardEntries.size(); index > limit;) {
+        size_t victim = g_state.clipboardEntries.size();
+        for (size_t candidate = g_state.clipboardEntries.size(); candidate > 0; --candidate) {
+            if (!g_state.clipboardEntries[candidate - 1].starred) {
+                victim = candidate - 1;
+                break;
+            }
+        }
+        if (victim >= g_state.clipboardEntries.size()) {
+            break;
+        }
+        using EntryDifference = std::vector<ClipboardEntry>::difference_type;
+        g_state.clipboardEntries.erase(g_state.clipboardEntries.begin() + static_cast<EntryDifference>(victim));
+        index = g_state.clipboardEntries.size();
+    }
+
+    // Starred entries outnumber the limit: fall back to plain truncation.
     if (g_state.clipboardEntries.size() > limit) {
         g_state.clipboardEntries.resize(limit);
     }
+    SortClipboardEntries();
 }
 
 // Loads the v2 index. Files written by older DoRun versions are plain text, one
@@ -4361,6 +4406,11 @@ void LoadClipboardEntriesFromFile() {
         if (fields.size() > 7) {
             entry.imageHash = ParseClipboardHash(fields[7]);
         }
+        // Fields after imageHash were added later; an index written before the
+        // star feature simply has fewer columns and reads as "not starred".
+        if (fields.size() > 8) {
+            entry.starred = fields[8] == L"1";
+        }
 
         const bool empty = entry.text.empty() && entry.files.empty() && entry.rtfHash == 0 && entry.imageHash == 0;
         if (empty) {
@@ -4390,24 +4440,47 @@ void AddClipboardEntry(ClipboardEntry entry) {
         return;
     }
 
-    // An unchanged newest entry is left alone so polling does not churn the
-    // list; a re-copy of an older entry moves it back to the top.
-    const auto existing = std::find_if(
+    // Recency is tracked inside the starred and unstarred groups separately, so
+    // the insert position is the first unstarred entry (the starred block comes
+    // first). Re-copying the very newest unstarred entry is a no-op so polling
+    // does not churn the list; a re-copy of an older entry moves it there.
+    const auto firstUnstarred = std::find_if(
         g_state.clipboardEntries.begin(),
+        g_state.clipboardEntries.end(),
+        [](const ClipboardEntry& candidate) { return !candidate.starred; });
+
+    const auto existing = std::find_if(
+        firstUnstarred,
         g_state.clipboardEntries.end(),
         [&entry](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, entry); });
     if (existing != g_state.clipboardEntries.end()) {
-        if (existing == g_state.clipboardEntries.begin()) {
+        // Preserve the star when the same payload is copied again.
+        entry.starred = existing->starred;
+        if (existing == firstUnstarred) {
             return;
         }
         ClipboardEntry moved = std::move(*existing);
         g_state.clipboardEntries.erase(existing);
+        g_state.clipboardEntries.insert(firstUnstarred, std::move(moved));
+        SaveClipboardEntriesToFile(false);
+        return;
+    }
+
+    // Copying a payload whose starred twin exists refreshes the starred entry
+    // rather than creating an unstarred duplicate.
+    const auto starredTwin = std::find_if(
+        g_state.clipboardEntries.begin(),
+        firstUnstarred,
+        [&entry](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, entry); });
+    if (starredTwin != firstUnstarred) {
+        ClipboardEntry moved = std::move(*starredTwin);
+        g_state.clipboardEntries.erase(starredTwin);
         g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(moved));
         SaveClipboardEntriesToFile(false);
         return;
     }
 
-    g_state.clipboardEntries.insert(g_state.clipboardEntries.begin(), std::move(entry));
+    g_state.clipboardEntries.insert(firstUnstarred, std::move(entry));
     const size_t previousCount = g_state.clipboardEntries.size();
     TrimClipboardEntries();
     SaveClipboardEntriesToFile(g_state.clipboardEntries.size() != previousCount);
@@ -5177,7 +5250,7 @@ std::wstring BuildClipboardHintText() {
     // Two action lines: the paste/copy keys first, the destructive keys second.
     const std::wstring actions =
         L"Enter / Ctrl+C copy    Ctrl+Shift+C or Ctrl+T copies as plain text\r\n"
-        L"Del remove    Ctrl+Del clear all    Esc close";
+        L"Space or click the star pins the entry    Del remove    Ctrl+Del clear all    Esc close";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5204,6 +5277,107 @@ int ClipboardListItemHeight() {
         height = std::max(height, Scale(52));
     }
     return height;
+}
+
+// Square box reserved for the star button at the right end of a row.
+RECT ClipboardStarRectForRow(const RECT& row) {
+    const int edge = Scale(20);
+    const int rightPadding = Scale(10);
+    const int top = row.top + ((row.bottom - row.top) - edge) / 2;
+    RECT starRect {};
+    starRect.right = row.right - rightPadding;
+    starRect.left = starRect.right - edge;
+    starRect.top = top;
+    starRect.bottom = top + edge;
+    return starRect;
+}
+
+// Draws a five-pointed star. Hollow (outlined, unfilled) means "not pinned yet",
+// filled means pinned. Both states use the same geometry so the click target and
+// the visible shape always agree.
+void DrawClipboardStar(HDC dc, const RECT& starRect, bool starred, COLORREF strokeColor, COLORREF fillColor) {
+    if (dc == nullptr) {
+        return;
+    }
+
+    const double centerX = (starRect.left + starRect.right) / 2.0;
+    const double centerY = (starRect.top + starRect.bottom) / 2.0;
+    const double outerRadius = (starRect.right - starRect.left) / 2.0 - Scale(1);
+    if (outerRadius <= 1.0) {
+        return;
+    }
+    // A classic five-pointed star has an inner/outer radius ratio of about 0.382.
+    const double innerRadius = outerRadius * 0.42;
+
+    // Ten vertices, outer and inner alternating, starting at the top point.
+    std::array<POINT, 10> points {};
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double angle = -3.14159265358979323846 / 2.0 + static_cast<double>(index) * 3.14159265358979323846 / 5.0;
+        const double radius = (index % 2 == 0) ? outerRadius : innerRadius;
+        points[index].x = static_cast<LONG>(centerX + radius * std::cos(angle));
+        points[index].y = static_cast<LONG>(centerY + radius * std::sin(angle));
+    }
+
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, Scale(1)), strokeColor);
+    HBRUSH brush = nullptr;
+    if (starred) {
+        brush = CreateSolidBrush(fillColor);
+    } else {
+        // Hollow star: no fill, so only the outline is painted.
+        brush = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
+    }
+    if (pen == nullptr || brush == nullptr) {
+        if (pen != nullptr) {
+            DeleteObject(pen);
+        }
+        if (brush != nullptr && brush != GetStockObject(NULL_BRUSH)) {
+            DeleteObject(brush);
+        }
+        return;
+    }
+
+    const HGDIOBJ oldPen = SelectObject(dc, pen);
+    const HGDIOBJ oldBrush = SelectObject(dc, brush);
+    const int oldFillMode = SetPolyFillMode(dc, WINDING);
+    Polygon(dc, points.data(), static_cast<int>(points.size()));
+    SetPolyFillMode(dc, oldFillMode);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+
+    if (brush != GetStockObject(NULL_BRUSH)) {
+        DeleteObject(brush);
+    }
+    DeleteObject(pen);
+}
+
+// Flips the star of one entry, re-sorts the list and persists the change.
+void ToggleClipboardEntryStar(size_t index) {
+    if (index >= g_state.clipboardEntries.size()) {
+        return;
+    }
+    g_state.clipboardEntries[index].starred = !g_state.clipboardEntries[index].starred;
+
+    // Remember the toggled entry so the reload below keeps the selection on it
+    // instead of jumping to whatever row happened to be selected before.
+    const ClipboardEntry toggled = g_state.clipboardEntries[index];
+    SortClipboardEntries();
+    SaveClipboardEntriesToFile(false);
+
+    const auto newIndex = std::find_if(
+        g_state.clipboardEntries.begin(),
+        g_state.clipboardEntries.end(),
+        [&toggled](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, toggled); });
+    const size_t newRow = newIndex == g_state.clipboardEntries.end()
+        ? 0
+        : static_cast<size_t>(std::distance(g_state.clipboardEntries.begin(), newIndex));
+
+    ReloadClipboardHistory();
+    if (g_state.clipboardList != nullptr) {
+        SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(newRow), 0);
+        SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(newRow), 0);
+        InvalidateRect(g_state.clipboardList, nullptr, FALSE);
+        UpdateClipboardPreview();
+    }
 }
 
 // Draws one history row: a separator line between entries, a filled highlight
@@ -5268,31 +5442,47 @@ void DrawClipboardListItem(const DRAWITEMSTRUCT& draw) {
     const int oldBkMode = SetBkMode(draw.hDC, TRANSPARENT);
     const COLORREF oldTextColor = SetTextColor(draw.hDC, textColor);
 
+    const ClipboardEntry& entry = g_state.clipboardEntries[itemIndex];
+    const RECT starRect = ClipboardStarRectForRow(row);
+
     RECT textRect = row;
     textRect.left += Scale(14);
-    // Leave room for the rank marker drawn on the right of the selected row.
-    textRect.right -= selected ? Scale(60) : Scale(12);
+    // The star button owns the right end of every row; the rank hint of the
+    // selected row sits just inside it.
+    textRect.right = starRect.left - Scale(6);
     // Thumbnail for image entries, drawn between the accent bar and the label.
-    if (g_state.clipboardEntries[itemIndex].kind == ClipboardEntryKind::Image) {
+    if (entry.kind == ClipboardEntryKind::Image) {
         const int thumbEdge = row.bottom - row.top - Scale(8);
         RECT thumbRect { textRect.left, row.top + Scale(4), textRect.left + thumbEdge, row.top + Scale(4) + thumbEdge };
-        if (DrawClipboardImageThumbnail(draw.hDC, g_state.clipboardEntries[itemIndex], thumbRect)) {
+        if (DrawClipboardImageThumbnail(draw.hDC, entry, thumbRect)) {
             textRect.left = thumbRect.right + Scale(10);
         }
     }
 
-    const std::wstring label = BuildClipboardEntryLabel(g_state.clipboardEntries[itemIndex]);
-    DrawTextW(draw.hDC, label.c_str(), static_cast<int>(label.size()), &textRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-
+    // The star paints its own column, so the label never overlaps it.
+    RECT labelRect = textRect;
     if (selected) {
-        // Rank hint on the right edge, so the order is obvious while cycling.
+        // Rank hint left of the star, so the order is obvious while cycling.
         const std::wstring rank = L"#" + std::to_wstring(itemIndex + 1);
-        RECT rankRect = row;
-        rankRect.left = rankRect.right - Scale(56);
-        rankRect.right -= Scale(10);
+        RECT rankRect = textRect;
+        rankRect.left = rankRect.right - Scale(40);
+        labelRect.right = rankRect.left - Scale(6);
         SetTextColor(draw.hDC, BlendColor(selectedBackground, RGB(255, 255, 255), 70));
         DrawTextW(draw.hDC, rank.c_str(), static_cast<int>(rank.size()), &rankRect, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        SetTextColor(draw.hDC, textColor);
     }
+
+    const std::wstring label = BuildClipboardEntryLabel(entry);
+    DrawTextW(draw.hDC, label.c_str(), static_cast<int>(label.size()), &labelRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    // Star: filled when pinned, hollow outline otherwise.
+    const COLORREF starStroke = selected
+        ? BlendColor(selectedBackground, RGB(255, 255, 255), 85)
+        : g_state.launcherAppearance.subtleTextColor;
+    const COLORREF starFill = selected
+        ? RGB(255, 255, 255)
+        : g_state.launcherAppearance.accentColor;
+    DrawClipboardStar(draw.hDC, starRect, entry.starred, starStroke, starFill);
 
     SetTextColor(draw.hDC, oldTextColor);
     SetBkMode(draw.hDC, oldBkMode);
@@ -5939,6 +6129,32 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
     if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MOUSEWHEEL) {
         CancelClipboardCycleSequence();
     }
+
+    // A click on the star column toggles the pin without moving the selection.
+    // The hit test has to happen here: the listbox would otherwise just select
+    // the row under the cursor.
+    if (message == WM_LBUTTONDOWN) {
+        const LRESULT hit = SendMessageW(window, LB_ITEMFROMPOINT, 0, lParam);
+        const int row = static_cast<int>(LOWORD(hit));
+        if (HIWORD(hit) == 0 && row >= 0) {
+            RECT rowRect {};
+            if (SendMessageW(window, LB_GETITEMRECT, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&rowRect)) != LB_ERR) {
+                const RECT starRect = ClipboardStarRectForRow(rowRect);
+                const POINT click { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                // A slightly larger hit box than the drawn star keeps the target
+                // comfortable at high DPI without stealing row clicks.
+                RECT hitBox = starRect;
+                InflateRect(&hitBox, Scale(4), Scale(4));
+                if (PtInRect(&hitBox, click) != FALSE) {
+                    const LRESULT itemIndex = SendMessageW(window, LB_GETITEMDATA, static_cast<WPARAM>(row), 0);
+                    if (itemIndex != LB_ERR && static_cast<size_t>(itemIndex) < g_state.clipboardEntries.size()) {
+                        ToggleClipboardEntryStar(static_cast<size_t>(itemIndex));
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
     // The hotkey may be an Alt chord; swallow the system-key messages of that
     // key so the popup never enters menu mode (which would beep and could steal
     // focus). Anything else, e.g. Alt+F4, still goes through.
@@ -5977,6 +6193,15 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
         if (controlDown && wParam == 'T') {
             CancelClipboardCycleSequence();
             CopySelectedClipboardEntry(true);
+            return 0;
+        }
+        if (wParam == VK_SPACE) {
+            // Space pins/unpins the selected entry, matching the star click.
+            const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+            if (index) {
+                CancelClipboardCycleSequence();
+                ToggleClipboardEntryStar(*index);
+            }
             return 0;
         }
         if (wParam == VK_ESCAPE) {
