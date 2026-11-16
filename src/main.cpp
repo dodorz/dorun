@@ -306,6 +306,19 @@ struct AppState {
     // True when the copy carries an "do not monitor" format.
     bool clipboardSourceExcluded = false;
 
+    // Progressive search box under the history list.
+    HWND clipboardSearch = nullptr;
+    WNDPROC clipboardSearchProc = nullptr;
+    // Space in the list toggles the star, but TranslateMessage still turns that
+    // key into a WM_CHAR ' ' afterwards. The flag tells the WM_CHAR handler to
+    // drop it so no stray space lands in the filter box.
+    ULONGLONG clipboardSpaceConsumedTick = 0;
+    // Indexes into clipboardEntries for the rows currently shown. Empty query
+    // means "all entries", which is represented by an empty vector + a flag so
+    // filtering does not have to copy the whole list.
+    std::vector<size_t> clipboardFilteredIndexes;
+    bool clipboardFilterActive = false;
+
     HWND clipboardReturnWindow = nullptr;
     DWORD lastClipboardSequenceNumber = 0;
     HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -536,6 +549,13 @@ void InjectPasteKeystroke();
 void InjectPasteIntoClipboardTarget();
 void DrawClipboardListItem(const DRAWITEMSTRUCT& draw);
 void DrawClipboardStar(HDC dc, const RECT& starRect, bool starred, COLORREF strokeColor, COLORREF fillColor);
+void RebuildClipboardFilter();
+size_t GetVisibleClipboardRowCount();
+std::optional<size_t> ClipboardRowToEntryIndex(size_t row);
+std::optional<size_t> ClipboardEntryIndexToRow(size_t entryIndex);
+std::wstring BuildClipboardSearchHaystack(const ClipboardEntry& entry);
+std::optional<size_t> GetSelectedClipboardEntryIndex();
+std::wstring GetControlText(HWND window);
 RECT ClipboardStarRectForRow(const RECT& row);
 void SortClipboardEntries();
 void ToggleClipboardEntryStar(size_t index);
@@ -5095,11 +5115,13 @@ void UpdateClipboardPreview() {
 
     const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
     if (!index) {
-        SetWindowTextW(
-            g_state.clipboardPreview,
-            g_state.clipboardEntries.empty()
-                ? L"Clipboard history is empty. Copy text, images, rich text, or files to start collecting entries."
-                : L"");
+        std::wstring message;
+        if (g_state.clipboardEntries.empty()) {
+            message = L"Clipboard history is empty. Copy text, images, rich text, or files to start collecting entries.";
+        } else if (g_state.clipboardFilterActive) {
+            message = L"No entry matches the filter. Press Esc to clear it.";
+        }
+        SetWindowTextW(g_state.clipboardPreview, message.c_str());
         return;
     }
 
@@ -5108,21 +5130,119 @@ void UpdateClipboardPreview() {
     SetWindowTextW(g_state.clipboardPreview, description.c_str());
 }
 
+// Text that the progressive filter searches: the list label (which already
+// contains the kind badge and a collapsed preview), the file paths, and the
+// long text behind the label. Searching the full text matters for entries whose
+// match is beyond the 24-character preview.
+std::wstring BuildClipboardSearchHaystack(const ClipboardEntry& entry) {
+    std::wstring haystack = BuildClipboardEntryLabel(entry);
+    if (!entry.text.empty()) {
+        haystack += L"\n";
+        haystack += entry.text;
+    }
+    for (const std::wstring& path : entry.files) {
+        haystack += L"\n";
+        haystack += path;
+    }
+    return Lowercase(haystack);
+}
+
+// Progressive filter: every whitespace separated token must appear as a
+// case-insensitive substring of the entry. Substring (not fuzzy) matching keeps
+// the result predictable while typing: a subsequence match would happily match
+// "report" inside "hello world from notepad", which is not what a filter should
+// do. An empty query clears the filter so every entry shows again.
+void RebuildClipboardFilter() {
+    g_state.clipboardFilteredIndexes.clear();
+    g_state.clipboardFilterActive = false;
+    if (g_state.clipboardSearch == nullptr) {
+        return;
+    }
+
+    const std::wstring query = Trim(GetControlText(g_state.clipboardSearch));
+    if (query.empty()) {
+        return;
+    }
+
+    const std::vector<std::wstring> tokens = SplitQueryTokens(Lowercase(query));
+    if (tokens.empty()) {
+        return;
+    }
+
+    g_state.clipboardFilterActive = true;
+    for (size_t index = 0; index < g_state.clipboardEntries.size(); ++index) {
+        const std::wstring haystack = BuildClipboardSearchHaystack(g_state.clipboardEntries[index]);
+        const bool matchesAll = std::all_of(
+            tokens.begin(),
+            tokens.end(),
+            [&haystack](const std::wstring& token) {
+                return haystack.find(token) != std::wstring::npos;
+            });
+        if (matchesAll) {
+            g_state.clipboardFilteredIndexes.push_back(index);
+        }
+    }
+}
+
+// Number of rows the list should show right now (filtered or not).
+size_t GetVisibleClipboardRowCount() {
+    return g_state.clipboardFilterActive ? g_state.clipboardFilteredIndexes.size() : g_state.clipboardEntries.size();
+}
+
+// Maps a listbox row back to the entry index in clipboardEntries.
+std::optional<size_t> ClipboardRowToEntryIndex(size_t row) {
+    if (g_state.clipboardFilterActive) {
+        if (row >= g_state.clipboardFilteredIndexes.size()) {
+            return std::nullopt;
+        }
+        return g_state.clipboardFilteredIndexes[row];
+    }
+    if (row >= g_state.clipboardEntries.size()) {
+        return std::nullopt;
+    }
+    return row;
+}
+
+// Reverse of ClipboardRowToEntryIndex: where an entry is shown right now, or
+// nullopt when the current filter hides it.
+std::optional<size_t> ClipboardEntryIndexToRow(size_t entryIndex) {
+    if (!g_state.clipboardFilterActive) {
+        return entryIndex < g_state.clipboardEntries.size()
+            ? std::optional<size_t>(entryIndex)
+            : std::nullopt;
+    }
+    const auto found = std::find(
+        g_state.clipboardFilteredIndexes.begin(),
+        g_state.clipboardFilteredIndexes.end(),
+        entryIndex);
+    if (found == g_state.clipboardFilteredIndexes.end()) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(std::distance(g_state.clipboardFilteredIndexes.begin(), found));
+}
+
 void ReloadClipboardHistory() {
     ResetClipboardThumbnailCache();
     if (g_state.clipboardList == nullptr) {
         return;
     }
 
+    RebuildClipboardFilter();
+
     const LRESULT previousSelection = SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0);
     SendMessageW(g_state.clipboardList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_state.clipboardList, LB_RESETCONTENT, 0, 0);
 
-    for (size_t index = 0; index < g_state.clipboardEntries.size(); ++index) {
-        const std::wstring label = BuildClipboardEntryLabel(g_state.clipboardEntries[index]);
+    const size_t rowCount = GetVisibleClipboardRowCount();
+    for (size_t row = 0; row < rowCount; ++row) {
+        const std::optional<size_t> entryIndex = ClipboardRowToEntryIndex(row);
+        if (!entryIndex) {
+            continue;
+        }
+        const std::wstring label = BuildClipboardEntryLabel(g_state.clipboardEntries[*entryIndex]);
         const LRESULT inserted = SendMessageW(g_state.clipboardList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         if (inserted >= 0) {
-            SendMessageW(g_state.clipboardList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(index));
+            SendMessageW(g_state.clipboardList, LB_SETITEMDATA, static_cast<WPARAM>(inserted), static_cast<LPARAM>(*entryIndex));
         }
     }
 
@@ -5185,6 +5305,7 @@ void ApplyClipboardFonts() {
         previewPointSize);
 
     ApplyFont(g_state.clipboardList, g_state.clipboardFont);
+    ApplyFont(g_state.clipboardSearch, g_state.clipboardFont);
     ApplyFont(g_state.clipboardPreview, g_state.clipboardPreviewFont);
     ApplyFont(g_state.clipboardHint, g_state.clipboardPreviewFont);
     if (g_state.clipboardHint != nullptr) {
@@ -5250,7 +5371,7 @@ std::wstring BuildClipboardHintText() {
     // Two action lines: the paste/copy keys first, the destructive keys second.
     const std::wstring actions =
         L"Enter / Ctrl+C copy    Ctrl+Shift+C or Ctrl+T copies as plain text\r\n"
-        L"Space or click the star pins the entry    Del remove    Ctrl+Del clear all    Esc close";
+        L"Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc clears filter, then closes";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5367,17 +5488,74 @@ void ToggleClipboardEntryStar(size_t index) {
         g_state.clipboardEntries.begin(),
         g_state.clipboardEntries.end(),
         [&toggled](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, toggled); });
-    const size_t newRow = newIndex == g_state.clipboardEntries.end()
+    const size_t newEntryIndex = newIndex == g_state.clipboardEntries.end()
         ? 0
         : static_cast<size_t>(std::distance(g_state.clipboardEntries.begin(), newIndex));
 
+    // Reloading rebuilds the (possibly filtered) rows, so the row to select is
+    // looked up afterwards from the entry index rather than reused directly.
     ReloadClipboardHistory();
     if (g_state.clipboardList != nullptr) {
-        SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(newRow), 0);
-        SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(newRow), 0);
+        const std::optional<size_t> newRow = ClipboardEntryIndexToRow(newEntryIndex);
+        const LRESULT row = newRow ? static_cast<LRESULT>(*newRow) : 0;
+        SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(row), 0);
+        SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(row), 0);
         InvalidateRect(g_state.clipboardList, nullptr, FALSE);
         UpdateClipboardPreview();
     }
+}
+
+// Subclass for the history search box. Typing filters the list on every change
+// (via EN_CHANGE in the parent), so this only has to route the navigation keys
+// the list itself would otherwise never see.
+LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_SETFOCUS) {
+        SetEnglishImeForWindow(window);
+    }
+    if (message == WM_KEYDOWN) {
+        if (wParam == VK_ESCAPE) {
+            // Esc in the search box clears it first; a second Esc closes the
+            // popup, which is what the user expects after typing a query.
+            if (!GetControlText(window).empty()) {
+                SetWindowTextW(window, L"");
+                return 0;
+            }
+            HideClipboardHistory();
+            return 0;
+        }
+        if (wParam == VK_DOWN || wParam == VK_UP) {
+            // Move into the list and keep the query, so the filtered view stays.
+            SetFocus(g_state.clipboardList);
+            if (g_state.clipboardList != nullptr) {
+                const LRESULT count = SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0);
+                if (count > 0 && SendMessageW(g_state.clipboardList, LB_GETCURSEL, 0, 0) == LB_ERR) {
+                    SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+                    UpdateClipboardPreview();
+                }
+            }
+            return 0;
+        }
+        if (wParam == VK_TAB) {
+            if (g_state.clipboardList != nullptr) {
+                SetFocus(g_state.clipboardList);
+            }
+            return 0;
+        }
+        if (wParam == VK_RETURN) {
+            // Enter in the search box acts on the first (best) match.
+            const LRESULT count = g_state.clipboardList != nullptr
+                ? SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0)
+                : 0;
+            if (count > 0) {
+                SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+                UpdateClipboardPreview();
+                CancelClipboardCycleSequence();
+                CopySelectedClipboardEntry();
+            }
+            return 0;
+        }
+    }
+    return CallWindowProcW(g_state.clipboardSearchProc, window, message, wParam, lParam);
 }
 
 // Draws one history row: a separator line between entries, a filled highlight
@@ -5793,18 +5971,26 @@ void LayoutClipboardWindow() {
         }
     }
     const int listHeight = listItemHeight * g_state.clipboardConfig.visibleItemCount;
+    // The filter box sits right below the list; its height follows the font so
+    // it scales with DPI like everything else.
+    const int searchHeight = std::max(Scale(26), MeasureFontTextHeight(g_state.clipboardFont) + Scale(10));
     const int previewHeight = Scale(96);
     const int hintHeight = std::max(
         Scale(20),
         MeasureFontTextHeight(g_state.clipboardPreviewFont) * ClipboardHintLineCount() + Scale(6));
-    const int height = margin * 4 + listHeight + previewHeight + hintHeight;
+    const int height = margin * 5 + listHeight + searchHeight + previewHeight + hintHeight;
     const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
     const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 6;
 
     SetWindowPos(g_state.clipboardWindow, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     MoveWindow(g_state.clipboardList, margin, margin, width - margin * 2, listHeight, TRUE);
-    MoveWindow(g_state.clipboardPreview, margin, margin * 2 + listHeight, width - margin * 2, previewHeight, TRUE);
-    MoveWindow(g_state.clipboardHint, margin, margin * 3 + listHeight + previewHeight, width - margin * 2, hintHeight, TRUE);
+    const int searchTop = margin * 2 + listHeight;
+    if (g_state.clipboardSearch != nullptr) {
+        MoveWindow(g_state.clipboardSearch, margin, searchTop, width - margin * 2, searchHeight, TRUE);
+    }
+    const int previewTop = searchTop + searchHeight + margin;
+    MoveWindow(g_state.clipboardPreview, margin, previewTop, width - margin * 2, previewHeight, TRUE);
+    MoveWindow(g_state.clipboardHint, margin, previewTop + previewHeight + margin, width - margin * 2, hintHeight, TRUE);
     ApplyClipboardAppearance();
 }
 
@@ -5851,6 +6037,10 @@ void ShowClipboardHistory() {
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
+    // Each open starts from the unfiltered history.
+    if (g_state.clipboardSearch != nullptr) {
+        SetWindowTextW(g_state.clipboardSearch, L"");
+    }
     ReloadClipboardHistory();
     // The popup always starts on the newest entry, so a single hotkey press can
     // already paste it.
@@ -6168,6 +6358,25 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
         // mode loop, which would otherwise start on a plain Alt press.
         return 0;
     }
+    // A printable character typed while the list has focus starts a search:
+    // the keystroke is forwarded to the filter box so typing anywhere in the
+    // popup narrows the list. The listbox's own type-ahead never runs because
+    // this branch consumes the WM_CHAR first.
+    if (message == WM_CHAR) {
+        const wchar_t typed = static_cast<wchar_t>(wParam);
+        const bool spaceAlreadyUsed = typed == L' ' &&
+            (GetTickCount64() - g_state.clipboardSpaceConsumedTick) < 250ULL;
+        if (typed >= 0x20 && typed != 0x7F && !spaceAlreadyUsed &&
+            (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+            (GetKeyState(VK_MENU) & 0x8000) == 0) {
+            if (g_state.clipboardSearch != nullptr) {
+                SetFocus(g_state.clipboardSearch);
+                SendMessageW(g_state.clipboardSearch, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+                PostMessageW(g_state.clipboardSearch, WM_CHAR, wParam, lParam);
+            }
+            return 0;
+        }
+    }
     if (message == WM_KEYDOWN) {
         const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         // Any manual navigation cancels the hotkey sequence, otherwise the
@@ -6202,9 +6411,29 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
                 CancelClipboardCycleSequence();
                 ToggleClipboardEntryStar(*index);
             }
+            // The matching WM_CHAR ' ' arrives right after this handler; claim
+            // it so the star shortcut does not also start a filter query.
+            g_state.clipboardSpaceConsumedTick = GetTickCount64();
+            return 0;
+        }
+        // Tab moves focus between the filter box and the list; the popup is not
+        // a dialog, so the system does not do it for us.
+        if (wParam == VK_TAB) {
+            CancelClipboardCycleSequence();
+            if (g_state.clipboardSearch != nullptr) {
+                SetFocus(g_state.clipboardSearch);
+            }
             return 0;
         }
         if (wParam == VK_ESCAPE) {
+            // Esc undoes the filter first; only an unfiltered popup closes.
+            if (g_state.clipboardFilterActive) {
+                CancelClipboardCycleSequence();
+                if (g_state.clipboardSearch != nullptr) {
+                    SetWindowTextW(g_state.clipboardSearch, L"");
+                }
+                return 0;
+            }
             HideClipboardHistory();
             return 0;
         }
@@ -6254,8 +6483,28 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_HINT)),
             g_state.instance,
             nullptr);
-        // Creates the fonts, applies them to all three controls, rebuilds the
-        // hint text and pushes the owner-draw row height.
+        // Progressive filter box under the list. ES_AUTOHSCROLL keeps long
+        // queries on one line; the cue banner works because the manifest pulls
+        // in common controls 6.
+        g_state.clipboardSearch = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0,
+            0,
+            0,
+            0,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_SEARCH)),
+            g_state.instance,
+            nullptr);
+        if (g_state.clipboardSearch != nullptr) {
+            SendMessageW(g_state.clipboardSearch, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"Filter history"));
+            g_state.clipboardSearchProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.clipboardSearch, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ClipboardSearchProc)));
+        }
+        // Creates the fonts, applies them to all controls, rebuilds the hint
+        // text and pushes the owner-draw row height.
         ApplyClipboardFonts();
         g_state.clipboardListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_state.clipboardList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ClipboardListProc)));
         LayoutClipboardWindow();
@@ -6299,6 +6548,16 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         break;
     }
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_CLIPBOARD_SEARCH && HIWORD(wParam) == EN_CHANGE) {
+            // Progressive search: refilter and rebuild on every keystroke.
+            ReloadClipboardHistory();
+            if (g_state.clipboardList != nullptr && SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0) > 0) {
+                SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+                SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, 0, 0);
+                UpdateClipboardPreview();
+            }
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
             UpdateClipboardPreview();
             return 0;
@@ -6313,6 +6572,13 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         HDC dc = reinterpret_cast<HDC>(wParam);
         SetBkMode(dc, TRANSPARENT);
         SetBkColor(dc, g_state.launcherAppearance.backgroundColor);
+        SetTextColor(dc, g_state.launcherAppearance.textColor);
+        return reinterpret_cast<LRESULT>(g_state.clipboardBackgroundBrush != nullptr ? g_state.clipboardBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetBkMode(dc, TRANSPARENT);
+        SetBkColor(dc, g_state.launcherAppearance.searchBackgroundColor);
         SetTextColor(dc, g_state.launcherAppearance.textColor);
         return reinterpret_cast<LRESULT>(g_state.clipboardBackgroundBrush != nullptr ? g_state.clipboardBackgroundBrush : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     }

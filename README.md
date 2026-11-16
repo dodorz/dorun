@@ -108,16 +108,34 @@ Two independent opt-outs also apply, without any configuration:
 - DoRun's own copies are re-recorded deliberately, so its own writes are never
   blocked by the ignore list.
 
+### Filtering the history
+
+A filter box sits directly below the list. It filters **progressively** — the
+list narrows on every keystroke — and matches case-insensitively against the
+entry's label (kind badge included), its full text, and its file paths:
+
+- several words must **all** match (`report 2026` keeps only entries containing both `report` and `2026`)
+- plain substring matching, so what you type is what you see — no fuzzy surprises
+- the box starts empty on every open of the popup; the match is shown in the preview pane (or `No entry matches the filter` when nothing matches)
+
+You can also start typing directly in the popup: printable keys are forwarded to
+the filter box while the list has focus, so `report` narrows the list without
+first clicking the box. `Tab`/`Shift+Tab` still move between the filter box and
+the list, and `Up`/`Down` in the box move focus into the list with the query
+kept. `Enter` in the box pastes the first (newest) match.
+
 In the popup:
 
 | Key | Action |
 |---|---|
 | `Up` / `Down` | Move the selection; the full text is previewed below the list |
+| type anywhere | Filter the list (text goes to the box below the list) |
 | `Enter`, `Ctrl+C`, double-click | Copy the selected entry back to the clipboard and close |
 | `Ctrl+Shift+C`, `Ctrl+T` | Copy the selected entry as **plain text only**, dropping RTF/image/file formats |
+| `Space`, click the star | Pin the entry (pinned entries stay on top) |
 | `Delete` | Remove the selected entry |
 | `Ctrl+Delete` | Clear the whole history |
-| `Esc` | Close without copying |
+| `Esc` | Clear the filter first; when it is already empty, close without copying |
 
 DoRun can also drive the popup with the clipboard hotkey itself, so the whole cycle stays on one chord:
 
