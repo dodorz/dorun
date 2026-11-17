@@ -1387,6 +1387,70 @@ std::wstring ResolveAliasSourceArgument() {
     return emptySourcePath;
 }
 
+// aliasc's generated functions run the editor as `& $env:EDITOR <path>` (the
+// CMD and POSIX variants use %EDITOR% / ${EDITOR}). Those variables normally
+// come from an interactive shell profile, but DoRun starts powershell.exe
+// -NoProfile, cmd.exe and bash without one, so they are empty: every Edit*
+// item dies with a "BadExpression" on a hidden window (SHOW_WINDOW: 0), which
+// is what "the launcher matches the command but Enter does nothing" looks like.
+// Fall back to DoRun's own EDITOR setting when the environment has none.
+std::wstring GetAliasEditorExecutable() {
+    const std::wstring configured = ExpandEnvironmentVariables(Trim(g_state.editorConfig.commandLine));
+    if (configured.empty()) {
+        return L"";
+    }
+    // `& $env:EDITOR <path>` needs one command name, so an argument list has to
+    // be cut off here; keeping a single value in every shell also avoids a
+    // different editor per shell.
+    if (configured.front() == L'"') {
+        const size_t closingQuote = configured.find(L'"', 1);
+        return closingQuote == std::wstring::npos
+            ? configured.substr(1)
+            : configured.substr(1, closingQuote - 1);
+    }
+    const size_t firstSpace = configured.find_first_of(L" \t");
+    return firstSpace == std::wstring::npos ? configured : configured.substr(0, firstSpace);
+}
+
+// The line goes after the runner's param() block: a PowerShell script may only
+// start with param(), comments or using-statements.
+std::wstring BuildPowerShellEditorFallback() {
+    const std::wstring editor = GetAliasEditorExecutable();
+    if (editor.empty()) {
+        return L"";
+    }
+    return L"if ([string]::IsNullOrWhiteSpace($env:EDITOR)) { $env:EDITOR = " +
+        QuoteForPowerShellScript(editor) + L"; }\r\n";
+}
+
+std::wstring BuildCmdEditorFallback() {
+    std::wstring editor = GetAliasEditorExecutable();
+    if (editor.empty()) {
+        return L"";
+    }
+    // A batch file expands %name%, so a literal percent has to be doubled.
+    std::wstring escaped;
+    escaped.reserve(editor.size() + 4);
+    for (const wchar_t ch : editor) {
+        escaped += ch;
+        if (ch == L'%') {
+            escaped += L'%';
+        }
+    }
+    return L"if not defined EDITOR set \"EDITOR=" + escaped + L"\"\r\n";
+}
+
+std::wstring BuildPosixEditorFallback() {
+    const std::wstring editor = GetAliasEditorExecutable();
+    if (editor.empty()) {
+        return L"";
+    }
+    // The generated functions quote ${EDITOR}, so no word splitting happens and
+    // the value has to be the bare executable.
+    return L"if [ -z \"${EDITOR:-}\" ]; then EDITOR=" + QuoteForShellScript(editor) +
+        L"; export EDITOR; fi\n";
+}
+
 bool CompileAliasArtifacts() {
     if (!g_state.aliasSupport.compilerReady ||
         (g_state.aliasSupport.sourcePath.empty() && g_state.aliasSupport.shortcutMapPath.empty())) {
@@ -1430,28 +1494,40 @@ bool CompileAliasArtifacts() {
         workingDirectory,
         stderrPaths.posix);
 
+    // The runner launches with SHOW_WINDOW: 0, so a failing alias leaves no
+    // trace anywhere; keep its stderr in a file that holds the last run only.
+    const std::wstring runnerStderrPath =
+        (std::filesystem::path(g_state.aliasSupport.powershellRunnerPath).parent_path() /
+         L"alias-runner.stderr.txt").wstring();
+
     if (cmdCompiled) {
         SaveUtf8TextFile(
             g_state.aliasSupport.cmdBootstrapPath,
-            L"@echo off\r\ndoskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdOutputPath) + L"\r\n");
+            L"@echo off\r\n" + BuildCmdEditorFallback() +
+            L"doskey /macrofile=" + QuoteCommandLineArgument(g_state.aliasSupport.cmdOutputPath) + L"\r\n");
     }
     if (powershellCompiled) {
         SaveUtf8TextFile(
             g_state.aliasSupport.powershellBootstrapPath,
+            BuildPowerShellEditorFallback() +
             L". " + QuoteForPowerShellScript(g_state.aliasSupport.powershellOutputPath) + L"\r\n");
         SaveUtf8TextFile(
             g_state.aliasSupport.powershellRunnerPath,
             L"param(\r\n"
             L"    [Parameter(Mandatory=$true)][string]$AliasName,\r\n"
             L"    [Parameter(ValueFromRemainingArguments=$true)][string[]]$AliasArgs\r\n"
-            L")\r\n"
+            L")\r\n" +
+            BuildPowerShellEditorFallback() +
+            L"Remove-Item -LiteralPath " + QuoteForPowerShellScript(runnerStderrPath) +
+            L" -ErrorAction SilentlyContinue\r\n"
             L". " + QuoteForPowerShellScript(g_state.aliasSupport.powershellOutputPath) + L"\r\n"
-            L"& $AliasName @AliasArgs\r\n"
+            L"& $AliasName @AliasArgs 2>> " + QuoteForPowerShellScript(runnerStderrPath) + L"\r\n"
             L"if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }\r\n");
     }
     if (posixCompiled) {
         SaveUtf8TextFile(
             g_state.aliasSupport.posixBootstrapPath,
+            BuildPosixEditorFallback() +
             L". " + QuoteForShellScript(g_state.aliasSupport.posixOutputPath) + L"\n");
     }
 
@@ -1830,6 +1906,10 @@ std::wstring BuildAliasImportDependencySignature() {
     signature << L"compiler=" << g_state.aliasSupport.compilerCommand << L'\n';
     signature << L"show_window=" << g_state.aliasSupport.showCommand << L'\n';
     signature << L"show_definition=" << (g_state.aliasSupport.showDefinition ? 1 : 0) << L'\n';
+    // The generated runner/bootstrap scripts embed the editor fallback, so a
+    // changed EDITOR has to regenerate them instead of waiting for another
+    // dependency to move.
+    signature << L"editor=" << GetAliasEditorExecutable() << L'\n';
     for (const std::wstring& path : dependencyPaths) {
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error) && !error;
