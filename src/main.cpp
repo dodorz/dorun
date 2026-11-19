@@ -5464,8 +5464,8 @@ int ClipboardHintLineCount() {
 std::wstring BuildClipboardHintText() {
     // Two action lines: the paste/copy keys first, the destructive keys second.
     const std::wstring actions =
-        L"Enter / Ctrl+C copy    Ctrl+Shift+C or Ctrl+T copies as plain text\r\n"
-        L"Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc clears filter, then closes";
+        L"Enter / double-click paste    Ctrl+C copy    Ctrl+Shift+C / Ctrl+T copy as text\r\n"
+        L"Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc closes without pasting";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5636,7 +5636,8 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
             return 0;
         }
         if (wParam == VK_RETURN) {
-            // Enter in the search box acts on the first (best) match.
+            // Enter in the search box pastes the first (best) match, matching
+            // the list's Enter; Ctrl+C there still copies without pasting.
             const LRESULT count = g_state.clipboardList != nullptr
                 ? SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0)
                 : 0;
@@ -5644,8 +5645,18 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
                 SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
                 UpdateClipboardPreview();
                 CancelClipboardCycleSequence();
-                CopySelectedClipboardEntry();
+                PasteSelectedClipboardEntry();
             }
+            return 0;
+        }
+        if (wParam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            // Ctrl+C in the filter box copies the first match without pasting.
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (g_state.clipboardList != nullptr) {
+                SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+            }
+            CancelClipboardCycleSequence();
+            CopySelectedClipboardEntry(shiftDown);
             return 0;
         }
     }
@@ -6423,6 +6434,10 @@ void PasteSelectedClipboardEntry() {
     }
 
     if (returnWindow == nullptr || IsWindow(returnWindow) == FALSE) {
+        // Nothing to paste into (for example the popup was opened from the
+        // launcher with /clipboard). The entry is on the clipboard, so say so
+        // in the debug log instead of pasting into an unknown window.
+        AppendHotkeyDebugLog(L"No return window for clipboard paste; entry left on the clipboard.");
         return;
     }
 
@@ -6538,12 +6553,25 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
             MoveClipboardSelection(1);
             return 0;
         }
-        // Enter / Ctrl+C keep the captured formats; Ctrl+Shift+C (or
-        // Ctrl+T) flattens the entry to plain text.
-        if (wParam == VK_RETURN || (controlDown && wParam == 'C')) {
+        // Ditto semantics: Enter pastes the selection straight into the window
+        // the popup was opened from, while Ctrl+C only puts it on the clipboard.
+        // Ctrl+Shift+C (or Ctrl+T) copies it as plain text.
+        if (wParam == VK_RETURN) {
+            if (g_state.clipboardCycleActive) {
+                // The hotkey chord is still armed. Its release already pastes,
+                // and that path waits until every modifier is physically up so
+                // the injected Ctrl+V is not mixed with a held Ctrl/Alt. Leave
+                // the paste to it instead of injecting while a key is down.
+                g_state.clipboardCycleLastPressTick = GetTickCount64();
+                return 0;
+            }
+            PasteSelectedClipboardEntry();
+            return 0;
+        }
+        if (controlDown && wParam == 'C') {
             const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             CancelClipboardCycleSequence();
-            CopySelectedClipboardEntry(controlDown && shiftDown);
+            CopySelectedClipboardEntry(shiftDown);
             return 0;
         }
         if (controlDown && wParam == 'T') {
@@ -6710,8 +6738,13 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
             return 0;
         }
         if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_DBLCLK) {
-            CancelClipboardCycleSequence();
-            CopySelectedClipboardEntry();
+            // Double-click pastes, like Enter; Ctrl+C stays the copy-only path.
+            if (g_state.clipboardCycleActive) {
+                // A mouse click cancels the sequence below, so the chord release
+                // would no longer paste; do it here instead.
+                CancelClipboardCycleSequence();
+            }
+            PasteSelectedClipboardEntry();
             return 0;
         }
         break;

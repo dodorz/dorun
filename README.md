@@ -130,12 +130,19 @@ In the popup:
 |---|---|
 | `Up` / `Down` | Move the selection; the full text is previewed below the list |
 | type anywhere | Filter the list (text goes to the box below the list) |
-| `Enter`, `Ctrl+C`, double-click | Copy the selected entry back to the clipboard and close |
+| `Enter`, double-click | **Paste** the selected entry into the window the popup was opened from, then close |
+| `Ctrl+C` | Copy the selected entry to the clipboard and close (no paste) |
 | `Ctrl+Shift+C`, `Ctrl+T` | Copy the selected entry as **plain text only**, dropping RTF/image/file formats |
 | `Space`, click the star | Pin the entry (pinned entries stay on top) |
 | `Delete` | Remove the selected entry |
 | `Ctrl+Delete` | Clear the whole history |
 | `Esc` | Clear the filter first; when it is already empty, close **without pasting** — also while the hotkey chord is still held |
+
+This is Ditto's interaction model: `Enter` (and double-click) performs the
+paste for you, while `Ctrl+C` only puts the entry on the clipboard so you can
+paste it yourself with `Ctrl+V` somewhere else. If the popup was opened from a
+window that cannot be found again (for example `/clipboard` from the launcher),
+`Enter` still copies the entry and logs why it did not paste.
 
 DoRun can also drive the popup with the clipboard hotkey itself, so the whole cycle stays on one chord:
 
