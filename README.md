@@ -135,7 +135,7 @@ In the popup:
 | `Space`, click the star | Pin the entry (pinned entries stay on top) |
 | `Delete` | Remove the selected entry |
 | `Ctrl+Delete` | Clear the whole history |
-| `Esc` | Clear the filter first; when it is already empty, close without copying |
+| `Esc` | Clear the filter first; when it is already empty, close **without pasting** — also while the hotkey chord is still held |
 
 DoRun can also drive the popup with the clipboard hotkey itself, so the whole cycle stays on one chord:
 
@@ -147,6 +147,8 @@ DoRun can also drive the popup with the clipboard hotkey itself, so the whole cy
 When the hotkey has no modifiers (for example an `F` key such as `F8`), there is no modifier release that could mark the end of the sequence, so consecutive presses with less than ~0.7 s between them are treated as one sequence, and the paste happens once the presses stop.
 
 Walking the list with the hotkey and with `Up` / `Down` are alternatives: pressing a key or clicking in the list abandons the hotkey sequence, so nothing is pasted behind your back.
+
+Press `Esc` at any moment — even before you release the hotkey's modifiers — and the popup closes without pasting anything. That release is the normal trigger for pasting the selection, so DoRun explicitly cancels the pending paste; the next hotkey press starts a fresh cycle.
 
 The popup closes when it loses focus or when `Esc` is pressed. Pasting returns focus to the window you came from and the injected `Ctrl+V` lands there, so files land in Explorer, images land in Paint/Word, and rich text keeps its formatting. `/clipboard` opens the same popup from the launcher.
 

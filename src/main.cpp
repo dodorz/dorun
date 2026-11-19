@@ -333,6 +333,10 @@ struct AppState {
     // Rejects the auto-repeat key-downs of a held hotkey key.
     bool clipboardCycleKeyHeld = false;
     ULONGLONG clipboardCycleLastPressTick = 0;
+    // Set when the popup was dismissed with Esc while the hotkey chord is still
+    // held. The paste on modifier release is the natural end of the cycle, so
+    // that release must not paste anything; only a new hotkey press clears this.
+    bool clipboardCycleCancelled = false;
     // Focus bookkeeping for closing the popup when the user clicks elsewhere.
     ULONGLONG clipboardShownTick = 0;
     int clipboardLostFocusTicks = 0;
@@ -544,6 +548,7 @@ void StartClipboardCycleSequence();
 void PollClipboardCycleSequence();
 void EndClipboardCycleSequence();
 void CancelClipboardCycleSequence();
+void DismissClipboardHistoryWithoutPaste();
 void PasteSelectedClipboardEntry();
 void InjectPasteKeystroke();
 void InjectPasteIntoClipboardTarget();
@@ -5609,7 +5614,7 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
                 SetWindowTextW(window, L"");
                 return 0;
             }
-            HideClipboardHistory();
+            DismissClipboardHistoryWithoutPaste();
             return 0;
         }
         if (wParam == VK_DOWN || wParam == VK_UP) {
@@ -6126,6 +6131,12 @@ void ShowClipboardHistory() {
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
+    // A fresh popup clears an earlier Esc dismissal (that flag only exists to
+    // suppress the paste of the sequence it interrupted).
+    g_state.clipboardCycleCancelled = false;
+    // Clear GetAsyncKeyState's "pressed since last query" bit for Esc, so a tap
+    // that happened before the popup opened cannot dismiss it 15 ms later.
+    GetAsyncKeyState(VK_ESCAPE);
     // Each open starts from the unfiltered history.
     if (g_state.clipboardSearch != nullptr) {
         SetWindowTextW(g_state.clipboardSearch, L"");
@@ -6187,9 +6198,32 @@ void EndClipboardCycleSequence() {
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
+    // Esc closed the popup while the chord was held, so the release that ends
+    // the sequence must not paste.
+    if (g_state.clipboardCycleCancelled) {
+        AppendHotkeyDebugLog(L"Clipboard cycle ended after an Esc dismissal; not pasting.");
+        g_state.clipboardPasteTarget = nullptr;
+        HideClipboardHistory();
+        return;
+    }
     // PasteSelectedClipboardEntry() re-activates the window the popup was
     // opened from and only injects Ctrl+V once it really has the foreground.
     PasteSelectedClipboardEntry();
+}
+
+// Closes the popup and guarantees that the pending paste does not fire, even
+// when the hotkey chord (Ctrl/Alt/Shift/Win) is still held down. The cycle
+// sequence is cancelled and a flag keeps the modifier-release path from
+// pasting: PollClipboardCycleSequence() only runs while the sequence is active,
+// but the press that opened the popup would still end in a paste on release.
+void DismissClipboardHistoryWithoutPaste() {
+    CancelClipboardCycleSequence();
+    g_state.clipboardCycleCancelled = true;
+    g_state.clipboardPasteTarget = nullptr;
+    if (g_state.clipboardWindow != nullptr) {
+        KillTimer(g_state.clipboardWindow, kClipboardPasteTimerId);
+    }
+    HideClipboardHistory();
 }
 
 // Abandons the current sequence without pasting: the user took over with the
@@ -6205,6 +6239,9 @@ void CancelClipboardCycleSequence() {
 
 // Called for every clipboard-hotkey press; moveUp is true for the Shift variant.
 void HandleClipboardHotkeyPress(bool moveUp) {
+    // A new hotkey press starts a fresh intent, so an earlier Esc no longer
+    // suppresses anything.
+    g_state.clipboardCycleCancelled = false;
     const bool visible = g_state.clipboardWindow != nullptr && IsWindowVisible(g_state.clipboardWindow) != FALSE;
     if (!visible) {
         ShowClipboardHistory();
@@ -6252,6 +6289,21 @@ void PollClipboardCycleSequence() {
         if (g_state.clipboardWindow != nullptr) {
             KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
         }
+        return;
+    }
+
+    // Esc closes the popup without pasting, even while the hotkey chord is
+    // still held: the modifier release that normally ends the sequence would
+    // otherwise paste the selected entry.
+    //
+    // The list and the filter box handle their own WM_KEYDOWN, but Ctrl+Esc is
+    // a shell chord that Windows consumes before any of our windows see it. The
+    // physical key is therefore also polled here: 0x8000 is "held right now" and
+    // 0x0001 is "pressed since the last query", which also catches a tap shorter
+    // than this 15 ms timer. ShowClipboardHistory() clears the 0x0001 bit when
+    // the popup opens so a stale press cannot dismiss it immediately.
+    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8001) != 0) {
+        DismissClipboardHistoryWithoutPaste();
         return;
     }
 
@@ -6348,6 +6400,12 @@ void InjectPasteKeystroke() {
 }
 
 void PasteSelectedClipboardEntry() {
+    if (g_state.clipboardCycleCancelled) {
+        // Belts and braces: no path may paste after an Esc dismissal.
+        g_state.clipboardPasteTarget = nullptr;
+        HideClipboardHistory();
+        return;
+    }
     const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
     const HWND returnWindow = g_state.clipboardReturnWindow;
     if (!index) {
@@ -6523,7 +6581,7 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
                 }
                 return 0;
             }
-            HideClipboardHistory();
+            DismissClipboardHistoryWithoutPaste();
             return 0;
         }
         if (wParam == VK_DELETE) {
@@ -6741,7 +6799,14 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
                 return 0;
             }
             if (++g_state.clipboardLostFocusTicks >= kClipboardLostFocusTicks) {
-                HideClipboardHistory();
+                // Focus loss while the hotkey chord is still held must not paste
+                // either: treat it like an explicit dismissal so the release
+                // path cannot put anything on the clipboard.
+                if (g_state.clipboardCycleActive) {
+                    DismissClipboardHistoryWithoutPaste();
+                } else {
+                    HideClipboardHistory();
+                }
             }
             return 0;
         }
@@ -6752,7 +6817,7 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         LayoutClipboardWindow();
         return 0;
     case WM_CLOSE:
-        HideClipboardHistory();
+        DismissClipboardHistoryWithoutPaste();
         return 0;
     default:
         break;
