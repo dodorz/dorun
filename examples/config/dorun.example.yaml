@@ -75,7 +75,10 @@ LAUNCHER_SEARCH_BG_COLOR: '#FCFDFF'
 # Optional variables that Command.conf can reference as `${NAME}`.
 # Define new variables under `VARS` to avoid conflicts with DoRun settings.
 # For compatibility, old top-level scalar variables still work, but `VARS` wins.
-# `EDITOR` is used by `/config` and `/cmdconfig`.
+# `EDITOR` is used by `/config` and `/cmdconfig`, and is the editor the
+# aliasc-generated `Edit*` commands run (`& $env:EDITOR <path>`): when it is set
+# here it wins over the inherited `EDITOR` environment variable, and the
+# environment value is only used when this is empty.
 # `VIEWER` is used by `/view`. When empty, falls back to `EDITOR` then Shell.
 # `VIEWER` can reference `${EDITOR}`, e.g.: '${EDITOR} --view'
 # Runtime variables `${CMD}`, `${CWD}`, and `${CWD_FLAG}` expand at launch time:
