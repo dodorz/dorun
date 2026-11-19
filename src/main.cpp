@@ -459,6 +459,11 @@ constexpr size_t kClipboardPreviewPopupLimit = 1200;
 constexpr size_t kClipboardMaxEntryLength = 512 * 1024;
 constexpr size_t kClipboardMaxBlobBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr size_t kClipboardMaxFileCount = 200;
+// Shift+Enter pastes the contents of a file entry. A single file is capped so a
+// stray multi-gigabyte log cannot stall the popup, and the total is capped too
+// because all files are joined into one clipboard payload.
+constexpr size_t kClipboardMaxFilePasteBytes = 2ULL * 1024ULL * 1024ULL;
+constexpr size_t kClipboardMaxFilePasteTotalBytes = 4ULL * 1024ULL * 1024ULL;
 // The history file itself, plus the blob directory next to it.
 constexpr wchar_t kClipboardHistoryMagic[] = L"DoRunClipboardHistoryV2";
 constexpr wchar_t kClipboardBlobDirectoryName[] = L"clipboard-blobs";
@@ -550,6 +555,7 @@ void EndClipboardCycleSequence();
 void CancelClipboardCycleSequence();
 void DismissClipboardHistoryWithoutPaste();
 void PasteSelectedClipboardEntry();
+void PasteSelectedClipboardEntryAsText();
 void InjectPasteKeystroke();
 void InjectPasteIntoClipboardTarget();
 void DrawClipboardListItem(const DRAWITEMSTRUCT& draw);
@@ -600,9 +606,14 @@ bool IsClipboardSourceIgnored(std::wstring_view processName);
 bool IsClipboardCaptureExcludedBySource();
 bool MatchesProcessPattern(std::wstring_view name, std::wstring_view pattern);
 bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry);
+bool CopyClipboardFileContents(const ClipboardEntry& entry, std::wstring* statusMessage);
+bool CopyClipboardRichTextAsPlain(const ClipboardEntry& entry, std::wstring* statusMessage);
+bool PutPlainTextOnClipboard(const std::wstring& text);
+bool ReadFileAsTextForPaste(const std::wstring& path, size_t byteBudget, std::wstring* text, std::wstring* reason);
 void ApplyClipboardFonts();
 void CopySelectedCommandLine();
 void ClearCopyFeedback(bool refreshDescription = true);
+void ShowCopyFeedback(std::wstring text);
 bool HandleCopyCommandHotkeyKeyDown(WPARAM vkCode, LPARAM keyData);
 bool ParseManagedHotkeySpec(std::wstring_view text, HotkeyConfig* hotkey);
 std::wstring FormatHotkeyConfig(const HotkeyConfig& hotkey);
@@ -5464,8 +5475,8 @@ int ClipboardHintLineCount() {
 std::wstring BuildClipboardHintText() {
     // Two action lines: the paste/copy keys first, the destructive keys second.
     const std::wstring actions =
-        L"Enter / double-click paste    Ctrl+C copy    Ctrl+Shift+C / Ctrl+T copy as text\r\n"
-        L"Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc closes without pasting";
+        L"Enter / double-click paste    Shift+Enter paste as text (file contents for files)\r\n"
+        L"Ctrl+C copy    Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc no paste";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5637,7 +5648,8 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
         }
         if (wParam == VK_RETURN) {
             // Enter in the search box pastes the first (best) match, matching
-            // the list's Enter; Ctrl+C there still copies without pasting.
+            // the list's Enter; Shift+Enter applies the text variant there too.
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             const LRESULT count = g_state.clipboardList != nullptr
                 ? SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0)
                 : 0;
@@ -5645,7 +5657,11 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
                 SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
                 UpdateClipboardPreview();
                 CancelClipboardCycleSequence();
-                PasteSelectedClipboardEntry();
+                if (shiftDown) {
+                    PasteSelectedClipboardEntryAsText();
+                } else {
+                    PasteSelectedClipboardEntry();
+                }
             }
             return 0;
         }
@@ -6410,6 +6426,67 @@ void InjectPasteKeystroke() {
     SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT));
 }
 
+// Shift+Enter variant: text-ish entries paste their plain text, file entries
+// paste the file's *contents* instead of the file. Everything else falls back to
+// the normal paste so the key is never a no-op.
+void PasteSelectedClipboardEntryAsText() {
+    if (g_state.clipboardCycleCancelled) {
+        g_state.clipboardPasteTarget = nullptr;
+        HideClipboardHistory();
+        return;
+    }
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    const HWND returnWindow = g_state.clipboardReturnWindow;
+    if (!index) {
+        HideClipboardHistory();
+        return;
+    }
+
+    const ClipboardEntry entry = g_state.clipboardEntries[*index];
+    HideClipboardHistory();
+
+    std::wstring status;
+    bool prepared = false;
+    switch (entry.kind) {
+    case ClipboardEntryKind::RichText:
+        prepared = CopyClipboardRichTextAsPlain(entry, &status);
+        break;
+    case ClipboardEntryKind::Files:
+        prepared = CopyClipboardFileContents(entry, &status);
+        break;
+    case ClipboardEntryKind::Image:
+    case ClipboardEntryKind::Text:
+    default:
+        // Text is already plain, and an image has no text form: use the plain
+        // text variant, which falls back to the entry's description.
+        prepared = CopyClipboardEntryAsPlainText(entry);
+        break;
+    }
+    if (!prepared) {
+        if (!status.empty()) {
+            AppendHotkeyDebugLog(L"Shift+Enter: " + status);
+            ShowCopyFeedback(status);
+        }
+        return;
+    }
+    if (!status.empty()) {
+        AppendHotkeyDebugLog(L"Shift+Enter: " + status);
+    }
+
+    if (returnWindow == nullptr || IsWindow(returnWindow) == FALSE) {
+        AppendHotkeyDebugLog(L"No return window for clipboard paste; entry left on the clipboard.");
+        return;
+    }
+
+    ForceForegroundWindow(returnWindow);
+    g_state.clipboardPasteTarget = returnWindow;
+    if (g_state.clipboardWindow != nullptr) {
+        SetTimer(g_state.clipboardWindow, kClipboardPasteTimerId, kClipboardPasteDelayMs, nullptr);
+    } else {
+        InjectPasteIntoClipboardTarget();
+    }
+}
+
 void PasteSelectedClipboardEntry() {
     if (g_state.clipboardCycleCancelled) {
         // Belts and braces: no path may paste after an Esc dismissal.
@@ -6557,6 +6634,7 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
         // the popup was opened from, while Ctrl+C only puts it on the clipboard.
         // Ctrl+Shift+C (or Ctrl+T) copies it as plain text.
         if (wParam == VK_RETURN) {
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             if (g_state.clipboardCycleActive) {
                 // The hotkey chord is still armed. Its release already pastes,
                 // and that path waits until every modifier is physically up so
@@ -6565,7 +6643,13 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
                 g_state.clipboardCycleLastPressTick = GetTickCount64();
                 return 0;
             }
-            PasteSelectedClipboardEntry();
+            if (shiftDown) {
+                // Shift+Enter: rich text pastes as plain text, a file entry
+                // pastes the file's contents instead of the file.
+                PasteSelectedClipboardEntryAsText();
+            } else {
+                PasteSelectedClipboardEntry();
+            }
             return 0;
         }
         if (controlDown && wParam == 'C') {
@@ -9252,14 +9336,104 @@ bool CopyClipboardEntryToClipboard(const ClipboardEntry& entry) {
 
 // Copies an entry as plain text only, dropping its RTF/image/file formats.
 // Used by the popup keys that intentionally flatten a rich copy.
-bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry) {
-    std::wstring text = entry.text;
-    if (text.empty()) {
-        // Image and file entries have no text payload of their own; use their
-        // human readable label instead of copying nothing.
-        text = BuildClipboardEntryDescription(entry);
+// Reads a file as UTF-8 and returns it as wide text. Binary content is rejected
+// instead of pasted: the clipboard entry is meant for text, and pasting a PNG as
+// mojibake helps nobody. The check is a BOM/heuristic sniff rather than a full
+// parser, which is enough to tell text from the binary files users copy.
+bool ReadFileAsTextForPaste(const std::wstring& path, size_t byteBudget, std::wstring* text, std::wstring* reason) {
+    if (text == nullptr || reason == nullptr) {
+        return false;
+    }
+    text->clear();
+    reason->clear();
+
+    std::error_code error;
+    const auto fileSize = std::filesystem::file_size(path, error);
+    if (error) {
+        *reason = L"cannot read";
+        return false;
+    }
+    if (fileSize > byteBudget) {
+        *reason = L"too large";
+        return false;
     }
 
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        *reason = L"cannot open";
+        return false;
+    }
+    std::string bytes;
+    bytes.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+
+    // A NUL byte in the first few KB is the usual "this is binary" signal; real
+    // text files (including UTF-16, which also contains NULs) are handled below.
+    const size_t probeLength = std::min<size_t>(bytes.size(), 4096);
+    bool looksBinary = false;
+    for (size_t index = 0; index < probeLength; ++index) {
+        const unsigned char value = static_cast<unsigned char>(bytes[index]);
+        if (value == 0x00 && index > 1) {
+            // UTF-16LE has a NUL at odd offsets and starts with a BOM, so only
+            // treat this as binary when there is no UTF-16 BOM.
+            looksBinary = true;
+            break;
+        }
+        if (value < 0x09 || (value > 0x0D && value < 0x20)) {
+            looksBinary = true;
+            break;
+        }
+    }
+
+    const bool utf16Le = bytes.size() >= 2 && bytes[0] == '\xFF' && bytes[1] == '\xFE';
+    const bool utf16Be = bytes.size() >= 2 && bytes[0] == '\xFE' && bytes[1] == '\xFF';
+    if (utf16Le || utf16Be) {
+        // Decode UTF-16 directly; the NUL test above would have flagged it.
+        const size_t codeUnits = (bytes.size() - 2) / 2;
+        text->reserve(codeUnits);
+        for (size_t index = 0; index < codeUnits; ++index) {
+            const size_t offset = 2 + index * 2;
+            // UTF-16LE stores the low byte first; UTF-16BE stores the high byte
+            // first. wchar_t is 16 bits on Windows, so the unit maps directly.
+            const unsigned char lowByte = static_cast<unsigned char>(bytes[utf16Le ? offset : offset + 1]);
+            const unsigned char highByte = static_cast<unsigned char>(bytes[utf16Le ? offset + 1 : offset]);
+            text->push_back(static_cast<wchar_t>((highByte << 8) | lowByte));
+        }
+        return !text->empty();
+    }
+    if (looksBinary) {
+        *reason = L"looks binary";
+        return false;
+    }
+
+    // Plain UTF-8. Converting through MultiByteToWideChar keeps the code page
+    // handling in one place and copes with a BOM by skipping it.
+    const size_t bomBytes = bytes.size() >= 3 && bytes[0] == '\xEF' && bytes[1] == '\xBB' && bytes[2] == '\xBF' ? 3 : 0;
+    const int byteCount = static_cast<int>(bytes.size() - bomBytes);
+    if (byteCount == 0) {
+        return false;
+    }
+    int wideLength = MultiByteToWideChar(CP_UTF8, 0, bytes.data() + bomBytes, byteCount, nullptr, 0);
+    if (wideLength <= 0) {
+        // Not valid UTF-8; fall back to the system ANSI code page so legacy
+        // text files still paste readably.
+        wideLength = MultiByteToWideChar(CP_ACP, 0, bytes.data() + bomBytes, byteCount, nullptr, 0);
+        if (wideLength <= 0) {
+            *reason = L"cannot decode";
+            return false;
+        }
+        text->resize(static_cast<size_t>(wideLength));
+        MultiByteToWideChar(CP_ACP, 0, bytes.data() + bomBytes, byteCount, text->data(), wideLength);
+        return true;
+    }
+    text->resize(static_cast<size_t>(wideLength));
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data() + bomBytes, byteCount, text->data(), wideLength);
+    return true;
+}
+
+// Puts a ready-made plain text payload on the clipboard and records it as a new
+// text entry. Shared by the plain-text variants so they agree on history
+// bookkeeping.
+bool PutPlainTextOnClipboard(const std::wstring& text) {
     HWND owner = g_state.launcherWindow;
     if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
         owner = g_state.clipboardWindow;
@@ -9280,13 +9454,114 @@ bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry) {
         g_state.clipboardSourceExcluded = false;
         ClipboardEntry recorded {};
         recorded.kind = ClipboardEntryKind::Text;
-        recorded.text = text;
+        recorded.text = text.size() > kClipboardMaxEntryLength ? text.substr(0, kClipboardMaxEntryLength) : text;
         AddClipboardEntry(std::move(recorded));
         if (IsWindowVisible(g_state.clipboardWindow) != FALSE) {
             ReloadClipboardHistory();
         }
     }
     return copied;
+}
+
+bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry) {
+    std::wstring text = entry.text;
+    if (text.empty()) {
+        // Image entries have no text payload of their own; use their human
+        // readable description instead of copying nothing. File entries fall
+        // back to the path list, which is what a plain-text consumer can use.
+        text = BuildClipboardEntryDescription(entry);
+    }
+    return PutPlainTextOnClipboard(text);
+}
+
+// Shift+Enter on a file entry: paste the file's contents, not the file. Files
+// that are unreadable, binary, or over the size budget are reported through
+// statusMessage so the caller can explain why nothing was pasted.
+bool CopyClipboardFileContents(const ClipboardEntry& entry, std::wstring* statusMessage) {
+    if (statusMessage != nullptr) {
+        statusMessage->clear();
+    }
+    if (entry.kind != ClipboardEntryKind::Files || entry.files.empty()) {
+        return false;
+    }
+
+    std::wstring combined;
+    std::vector<std::wstring> skipped;
+    size_t budget = kClipboardMaxFilePasteTotalBytes;
+    for (const std::wstring& path : entry.files) {
+        if (budget == 0) {
+            skipped.push_back(path);
+            continue;
+        }
+        std::wstring text;
+        std::wstring reason;
+        const size_t perFileBudget = std::min(budget, kClipboardMaxFilePasteBytes);
+        if (!ReadFileAsTextForPaste(path, perFileBudget, &text, &reason)) {
+            AppendHotkeyDebugLog(L"Shift+Enter skipped " + path + L": " + reason);
+            skipped.push_back(path);
+            continue;
+        }
+        if (!combined.empty()) {
+            // Separate files so the join stays readable in the paste target.
+            combined += L"\r\n";
+        }
+        combined += text;
+        budget = (text.size() >= budget) ? 0 : (budget - text.size());
+    }
+
+    if (combined.empty()) {
+        if (statusMessage != nullptr) {
+            *statusMessage = skipped.empty()
+                ? L"No readable text in that file entry."
+                : L"File content not pasted: unreadable or binary (" + std::to_wstring(skipped.size()) + L" file(s) skipped).";
+        }
+        return false;
+    }
+
+    if (!PutPlainTextOnClipboard(combined)) {
+        if (statusMessage != nullptr) {
+            *statusMessage = L"Could not put the file content on the clipboard.";
+        }
+        return false;
+    }
+
+    if (statusMessage != nullptr && !skipped.empty()) {
+        *statusMessage = L"Pasted text of " + std::to_wstring(entry.files.size() - skipped.size()) +
+            L" file(s); " + std::to_wstring(skipped.size()) + L" skipped (binary, unreadable, or too large).";
+    } else if (statusMessage != nullptr) {
+        *statusMessage = L"Pasted text content of " + std::to_wstring(entry.files.size()) + L" file(s).";
+    }
+    return true;
+}
+
+// Shift+Enter on a rich text entry: paste its plain text only, so the target
+// receives no formatting. Falls back to the stored text when the RTF blob is
+// gone (the entry keeps its plain-text copy precisely for this case).
+bool CopyClipboardRichTextAsPlain(const ClipboardEntry& entry, std::wstring* statusMessage) {
+    if (statusMessage != nullptr) {
+        statusMessage->clear();
+    }
+    if (entry.kind != ClipboardEntryKind::RichText) {
+        return false;
+    }
+
+    std::wstring text = entry.text;
+    if (text.empty()) {
+        if (statusMessage != nullptr) {
+            *statusMessage = L"That rich text entry has no plain-text form.";
+        }
+        return false;
+    }
+    if (!PutPlainTextOnClipboard(text)) {
+        if (statusMessage != nullptr) {
+            *statusMessage = L"Could not put the plain text on the clipboard.";
+        }
+        return false;
+    }
+    if (statusMessage != nullptr) {
+        *statusMessage = L"Pasted as plain text (RTF formatting dropped).";
+    }
+    return true;
 }
 
 // Clears the transient copy status line. Callers that are about to refresh the

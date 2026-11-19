@@ -131,6 +131,7 @@ In the popup:
 | `Up` / `Down` | Move the selection; the full text is previewed below the list |
 | type anywhere | Filter the list (text goes to the box below the list) |
 | `Enter`, double-click | **Paste** the selected entry into the window the popup was opened from, then close |
+| `Shift+Enter` | Same paste, but text-only: a **rich text** entry is pasted as plain text (no formatting), a **file** entry pastes the file's **contents** instead of the file |
 | `Ctrl+C` | Copy the selected entry to the clipboard and close (no paste) |
 | `Ctrl+Shift+C`, `Ctrl+T` | Copy the selected entry as **plain text only**, dropping RTF/image/file formats |
 | `Space`, click the star | Pin the entry (pinned entries stay on top) |
@@ -140,7 +141,17 @@ In the popup:
 
 This is Ditto's interaction model: `Enter` (and double-click) performs the
 paste for you, while `Ctrl+C` only puts the entry on the clipboard so you can
-paste it yourself with `Ctrl+V` somewhere else. If the popup was opened from a
+paste it yourself with `Ctrl+V` somewhere else.
+
+`Shift+Enter` is the "give me the plain version" variant:
+
+- **rich text** → pasted without the RTF format, so the target keeps no bold,
+  colours, or fonts (the entry's stored plain-text form is used)
+- **files** → the *contents* of the files are pasted as text, joined with blank
+  lines. Files that are binary, unreadable, or over the size budget (2 MB per
+  file, 4 MB total) are skipped, and the reason is written to the hotkey debug
+  log; the preview/feedback line says how many were skipped
+- **text / image** → plain text, exactly like `Ctrl+Shift+C` If the popup was opened from a
 window that cannot be found again (for example `/clipboard` from the launcher),
 `Enter` still copies the entry and logs why it did not paste.
 
