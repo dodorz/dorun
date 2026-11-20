@@ -22,10 +22,12 @@
 #include <iterator>
 #include <limits>
 #include <locale>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -55,6 +57,9 @@ struct HistoryConfig {
 struct ClipboardConfig {
     bool enabled = true;
     HotkeyConfig hotkey {};
+    // Ctrl+E by default opens the selected entry in the configured EDITOR.
+    HotkeyConfig editHotkey {};
+    bool editHotkeyEnabled = true;
     int maxRows = 500;
     int visibleItemCount = 12;
     bool captureText = true;
@@ -97,6 +102,17 @@ struct ClipboardEntry {
     // Pinned entries are kept at the top of the history and never dropped by the
     // row limit until every unpinned entry is gone.
     bool starred = false;
+};
+
+// Work item for the Ctrl+E editor round trip. Created on the UI thread, waited
+// on by a worker, and consumed by the posted completion message.
+struct ClipboardEditJob {
+    HANDLE process = nullptr;
+    std::wstring path;
+    // The entry's identity, not its index: clipboard polling can insert new
+    // entries while the editor is open, which would shift the index. The
+    // original content is stored so the entry can be found again afterwards.
+    ClipboardEntry snapshot {};
 };
 
 struct LauncherAppearanceConfig {
@@ -320,6 +336,10 @@ struct AppState {
     bool clipboardFilterActive = false;
 
     HWND clipboardReturnWindow = nullptr;
+    // Where the popup was opened from when Ctrl+E started; restored after the
+    // editor closes so a later Enter still pastes into the original window.
+    HWND clipboardEditReturnWindow = nullptr;
+    bool clipboardEditorWasOpen = false;
     DWORD lastClipboardSequenceNumber = 0;
     HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
     HotkeyBackend clipboardUpHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -426,6 +446,9 @@ constexpr UINT kMessageRebuildResults = WM_APP + 2;
 constexpr UINT kMessageSingletonShowLauncher = WM_APP + 3;
 constexpr UINT kMessageSingletonRunGroup = WM_APP + 4;
 constexpr UINT kMessageSingletonReload = WM_APP + 5;
+// Posted by the editor worker thread once the editor process exits; lParam is a
+// heap-allocated EditJob that the handler on the UI thread takes ownership of.
+constexpr UINT kMessageClipboardEditDone = WM_APP + 6;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 2000;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
@@ -624,6 +647,10 @@ bool MatchesProcessPattern(std::wstring_view name, std::wstring_view pattern);
 bool CopyClipboardEntryAsPlainText(const ClipboardEntry& entry);
 bool CopyClipboardFileContents(const ClipboardEntry& entry, std::wstring* statusMessage);
 bool CopyClipboardRichTextAsPlain(const ClipboardEntry& entry, std::wstring* statusMessage);
+void EditSelectedClipboardEntry();
+std::wstring BuildClipboardEditableText(const ClipboardEntry& entry);
+std::wstring MakeClipboardEditFilePath();
+bool LaunchEditorAndWaitForExit(const std::wstring& path, HANDLE* process);
 bool PutPlainTextOnClipboard(const std::wstring& text);
 bool ReadFileAsTextForPaste(const std::wstring& path, size_t byteBudget, std::wstring* text, std::wstring* reason);
 void ApplyClipboardFonts();
@@ -2678,6 +2705,8 @@ void LoadCopyCommandHotkeyConfig() {
 // `CLIPBOARD_HISTORY_ENABLED` toggles the whole feature. `CLIPBOARD_HOTKEY`
 // uses the same syntax as Command.conf hotkeys and defaults to Ctrl+Backtick.
 constexpr wchar_t kDefaultClipboardHotkey[] = L"^BACKTICK";
+// Ctrl+E opens the selected history entry in EDITOR for editing.
+constexpr wchar_t kDefaultClipboardEditHotkey[] = L"^e";
 
 // A disabled hotkey is represented by vk == 0; the modifiers are cleared too so
 // nothing (e.g. the "does this use Shift/Win" checks) can see a stale chord.
@@ -2743,6 +2772,33 @@ void LoadClipboardConfig() {
             g_state.clipboardConfig.ignoredProcesses.push_back(fileName);
         } else {
             g_state.clipboardConfig.ignoredProcesses.push_back(pattern);
+        }
+    }
+
+    // Ctrl+E editing. Parsed before the clipboard hotkey because the latter's
+    // early returns below would skip it.
+    g_state.clipboardConfig.editHotkey = HotkeyConfig {};
+    g_state.clipboardConfig.editHotkeyEnabled = ParseManagedHotkeySpec(kDefaultClipboardEditHotkey, &g_state.clipboardConfig.editHotkey);
+    if (const std::optional<std::wstring> editSpec = ParseYamlString(content, L"CLIPBOARD_EDIT_HOTKEY")) {
+        const std::wstring trimmedEditSpec = Trim(*editSpec);
+        const std::wstring lowercaseEditSpec = Lowercase(trimmedEditSpec);
+        if (trimmedEditSpec.empty() ||
+            trimmedEditSpec == L"0" ||
+            lowercaseEditSpec == L"none" ||
+            lowercaseEditSpec == L"off" ||
+            lowercaseEditSpec == L"disabled") {
+            g_state.clipboardConfig.editHotkey = HotkeyConfig {};
+            g_state.clipboardConfig.editHotkeyEnabled = false;
+        } else {
+            HotkeyConfig parsedEdit {};
+            if (ParseManagedHotkeySpec(trimmedEditSpec, &parsedEdit)) {
+                g_state.clipboardConfig.editHotkey = parsedEdit;
+                g_state.clipboardConfig.editHotkeyEnabled = true;
+            } else {
+                AppendHotkeyDebugLog(L"Ignoring invalid CLIPBOARD_EDIT_HOTKEY: " + trimmedEditSpec);
+                g_state.clipboardConfig.editHotkey = HotkeyConfig {};
+                g_state.clipboardConfig.editHotkeyEnabled = false;
+            }
         }
     }
 
@@ -5492,7 +5548,7 @@ std::wstring BuildClipboardHintText() {
     // Two action lines: the paste/copy keys first, the destructive keys second.
     const std::wstring actions =
         L"Enter / double-click paste    Shift+Enter paste as text (file contents for files)\r\n"
-        L"Ctrl+C copy    Type to filter    Space / star pins    Del remove    Ctrl+Del clear    Esc no paste";
+        L"Ctrl+C copy    Ctrl+E edit in EDITOR    Type to filter    Space / star pins    Del remove    Esc no paste";
     if (g_state.clipboardConfig.hotkey.vk == 0U) {
         return actions;
     }
@@ -5697,6 +5753,18 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
             }
             CancelClipboardCycleSequence();
             CopySelectedClipboardEntry(shiftDown);
+            return 0;
+        }
+        if (g_state.clipboardConfig.editHotkeyEnabled &&
+            g_state.clipboardConfig.editHotkey.vk != 0U &&
+            wParam == g_state.clipboardConfig.editHotkey.vk &&
+            AreHotkeyModifiersPressed(g_state.clipboardConfig.editHotkey.modifiers)) {
+            // The same chord from the filter box edits the first match.
+            if (g_state.clipboardList != nullptr && SendMessageW(g_state.clipboardList, LB_GETCOUNT, 0, 0) > 0) {
+                SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
+            }
+            CancelClipboardCycleSequence();
+            EditSelectedClipboardEntry();
             return 0;
         }
     }
@@ -6140,9 +6208,14 @@ void LayoutClipboardWindow() {
 }
 
 void HideClipboardHistory() {
+    // An editor is in front: the popup is hidden deliberately for it, so the
+    // paste target and the "editor is open" marker survive this hide.
+    const bool editorOpen = g_state.clipboardEditorWasOpen;
     // Callers that want focus restored capture clipboardReturnWindow before
     // hiding; clearing it here avoids stealing focus on a later unrelated hide.
-    g_state.clipboardReturnWindow = nullptr;
+    if (!editorOpen) {
+        g_state.clipboardReturnWindow = nullptr;
+    }
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
@@ -6185,6 +6258,8 @@ void ShowClipboardHistory() {
     g_state.clipboardCycleStartTick = 0;
     g_state.clipboardCycleMovedSelection = false;
     g_state.clipboardCyclePasteRequest = 0;
+    g_state.clipboardEditorWasOpen = false;
+    g_state.clipboardEditReturnWindow = nullptr;
     // A fresh popup clears an earlier Esc dismissal (that flag only exists to
     // suppress the paste of the sequence it interrupted).
     g_state.clipboardCycleCancelled = false;
@@ -6474,6 +6549,99 @@ void CopySelectedClipboardEntry(bool asPlainText) {
     }
 }
 
+// The text handed to the editor: the entry's plain text, or one path per line
+// for a file entry. The comparison after editing uses the same text, so "no
+// change" is detected without duplicating the join logic.
+std::wstring BuildClipboardEditableText(const ClipboardEntry& entry) {
+    if (entry.kind == ClipboardEntryKind::Files) {
+        std::wstring joined;
+        for (size_t i = 0; i < entry.files.size(); ++i) {
+            if (i > 0) {
+                joined += L"\r\n";
+            }
+            joined += entry.files[i];
+        }
+        return joined;
+    }
+    return entry.text;
+}
+
+// Ctrl+E: dump the selected entry to a scratch file, open EDITOR on it, and when
+// the editor exits replace the entry's content with whatever was saved.
+//
+// The wait happens on a worker thread so the popup stays responsive and the
+// message loop keeps running; the completion is marshalled back with a posted
+// message. Only text-ish entries are editable: an image has no text form, and a
+// file entry's content is the file list (editing that makes sense, so file
+// entries edit their path list, one path per line).
+void EditSelectedClipboardEntry() {
+    const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
+    if (!index) {
+        return;
+    }
+
+    const ClipboardEntry entry = g_state.clipboardEntries[*index];
+    if (entry.kind == ClipboardEntryKind::Image) {
+        AppendHotkeyDebugLog(L"Ctrl+E ignored: image entries have no editable text.");
+        ShowCopyFeedback(L"Image entries cannot be edited as text.");
+        return;
+    }
+
+    const std::wstring editable = BuildClipboardEditableText(entry);
+    if (editable.empty()) {
+        ShowCopyFeedback(L"That entry has no text to edit.");
+        return;
+    }
+
+    const std::wstring path = MakeClipboardEditFilePath();
+    if (!SaveUtf8TextFile(path, editable)) {
+        AppendHotkeyDebugLog(L"Ctrl+E failed to write the scratch file: " + path);
+        ShowCopyFeedback(L"Could not write the scratch file for editing.");
+        return;
+    }
+
+    HANDLE editorProcess = nullptr;
+    if (!LaunchEditorAndWaitForExit(path, &editorProcess)) {
+        AppendHotkeyDebugLog(L"Ctrl+E failed to start the editor.");
+        ShowCopyFeedback(L"Could not start the configured editor.");
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+        return;
+    }
+
+    // Remember who to paste back into: HideClipboardHistory() clears the return
+    // window, but Enter/Shift+Enter after the edit must still target the window
+    // the popup was originally opened from.
+    const HWND returnWindow = g_state.clipboardReturnWindow;
+
+    // Hide the popup while the editor is in front; it would otherwise sit on top
+    // of the editor and steal the focus back.
+    HideClipboardHistory();
+    g_state.clipboardReturnWindow = returnWindow;
+    g_state.clipboardEditReturnWindow = returnWindow;
+    g_state.clipboardEditorWasOpen = true;
+    ShowCopyFeedback(L"Editing in the configured editor…");
+
+    if (editorProcess == nullptr) {
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+        return;
+    }
+
+    // The editor is a separate process; wait for it without blocking the UI.
+    auto* job = new ClipboardEditJob();
+    job->process = editorProcess;
+    job->path = path;
+    job->snapshot = entry;
+
+    std::thread([job]() {
+        WaitForSingleObject(job->process, INFINITE);
+        CloseHandle(job->process);
+        job->process = nullptr;
+        PostMessageW(g_state.hostWindow, kMessageClipboardEditDone, 0, reinterpret_cast<LPARAM>(job));
+    }).detach();
+}
+
 void DeleteSelectedClipboardEntry() {
     const std::optional<size_t> index = GetSelectedClipboardEntryIndex();
     if (!index) {
@@ -6749,6 +6917,17 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
         if (controlDown && wParam == 'T') {
             CancelClipboardCycleSequence();
             CopySelectedClipboardEntry(true);
+            return 0;
+        }
+        // CLIPBOARD_EDIT_HOTKEY (Ctrl+E by default) opens the selected entry in
+        // the configured EDITOR; the popup hides while the editor is in front
+        // and the entry is replaced by whatever the editor saved.
+        if (g_state.clipboardConfig.editHotkeyEnabled &&
+            g_state.clipboardConfig.editHotkey.vk != 0U &&
+            wParam == g_state.clipboardConfig.editHotkey.vk &&
+            AreHotkeyModifiersPressed(g_state.clipboardConfig.editHotkey.modifiers)) {
+            CancelClipboardCycleSequence();
+            EditSelectedClipboardEntry();
             return 0;
         }
         if (wParam == VK_SPACE) {
@@ -9523,6 +9702,50 @@ bool ReadFileAsTextForPaste(const std::wstring& path, size_t byteBudget, std::ws
     return true;
 }
 
+// Directory used for the scratch file handed to the editor. Reuses the existing
+// temp directory so nothing new has to be created on disk.
+std::wstring MakeClipboardEditFilePath() {
+    std::error_code error;
+    const std::filesystem::path directory = GetTempBatchDirectory();
+    std::filesystem::create_directories(directory, error);
+
+    const DWORD processId = GetCurrentProcessId();
+    const ULONGLONG tickCount = GetTickCount64();
+    const std::wstring fileName =
+        L"DoRun-clip-edit-" + std::to_wstring(processId) + L"-" + std::to_wstring(tickCount) + L".txt";
+    return (directory / fileName).wstring();
+}
+
+// Starts the configured EDITOR on path and hands back the process handle. The
+// caller waits for it, so a GUI editor that returns immediately after spawning
+// its own window is the caller's problem, not this helper's.
+bool LaunchEditorAndWaitForExit(const std::wstring& path, HANDLE* process) {
+    if (process != nullptr) {
+        *process = nullptr;
+    }
+
+    const std::wstring editorCommand = Trim(ExpandEnvironmentVariables(g_state.editorConfig.commandLine));
+    std::wstring commandLine;
+    if (editorCommand.empty()) {
+        // No EDITOR configured: fall back to the shell's default handler so the
+        // hotkey still does something useful.
+        commandLine = L"notepad.exe " + QuoteCommandLineArgument(path);
+    } else {
+        commandLine = editorCommand + L" " + QuoteCommandLineArgument(path);
+    }
+
+    HANDLE launched = nullptr;
+    if (!LaunchProcessCommand(commandLine, L"", SW_SHOWNORMAL, NORMAL_PRIORITY_CLASS, 0, &launched)) {
+        return false;
+    }
+    if (process != nullptr) {
+        *process = launched;
+    } else if (launched != nullptr) {
+        CloseHandle(launched);
+    }
+    return true;
+}
+
 // Puts a ready-made plain text payload on the clipboard and records it as a new
 // text entry. Shared by the plain-text variants so they agree on history
 // bookkeeping.
@@ -10032,6 +10255,102 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         if (lParam != 0) {
             GlobalDeleteAtom(static_cast<ATOM>(lParam));
         }
+        return 0;
+    }
+    if (message == kMessageClipboardEditDone) {
+        // Restore the paste target recorded when the edit started, so a later
+        // Enter still pastes into the window the popup was opened from.
+        if (g_state.clipboardEditorWasOpen) {
+            g_state.clipboardEditorWasOpen = false;
+            // The editor window was foreground while it ran, so the paste target
+            // has to be restored from before the edit.
+            g_state.clipboardReturnWindow = g_state.clipboardEditReturnWindow;
+            g_state.clipboardEditReturnWindow = nullptr;
+            // Reopen the popup on the edited entry so it can still be pasted.
+            g_state.clipboardCycleActive = false;
+            g_state.clipboardCycleKeyHeld = false;
+            g_state.clipboardCycleStartTick = 0;
+            g_state.clipboardCycleMovedSelection = false;
+            g_state.clipboardCyclePasteRequest = 0;
+            ShowWindow(g_state.clipboardWindow, SW_SHOW);
+            ForceForegroundWindow(g_state.clipboardWindow);
+            SetFocus(g_state.clipboardList);
+            LayoutClipboardWindow();
+        }
+        // The editor closed. Replace the entry's content with what was saved.
+        std::unique_ptr<ClipboardEditJob> job(reinterpret_cast<ClipboardEditJob*>(lParam));
+        if (!job) {
+            return 0;
+        }
+
+        const std::wstring saved = LoadUtf8TextFile(job->path);
+        std::error_code removeError;
+        std::filesystem::remove(job->path, removeError);
+
+        // Locate the entry by content: new clipboard entries may have been
+        // inserted while the editor was open, so the old index is unreliable.
+        const auto found = std::find_if(
+            g_state.clipboardEntries.begin(),
+            g_state.clipboardEntries.end(),
+            [&job](const ClipboardEntry& candidate) { return ClipboardEntriesMatch(candidate, job->snapshot); });
+        if (found == g_state.clipboardEntries.end()) {
+            AppendHotkeyDebugLog(L"Ctrl+E result dropped: the entry was removed while editing.");
+            return 0;
+        }
+        const size_t targetIndex = static_cast<size_t>(std::distance(g_state.clipboardEntries.begin(), found));
+
+        ClipboardEntry& target = g_state.clipboardEntries[targetIndex];
+        if (saved == BuildClipboardEditableText(target)) {
+            AppendHotkeyDebugLog(L"Ctrl+E: editor closed without changes.");
+            return 0;
+        }
+
+        if (saved.empty()) {
+            AppendHotkeyDebugLog(L"Ctrl+E: saved file is empty; keeping the entry unchanged.");
+            ShowCopyFeedback(L"Empty file after editing; entry left unchanged.");
+            return 0;
+        }
+
+        if (target.kind == ClipboardEntryKind::Files) {
+            // One path per line.
+            std::vector<std::wstring> paths;
+            size_t start = 0;
+            while (start <= saved.size()) {
+                size_t end = saved.find(L'\n', start);
+                if (end == std::wstring::npos) {
+                    end = saved.size();
+                }
+                std::wstring line = Trim(saved.substr(start, end - start));
+                if (!line.empty()) {
+                    paths.push_back(std::move(line));
+                }
+                start = end + 1;
+            }
+            if (paths.empty()) {
+                ShowCopyFeedback(L"No paths left after editing; entry left unchanged.");
+                return 0;
+            }
+            target.files = std::move(paths);
+            target.text.clear();
+            AppendHotkeyDebugLog(L"Ctrl+E: file entry now holds " + std::to_wstring(target.files.size()) + L" path(s).");
+        } else {
+            target.text = saved;
+            if (target.text.size() > kClipboardMaxEntryLength) {
+                target.text.resize(kClipboardMaxEntryLength);
+            }
+            AppendHotkeyDebugLog(L"Ctrl+E: entry text replaced by the edited file.");
+        }
+
+        SaveClipboardEntriesToFile(false);
+        ReloadClipboardHistory();
+        // Keep the selection on the entry that was just edited.
+        const std::optional<size_t> row = ClipboardEntryIndexToRow(targetIndex);
+        if (row && g_state.clipboardList != nullptr && IsWindowVisible(g_state.clipboardWindow) != FALSE) {
+            SendMessageW(g_state.clipboardList, LB_SETCURSEL, static_cast<WPARAM>(*row), 0);
+            SendMessageW(g_state.clipboardList, LB_SETTOPINDEX, static_cast<WPARAM>(*row), 0);
+            UpdateClipboardPreview();
+        }
+        ShowCopyFeedback(L"Entry updated from the editor.");
         return 0;
     }
     if (message == kMessageRefreshLauncherData) {

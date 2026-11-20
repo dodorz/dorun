@@ -89,6 +89,9 @@ CLIPBOARD_CAPTURE_FILES: true
 # Copy rich text back as plain text only (no RTF format on the clipboard).
 CLIPBOARD_RICH_TEXT_AS_PLAIN: false
 
+# Chord that opens the selected entry in the EDITOR for editing.
+CLIPBOARD_EDIT_HOTKEY: '^e'
+
 # Applications whose clipboard content is never recorded. Values match the
 # process file name (not the window title) and accept `*` / `?` wildcards.
 CLIPBOARD_HISTORY_IGNORE_PROCESSES:
@@ -134,6 +137,7 @@ In the popup:
 | `Shift+Enter` | Same paste, but text-only: a **rich text** entry is pasted as plain text (no formatting), a **file** entry pastes the file's **contents** instead of the file |
 | `Ctrl+C` | Copy the selected entry to the clipboard and close (no paste) |
 | `Ctrl+Shift+C`, `Ctrl+T` | Copy the selected entry as **plain text only**, dropping RTF/image/file formats |
+| `Ctrl+E` | Open the selected entry in the configured `EDITOR` for editing; saving the file replaces the entry |
 | `Space`, click the star | Pin the entry (pinned entries stay on top) |
 | `Delete` | Remove the selected entry |
 | `Ctrl+Delete` | Clear the whole history |
@@ -142,6 +146,18 @@ In the popup:
 This is Ditto's interaction model: `Enter` (and double-click) performs the
 paste for you, while `Ctrl+C` only puts the entry on the clipboard so you can
 paste it yourself with `Ctrl+V` somewhere else.
+
+`Ctrl+E` (configurable as `CLIPBOARD_EDIT_HOTKEY`) edits the selected entry:
+
+1. its text is written to a scratch file under `%LOCALAPPDATA%\DoRun\temp\`,
+2. the editor from `VARS.EDITOR` (or `notepad.exe` when none is set) opens on it,
+   the popup hides so the editor has the screen,
+3. when the editor exits the file is read back and **replaces** the entry's
+   content, then the popup returns with the edited entry selected.
+
+File entries are edited as a path list, one path per line; image entries cannot
+be edited (they have no text form) and say so. Closing the editor without
+saving, or saving an empty file, leaves the entry untouched.
 
 `Shift+Enter` is the "give me the plain version" variant:
 
@@ -306,6 +322,7 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `CLIPBOARD_CAPTURE_FILES`
 - `CLIPBOARD_RICH_TEXT_AS_PLAIN`
 - `CLIPBOARD_HISTORY_IGNORE_PROCESSES`
+- `CLIPBOARD_EDIT_HOTKEY`
 - `HISTORY_ENABLED`
 - `HISTORY_DB_PATH`
 - `HISTORY_RANK_SUM_LIMIT`
