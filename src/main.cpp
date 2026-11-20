@@ -337,6 +337,17 @@ struct AppState {
     // held. The paste on modifier release is the natural end of the cycle, so
     // that release must not paste anything; only a new hotkey press clears this.
     bool clipboardCycleCancelled = false;
+    // While the hotkey chord is still held, Enter cannot inject Ctrl+V yet
+    // (Ctrl is physically down). The requested variant is recorded here and the
+    // release path honours it: 0 = none (release pastes the normal way),
+    // 1 = paste the entry as-is, 2 = paste the plain-text variant.
+    int clipboardCyclePasteRequest = 0;
+    // When the sequence started, and whether the hotkey walked the selection.
+    // Ditto decides on modifier release between "quick tap" (leave the popup up
+    // for Enter / Shift+Enter) and "deliberate cycle" (paste immediately), and
+    // these two values are that decision input.
+    ULONGLONG clipboardCycleStartTick = 0;
+    bool clipboardCycleMovedSelection = false;
     // Focus bookkeeping for closing the popup when the user clicks elsewhere.
     ULONGLONG clipboardShownTick = 0;
     int clipboardLostFocusTicks = 0;
@@ -446,6 +457,10 @@ constexpr int kClipboardLostFocusTicks = 6;
 // Fast enough to see a short key tap, so the next press is not mistaken for
 // auto-repeat and a quick tap is never dropped.
 constexpr UINT kClipboardCycleTimerIntervalMs = 15;
+// Ditto's "did the user hold the chord long enough to mean it" threshold. A
+// quick tap leaves the popup open so Enter / Shift+Enter can choose what to
+// paste; holding past this, or walking the selection, pastes on release.
+constexpr ULONGLONG kClipboardCycleHoldPasteMs = 1000;
 // A hotkey without modifiers (e.g. an F-key) has no modifier release that ends
 // the sequence, so a short idle gap between presses ends it instead.
 constexpr ULONGLONG kClipboardCycleIdleMs = 700;
@@ -552,6 +567,7 @@ void HandleClipboardHotkeyPress(bool moveUp);
 void StartClipboardCycleSequence();
 void PollClipboardCycleSequence();
 void EndClipboardCycleSequence();
+void EndClipboardCycleKeepingWindow();
 void CancelClipboardCycleSequence();
 void DismissClipboardHistoryWithoutPaste();
 void PasteSelectedClipboardEntry();
@@ -5481,11 +5497,13 @@ std::wstring BuildClipboardHintText() {
         return actions;
     }
 
+    // Describe the two modes: a quick tap keeps the popup for Enter, while
+    // walking the selection (or holding the chord) pastes on release.
     std::wstring cycling = L"Tap " + FormatHotkeyForDisplay(g_state.clipboardConfig.hotkey) + L" again to step down";
     if (ClipboardUpHotkeyAvailable()) {
         cycling += L", " + FormatHotkeyForDisplay(MakeClipboardUpHotkey()) + L" to step up";
     }
-    cycling += L"; release/pause to paste";
+    cycling += L"; then release pastes. A quick tap keeps the window for Enter";
     return cycling + L"\r\n" + actions;
 }
 
@@ -5656,6 +5674,12 @@ LRESULT CALLBACK ClipboardSearchProc(HWND window, UINT message, WPARAM wParam, L
             if (count > 0) {
                 SendMessageW(g_state.clipboardList, LB_SETCURSEL, 0, 0);
                 UpdateClipboardPreview();
+                if (g_state.clipboardCycleActive) {
+                    // Same deferral as the list: the chord's release pastes.
+                    g_state.clipboardCyclePasteRequest = shiftDown ? 2 : 1;
+                    g_state.clipboardCycleLastPressTick = GetTickCount64();
+                    return 0;
+                }
                 CancelClipboardCycleSequence();
                 if (shiftDown) {
                     PasteSelectedClipboardEntryAsText();
@@ -6158,6 +6182,9 @@ void ShowClipboardHistory() {
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
+    g_state.clipboardCycleStartTick = 0;
+    g_state.clipboardCycleMovedSelection = false;
+    g_state.clipboardCyclePasteRequest = 0;
     // A fresh popup clears an earlier Esc dismissal (that flag only exists to
     // suppress the paste of the sequence it interrupted).
     g_state.clipboardCycleCancelled = false;
@@ -6213,6 +6240,10 @@ void StartClipboardCycleSequence() {
     g_state.clipboardCycleActive = true;
     g_state.clipboardCycleKeyHeld = true;
     g_state.clipboardCycleLastPressTick = GetTickCount64();
+    g_state.clipboardCycleStartTick = g_state.clipboardCycleLastPressTick;
+    g_state.clipboardCycleMovedSelection = false;
+    // A fresh sequence has no deferred Enter request yet.
+    g_state.clipboardCyclePasteRequest = 0;
     if (g_state.clipboardWindow != nullptr) {
         SetTimer(g_state.clipboardWindow, kClipboardCycleTimerId, kClipboardCycleTimerIntervalMs, nullptr);
     }
@@ -6233,6 +6264,17 @@ void EndClipboardCycleSequence() {
         HideClipboardHistory();
         return;
     }
+    // The user may have pressed Enter while the chord was still held; Ctrl was
+    // physically down then, so the injection was deferred to this release. Honour
+    // the variant they asked for.
+    const int requestedVariant = g_state.clipboardCyclePasteRequest;
+    g_state.clipboardCyclePasteRequest = 0;
+    if (requestedVariant == 2) {
+        // PasteSelectedClipboardEntryAsText() re-activates the return window and
+        // only injects Ctrl+V once it really has the foreground.
+        PasteSelectedClipboardEntryAsText();
+        return;
+    }
     // PasteSelectedClipboardEntry() re-activates the window the popup was
     // opened from and only injects Ctrl+V once it really has the foreground.
     PasteSelectedClipboardEntry();
@@ -6246,11 +6288,30 @@ void EndClipboardCycleSequence() {
 void DismissClipboardHistoryWithoutPaste() {
     CancelClipboardCycleSequence();
     g_state.clipboardCycleCancelled = true;
+    g_state.clipboardCyclePasteRequest = 0;
     g_state.clipboardPasteTarget = nullptr;
     if (g_state.clipboardWindow != nullptr) {
         KillTimer(g_state.clipboardWindow, kClipboardPasteTimerId);
     }
     HideClipboardHistory();
+}
+
+// Ends the cycle without pasting and leaves the popup on screen. This is what a
+// quick hotkey tap does: the popup stays up so Enter / Shift+Enter / Ctrl+C can
+// decide what happens, exactly like Ditto leaves its window open when the chord
+// is released early.
+void EndClipboardCycleKeepingWindow() {
+    if (g_state.clipboardWindow != nullptr) {
+        KillTimer(g_state.clipboardWindow, kClipboardCycleTimerId);
+    }
+    g_state.clipboardCycleActive = false;
+    g_state.clipboardCycleKeyHeld = false;
+    g_state.clipboardCycleLastPressTick = 0;
+    g_state.clipboardCycleStartTick = 0;
+    g_state.clipboardCycleMovedSelection = false;
+    g_state.clipboardCyclePasteRequest = 0;
+    // The return window is kept: Enter / Shift+Enter still paste into it.
+    AppendHotkeyDebugLog(L"Clipboard cycle ended without pasting (quick tap); popup kept open.");
 }
 
 // Abandons the current sequence without pasting: the user took over with the
@@ -6262,6 +6323,8 @@ void CancelClipboardCycleSequence() {
     g_state.clipboardCycleActive = false;
     g_state.clipboardCycleKeyHeld = false;
     g_state.clipboardCycleLastPressTick = 0;
+    // An abandoned sequence must not carry a deferred Enter request over.
+    g_state.clipboardCyclePasteRequest = 0;
 }
 
 // Called for every clipboard-hotkey press; moveUp is true for the Shift variant.
@@ -6275,16 +6338,22 @@ void HandleClipboardHotkeyPress(bool moveUp) {
         if (g_state.clipboardWindow == nullptr || IsWindowVisible(g_state.clipboardWindow) == FALSE) {
             return;
         }
-        // The popup opens on the newest entry; this press only starts the
-        // sequence, so releasing the chord pastes that first entry.
+        // The popup opens on the newest entry. A quick tap leaves it there for
+        // Enter / Shift+Enter; holding the chord or walking the selection pastes
+        // on release (the decision lives in PollClipboardCycleSequence).
         StartClipboardCycleSequence();
         return;
     }
 
     if (!g_state.clipboardCycleActive) {
-        // Opened some other way (e.g. /clipboard): arm the sequence. Like the
-        // opening press, this one keeps the entry the popup is showing.
+        // The popup is up but no sequence is armed. That happens when it was
+        // opened from the launcher (/clipboard), or after a quick hotkey tap
+        // left it open on purpose (see EndClipboardCycleKeepingWindow). A press
+        // here is the "walk the selection" gesture, matching Ditto, so it moves
+        // down one entry and release pastes it.
         StartClipboardCycleSequence();
+        g_state.clipboardCycleMovedSelection = true;
+        MoveClipboardSelection(moveUp ? -1 : 1);
         return;
     }
 
@@ -6299,6 +6368,7 @@ void HandleClipboardHotkeyPress(bool moveUp) {
 
     g_state.clipboardCycleKeyHeld = true;
     g_state.clipboardCycleLastPressTick = GetTickCount64();
+    g_state.clipboardCycleMovedSelection = true;
     MoveClipboardSelection(moveUp ? -1 : 1);
     if (g_state.clipboardWindow != nullptr) {
         SetTimer(g_state.clipboardWindow, kClipboardCycleTimerId, kClipboardCycleTimerIntervalMs, nullptr);
@@ -6355,7 +6425,25 @@ void PollClipboardCycleSequence() {
         return;
     }
 
-    EndClipboardCycleSequence();
+    // Ditto's decision on release. Pasting straight away is what a deliberate
+    // cycle means, but a quick tap should leave the popup up so Enter and
+    // Shift+Enter can choose the variant:
+    //   * the user asked explicitly (Enter / Shift+Enter while the chord was
+    //     held) -> paste that variant,
+    //   * the hotkey walked the selection -> the cycling gesture, so paste,
+    //   * the chord was held past the threshold -> also a deliberate cycle,
+    //   * otherwise a quick tap -> keep the popup open, no paste.
+    const bool explicitRequest = g_state.clipboardCyclePasteRequest != 0;
+    const bool walkedSelection = g_state.clipboardCycleMovedSelection;
+    const bool heldLongEnough =
+        g_state.clipboardCycleStartTick != 0 &&
+        (GetTickCount64() - g_state.clipboardCycleStartTick) >= kClipboardCycleHoldPasteMs;
+    if (explicitRequest || walkedSelection || heldLongEnough) {
+        EndClipboardCycleSequence();
+        return;
+    }
+
+    EndClipboardCycleKeepingWindow();
 }
 
 // asPlainText forces a text-only copy; otherwise the entry keeps every format
@@ -6636,10 +6724,10 @@ LRESULT CALLBACK ClipboardListProc(HWND window, UINT message, WPARAM wParam, LPA
         if (wParam == VK_RETURN) {
             const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             if (g_state.clipboardCycleActive) {
-                // The hotkey chord is still armed. Its release already pastes,
-                // and that path waits until every modifier is physically up so
-                // the injected Ctrl+V is not mixed with a held Ctrl/Alt. Leave
-                // the paste to it instead of injecting while a key is down.
+                // The chord is still held, so injecting Ctrl+V now would mix
+                // with the physical Ctrl. Record what the user asked for and
+                // let the release path perform it.
+                g_state.clipboardCyclePasteRequest = shiftDown ? 2 : 1;
                 g_state.clipboardCycleLastPressTick = GetTickCount64();
                 return 0;
             }
@@ -6823,12 +6911,17 @@ LRESULT CALLBACK ClipboardWindowProc(HWND window, UINT message, WPARAM wParam, L
         }
         if (LOWORD(wParam) == IDC_CLIPBOARD_LIST && HIWORD(wParam) == LBN_DBLCLK) {
             // Double-click pastes, like Enter; Ctrl+C stays the copy-only path.
-            if (g_state.clipboardCycleActive) {
-                // A mouse click cancels the sequence below, so the chord release
-                // would no longer paste; do it here instead.
-                CancelClipboardCycleSequence();
+            // A mouse click cancels the sequence, so the chord release no longer
+            // pastes and this has to perform it directly. Shift decides the
+            // variant, matching Shift+Enter.
+            const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            CancelClipboardCycleSequence();
+            g_state.clipboardCyclePasteRequest = 0;
+            if (shiftDown) {
+                PasteSelectedClipboardEntryAsText();
+            } else {
+                PasteSelectedClipboardEntry();
             }
-            PasteSelectedClipboardEntry();
             return 0;
         }
         break;

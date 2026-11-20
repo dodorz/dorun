@@ -159,10 +159,12 @@ DoRun can also drive the popup with the clipboard hotkey itself, so the whole cy
 
 1. **First press** opens the popup with the newest entry selected.
 2. **Further presses**, while the hotkey's modifiers (Ctrl/Alt/Shift/Win) stay held, move the selection down one entry each.
-3. **Releasing the modifiers** puts the selected entry on the clipboard and pastes it into the window you came from by injecting `Ctrl+V` there.
-4. **Shift+hotkey** moves the selection up instead — with the default hotkey (`Ctrl` plus the backtick key), holding Shift as well walks back towards the newest entry. This variant is only registered when Shift is not already part of the base hotkey.
+3. **Releasing the modifiers** pastes the selected entry into the window you came from by injecting `Ctrl+V` there — but only when the release follows a deliberate cycle: a second hotkey press, or holding the chord for about a second.
+4. **A quick tap** (press and release without walking the selection and within ~1 s) does **not** paste. The popup stays open so `Enter` / `Shift+Enter` / `Ctrl+C` decide what happens. This is Ditto's split: the same hotkey can either be a one-shot "paste the newest entry" gesture or a window opener.
+5. **Shift+hotkey** moves the selection up instead — with the default hotkey (`Ctrl` plus the backtick key), holding Shift as well walks back towards the newest entry. This variant is only registered when Shift is not already part of the base hotkey.
+6. **Enter / Shift+Enter while the chord is still held** is remembered: the release performs the paste you asked for (normal, or plain-text variant) once the modifiers are physically up.
 
-When the hotkey has no modifiers (for example an `F` key such as `F8`), there is no modifier release that could mark the end of the sequence, so consecutive presses with less than ~0.7 s between them are treated as one sequence, and the paste happens once the presses stop.
+When the hotkey has no modifiers (for example an `F` key such as `F8`), there is no modifier release that could mark the end of the sequence, so consecutive presses with less than ~0.7 s between them are treated as one sequence, and the paste happens once the presses stop. A single tap of such a hotkey opens the popup without pasting, same as a quick chord tap.
 
 Walking the list with the hotkey and with `Up` / `Down` are alternatives: pressing a key or clicking in the list abandons the hotkey sequence, so nothing is pasted behind your back.
 
