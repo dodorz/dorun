@@ -461,6 +461,23 @@ v0.4.0.58
 are compiled from it, the automatic tag name is derived from it, and a release is
 only published when the tag agrees with it.
 
+### Who may change the version
+
+`major`, `minor`, and `patch` are changed **only on an explicit instruction**
+from the repository owner. Automatic or "opportunistic" version bumps by an
+assistant are limited to the `build` segment, because a `minor`/`major` bump is
+what makes CI publish a GitHub Release — an accidental bump would make a
+work-in-progress build public.
+
+Segment bumping resets the lower segments:
+
+- `major` → reset `minor`, `patch`, and `build` to `0`
+- `minor` → reset `patch` and `build` to `0`
+- `patch` → reset `build` to `0`
+- `build` only → increment `build`, leave the rest alone
+
+The full rules (tagging, release gating, artifact names) are in `AGENTS.md`.
+
 ## Notes
 
 This is a Windows-specific native launcher focused on keyboard-first workflows and local automation.
