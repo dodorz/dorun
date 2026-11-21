@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <exdisp.h>
 #include <winsqlite/winsqlite3.h>
 
 #include <algorithm>
@@ -340,6 +341,20 @@ struct AppState {
     // editor closes so a later Enter still pastes into the original window.
     HWND clipboardEditReturnWindow = nullptr;
     bool clipboardEditorWasOpen = false;
+
+    // "Dialog follows the file manager": see ConfigureDialogFollowHook().
+    bool dialogFollowEnabled = true;
+    HWINEVENTHOOK dialogFollowHook = nullptr;
+    // Explorer / Total Commander window that was activated after the last file
+    // dialog; consumed when a file dialog becomes the foreground window again.
+    HWND dialogFollowFileManager = nullptr;
+    // The file dialog that was in front when the user switched to the file
+    // manager; only a return to this same dialog navigates it.
+    HWND dialogFollowSourceDialog = nullptr;
+    // File name the dialog showed before it was navigated; put back shortly
+    // afterwards so a Save dialog keeps the name the user typed.
+    HWND dialogFollowRestoreEdit = nullptr;
+    std::wstring dialogFollowRestoreText;
     DWORD lastClipboardSequenceNumber = 0;
     HotkeyBackend clipboardHotkeyBackend = HotkeyBackend::RegisterHotKey;
     HotkeyBackend clipboardUpHotkeyBackend = HotkeyBackend::RegisterHotKey;
@@ -449,6 +464,8 @@ constexpr UINT kMessageSingletonReload = WM_APP + 5;
 // Posted by the editor worker thread once the editor process exits; lParam is a
 // heap-allocated EditJob that the handler on the UI thread takes ownership of.
 constexpr UINT kMessageClipboardEditDone = WM_APP + 6;
+// Posted by the foreground WinEvent hook; wParam is the new foreground window.
+constexpr UINT kMessageForegroundChanged = WM_APP + 7;
 constexpr ULONGLONG kDeferredRefreshIdleDelayMs = 2000;
 constexpr ULONGLONG kItemsRefreshIntervalMs = 5ULL * 60ULL * 1000ULL;
 constexpr ULONGLONG kHistoryRefreshIntervalMs = 15ULL * 1000ULL;
@@ -464,6 +481,12 @@ constexpr UINT_PTR kClipboardCycleTimerId = 9;
 // Delays the injected Ctrl+V slightly so focus has settled in the target app.
 constexpr UINT_PTR kClipboardPasteTimerId = 10;
 constexpr UINT_PTR kConfigAutoReloadTimerId = 11;
+// Puts the original file name back into a dialog after it was navigated.
+constexpr UINT_PTR kDialogFollowRestoreTimerId = 12;
+constexpr UINT kDialogFollowRestoreDelayMs = 300;
+// Upper bound for every message sent to another process's window, so a hung
+// dialog or file manager cannot freeze DoRun.
+constexpr UINT kDialogFollowSendTimeoutMs = 1000;
 constexpr int kDefaultConfigAutoReloadSeconds = 0;
 // One week; only a sanity cap for absurd values in the config file.
 constexpr int kMaxConfigAutoReloadSeconds = 7 * 24 * 60 * 60;
@@ -570,6 +593,11 @@ void LoadManagedHotkeys();
 void LoadCopyCommandHotkeyConfig();
 void LoadClipboardConfig();
 void LoadConfigReloadConfig();
+void LoadDialogFollowConfig();
+void ConfigureDialogFollowHook();
+void UninstallDialogFollowHook();
+void HandleForegroundChangeForDialogFollow(HWND window);
+void RestoreFileDialogText();
 void StartConfigAutoReloadTimer();
 void LoadClipboardEntriesFromFile();
 void RegisterClipboardHotkey();
@@ -2651,6 +2679,22 @@ void LoadConfigReloadConfig() {
 
     if (const std::optional<int> seconds = ParseYamlInt(content, L"CONFIG_AUTO_RELOAD_SECONDS")) {
         g_state.configAutoReloadSeconds = std::clamp(*seconds, 0, kMaxConfigAutoReloadSeconds);
+    }
+}
+
+// DIALOG_FOLLOW_FILE_MANAGER (default true): a file open/save/folder dialog
+// jumps to the folder of the Explorer or Total Commander window the user just
+// switched away from.
+void LoadDialogFollowConfig() {
+    g_state.dialogFollowEnabled = true;
+
+    const std::wstring configPath = FindConfigPath(kConfigFileName);
+    const std::wstring content = LoadUtf8TextFile(configPath);
+    if (content.empty()) {
+        return;
+    }
+    if (const std::optional<bool> enabled = ParseYamlBool(content, L"DIALOG_FOLLOW_FILE_MANAGER")) {
+        g_state.dialogFollowEnabled = *enabled;
     }
 }
 
@@ -9141,6 +9185,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     LoadCopyCommandHotkeyConfig();
     LoadClipboardConfig();
     LoadConfigReloadConfig();
+    LoadDialogFollowConfig();
     RefreshMonitoredConfigFiles();
     UpdateUiFont(g_state.dpi);
     g_state.hotkeyRegistrationFailures.clear();
@@ -9148,6 +9193,7 @@ void ReloadAllConfiguration(bool hideLauncherOnSuccess) {
     RegisterClipboardHotkey();
     RegisterManagedHotkeys();
     ConfigureKeyboardHook();
+    ConfigureDialogFollowHook();
     ShowHotkeyRegistrationFailures();
     if (g_state.clipboardConfig.enabled) {
         LoadClipboardEntriesFromFile();
@@ -10181,6 +10227,502 @@ LRESULT CALLBACK LauncherWindowProc(HWND window, UINT message, WPARAM wParam, LP
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------
+// Dialog follows the file manager (the old Listary feature).
+//
+// While a file open / save / folder dialog is in front, switching to an Explorer
+// or Total Commander window and back moves the dialog to the folder that file
+// manager shows. A foreground WinEvent hook watches the switches; the hook
+// callback only posts a message, so the COM calls into Explorer run from the
+// host window procedure and never inside the hook.
+// ---------------------------------------------------------------------------
+
+// Minimal owning COM pointer for the Explorer queries below.
+template <typename T>
+class ComRef {
+public:
+    ComRef() = default;
+    ComRef(const ComRef&) = delete;
+    ComRef& operator=(const ComRef&) = delete;
+    ~ComRef() {
+        if (pointer_ != nullptr) {
+            pointer_->Release();
+        }
+    }
+    T** put() {
+        return &pointer_;
+    }
+    T* get() const {
+        return pointer_;
+    }
+    T* operator->() const {
+        return pointer_;
+    }
+    explicit operator bool() const {
+        return pointer_ != nullptr;
+    }
+
+private:
+    T* pointer_ = nullptr;
+};
+
+std::wstring GetWindowClassNameString(HWND window) {
+    if (window == nullptr) {
+        return L"";
+    }
+    wchar_t buffer[256] {};
+    const int length = GetClassNameW(window, buffer, static_cast<int>(std::size(buffer)));
+    return length > 0 ? std::wstring(buffer, static_cast<size_t>(length)) : std::wstring();
+}
+
+// Reads a window's text through a timed send; WM_GETTEXT is marshalled across
+// processes by the system.
+std::wstring GetRemoteWindowText(HWND window) {
+    DWORD_PTR length = 0;
+    if (SendMessageTimeoutW(window, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &length) == 0 ||
+        length == 0 || length > 32767) {
+        return L"";
+    }
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    DWORD_PTR copied = 0;
+    if (SendMessageTimeoutW(
+            window,
+            WM_GETTEXT,
+            static_cast<WPARAM>(text.size()),
+            reinterpret_cast<LPARAM>(text.data()),
+            SMTO_ABORTIFHUNG,
+            kDialogFollowSendTimeoutMs,
+            &copied) == 0) {
+        return L"";
+    }
+    text.resize(std::min<size_t>(static_cast<size_t>(copied), static_cast<size_t>(length)));
+    return text;
+}
+
+bool SetRemoteWindowText(HWND window, const std::wstring& text) {
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(
+               window,
+               WM_SETTEXT,
+               0,
+               reinterpret_cast<LPARAM>(text.c_str()),
+               SMTO_ABORTIFHUNG,
+               kDialogFollowSendTimeoutMs,
+               &result) != 0 &&
+        result != 0;
+}
+
+bool IsFileManagerWindowClass(const std::wstring& className) {
+    return className == L"CabinetWClass" || className == L"ExploreWClass" || className == L"TTOTAL_CMD";
+}
+
+// Shell surfaces that briefly take the foreground while the user switches
+// windows (taskbar, Alt+Tab, Start, desktop). They must not break the
+// "dialog -> file manager -> dialog" sequence.
+bool IsTransientShellWindowClass(const std::wstring& className) {
+    static const wchar_t* const kClasses[] = {
+        L"Shell_TrayWnd",
+        L"Shell_SecondaryTrayWnd",
+        L"MultitaskingViewFrame",
+        L"XamlExplorerHostIslandWindow",
+        L"TaskSwitcherWnd",
+        L"TaskSwitcherOverlayWnd",
+        L"ForegroundStaging",
+        L"Windows.UI.Core.CoreWindow",
+        L"NotifyIconOverflowWindow",
+        L"TopLevelWindowForOverflowXamlIsland",
+        L"Progman",
+        L"WorkerW",
+    };
+    for (const wchar_t* candidate : kClasses) {
+        if (className == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Folder shown by an Explorer window. Windows 11 Explorer keeps several tabs
+// under one top-level window; the active tab is the first ShellTabWindowClass
+// child, and IShellBrowser::GetWindow() returns that tab window.
+std::wstring GetExplorerWindowFolder(HWND explorer) {
+    // CLSID_ShellWindows, spelled out so uuid.lib is not required.
+    static constexpr CLSID kShellWindowsClass =
+        {0x9ba05972, 0xf6a8, 0x11cf, {0xa4, 0x42, 0x00, 0xa0, 0xc9, 0x0a, 0x8f, 0x39}};
+    ComRef<IShellWindows> shellWindows;
+    if (FAILED(CoCreateInstance(kShellWindowsClass, nullptr, CLSCTX_ALL, IID_PPV_ARGS(shellWindows.put()))) ||
+        !shellWindows) {
+        return L"";
+    }
+
+    // SID_STopLevelBrowser, spelled out so no extra GUID library is needed.
+    static constexpr GUID kTopLevelBrowserService =
+        {0x4c96be40, 0x915c, 0x11cf, {0x99, 0xd3, 0x00, 0xaa, 0x00, 0x4a, 0xe8, 0x37}};
+
+    const HWND activeTab = FindWindowExW(explorer, nullptr, L"ShellTabWindowClass", nullptr);
+    long count = 0;
+    if (FAILED(shellWindows->get_Count(&count))) {
+        return L"";
+    }
+
+    std::wstring fallback;
+    for (long i = 0; i < count; ++i) {
+        VARIANT index {};
+        index.vt = VT_I4;
+        index.lVal = i;
+        ComRef<IDispatch> dispatch;
+        if (shellWindows->Item(index, dispatch.put()) != S_OK || !dispatch) {
+            continue;
+        }
+        ComRef<IWebBrowserApp> browserApp;
+        if (FAILED(dispatch->QueryInterface(IID_PPV_ARGS(browserApp.put())))) {
+            continue;
+        }
+        SHANDLE_PTR handle = 0;
+        if (FAILED(browserApp->get_HWND(&handle)) || reinterpret_cast<HWND>(handle) != explorer) {
+            continue;
+        }
+        ComRef<IServiceProvider> serviceProvider;
+        ComRef<IShellBrowser> shellBrowser;
+        if (FAILED(browserApp->QueryInterface(IID_PPV_ARGS(serviceProvider.put()))) ||
+            FAILED(serviceProvider->QueryService(kTopLevelBrowserService, IID_PPV_ARGS(shellBrowser.put())))) {
+            continue;
+        }
+        HWND tab = nullptr;
+        shellBrowser->GetWindow(&tab);
+        ComRef<IShellView> shellView;
+        ComRef<IFolderView> folderView;
+        ComRef<IPersistFolder2> persistFolder;
+        if (FAILED(shellBrowser->QueryActiveShellView(shellView.put())) || !shellView ||
+            FAILED(shellView->QueryInterface(IID_PPV_ARGS(folderView.put()))) ||
+            FAILED(folderView->GetFolder(IID_PPV_ARGS(persistFolder.put())))) {
+            continue;
+        }
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (FAILED(persistFolder->GetCurFolder(&pidl)) || pidl == nullptr) {
+            continue;
+        }
+        // Virtual folders (This PC, Home, Control Panel) have no file system
+        // path and fail here, which leaves the dialog alone.
+        std::wstring path(32768, L'\0');
+        const bool resolved =
+            SHGetPathFromIDListEx(pidl, path.data(), static_cast<DWORD>(path.size()), GPFIDL_DEFAULT) != FALSE;
+        CoTaskMemFree(pidl);
+        if (!resolved) {
+            continue;
+        }
+        path.resize(wcslen(path.c_str()));
+        if (activeTab == nullptr || tab == activeTab) {
+            return path;
+        }
+        if (fallback.empty()) {
+            fallback = path;
+        }
+    }
+    return fallback;
+}
+
+// Folder of Total Commander's active panel, read through its documented
+// WM_USER+50 "get window handle" message: 1000 returns the active side
+// (1 = left, 2 = right), 9 / 10 return the left / right path label, whose text
+// looks like "c:\Windows\*.*".
+std::wstring GetTotalCommanderFolder(HWND commander) {
+    constexpr UINT kGetHandleMessage = WM_USER + 50;
+    const auto query = [commander](WPARAM what) -> DWORD_PTR {
+        DWORD_PTR result = 0;
+        if (SendMessageTimeoutW(
+                commander, kGetHandleMessage, what, 0, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &result) == 0) {
+            return 0;
+        }
+        return result;
+    };
+
+    DWORD_PTR activeSide = query(1000);
+    if (activeSide != 1 && activeSide != 2) {
+        // Older builds: compare the active list (3) with the left list (1).
+        const DWORD_PTR activeList = query(3);
+        if (activeList == 0) {
+            return L"";
+        }
+        activeSide = activeList == query(1) ? 1 : 2;
+    }
+    const HWND pathLabel = reinterpret_cast<HWND>(query(activeSide == 1 ? 9 : 10));
+    if (pathLabel == nullptr) {
+        return L"";
+    }
+    std::wstring text = Trim(GetRemoteWindowText(pathLabel));
+    const size_t slash = text.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && text.find_first_of(L"*?", slash) != std::wstring::npos) {
+        text.erase(slash + 1);
+    }
+    return text;
+}
+
+// Folder the file manager shows, or empty when it is not a real directory
+// (archives, FTP, virtual folders).
+std::wstring GetFileManagerFolder(HWND fileManager) {
+    const std::wstring className = GetWindowClassNameString(fileManager);
+    std::wstring folder;
+    if (className == L"TTOTAL_CMD") {
+        folder = GetTotalCommanderFolder(fileManager);
+    } else {
+        folder = GetExplorerWindowFolder(fileManager);
+    }
+    if (folder.empty()) {
+        return L"";
+    }
+    const DWORD attributes = GetFileAttributesW(folder.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        AppendHotkeyDebugLog(L"Dialog follow: not a directory, ignored: " + folder);
+        return L"";
+    }
+    return folder;
+}
+
+// Standard common-dialog control IDs (dlgs.h): cmb13 is the file name combo
+// box, edt1 the plain file name edit some dialogs use instead, and cmb1 the
+// "Save as type" / file type filter, which folder pickers do not have.
+constexpr int kFileDialogFileNameComboId = 0x047c;
+constexpr int kFileDialogFileNameEditId = 0x0480;
+constexpr int kFileDialogFileTypeComboId = 0x0470;
+
+struct FileDialogControls {
+    HWND dialog = nullptr;
+    HWND fileNameCombo = nullptr;
+    HWND fileNameEdit = nullptr;
+    // Fallbacks when the standard IDs are missing: an Edit inside a ComboBox,
+    // then any other visible Edit outside the address/search area.
+    HWND comboEdit = nullptr;
+    HWND otherEdit = nullptr;
+    bool hasFileTypeCombo = false;
+    bool hasShellView = false;
+};
+
+// True for controls in the address bar or search box, which also contain Edit
+// and ComboBox windows but are not the file name box.
+bool IsInFileDialogAddressArea(HWND control, HWND dialog) {
+    for (HWND current = GetParent(control); current != nullptr && current != dialog; current = GetParent(current)) {
+        const std::wstring className = GetWindowClassNameString(current);
+        if (className == L"ReBarWindow32" || className == L"Address Band Root" ||
+            className == L"Breadcrumb Parent" || className == L"UniversalSearchBand" ||
+            className == L"SearchEditBoxWrapperClass") {
+            return true;
+        }
+    }
+    return false;
+}
+
+BOOL CALLBACK CollectFileDialogControl(HWND control, LPARAM lParam) {
+    auto* controls = reinterpret_cast<FileDialogControls*>(lParam);
+    const std::wstring className = GetWindowClassNameString(control);
+    if (className == L"SHELLDLL_DefView") {
+        controls->hasShellView = true;
+        return TRUE;
+    }
+    if (IsWindowVisible(control) == FALSE || IsInFileDialogAddressArea(control, controls->dialog)) {
+        return TRUE;
+    }
+    const int id = GetDlgCtrlID(control);
+    if (className == L"ComboBox" || className == L"ComboBoxEx32") {
+        if (id == kFileDialogFileNameComboId && controls->fileNameCombo == nullptr) {
+            controls->fileNameCombo = control;
+        } else if (id == kFileDialogFileTypeComboId) {
+            controls->hasFileTypeCombo = true;
+        }
+    } else if (className == L"Edit") {
+        if (id == kFileDialogFileNameEditId && controls->fileNameEdit == nullptr) {
+            controls->fileNameEdit = control;
+            return TRUE;
+        }
+        const std::wstring parentClass = GetWindowClassNameString(GetParent(control));
+        if (controls->comboEdit == nullptr && (parentClass == L"ComboBox" || parentClass == L"ComboBoxEx32")) {
+            controls->comboEdit = control;
+        } else if (controls->otherEdit == nullptr) {
+            controls->otherEdit = control;
+        }
+    }
+    return TRUE;
+}
+
+FileDialogControls CollectFileDialogControls(HWND dialog) {
+    FileDialogControls controls {};
+    controls.dialog = dialog;
+    EnumChildWindows(dialog, CollectFileDialogControl, reinterpret_cast<LPARAM>(&controls));
+    return controls;
+}
+
+// The edit control that holds the file (or folder) name.
+HWND GetFileDialogNameEdit(const FileDialogControls& controls) {
+    if (controls.fileNameCombo != nullptr) {
+        if (const HWND inner = FindWindowExW(controls.fileNameCombo, nullptr, L"Edit", nullptr)) {
+            return inner;
+        }
+    }
+    if (controls.fileNameEdit != nullptr) {
+        return controls.fileNameEdit;
+    }
+    return controls.comboEdit != nullptr ? controls.comboEdit : controls.otherEdit;
+}
+
+bool IsFileDialog(const FileDialogControls& controls) {
+    return controls.hasShellView && GetFileDialogNameEdit(controls) != nullptr;
+}
+
+// Moves an open/save dialog to `folder` the way a user would: the path goes into
+// the file name box and the dialog's OK command runs, which navigates instead of
+// accepting when the text names a folder. The box is read back first so a
+// failed write can never let OK act on the user's original file name.
+//
+// A folder picker would *accept* the typed folder on OK and close, so there the
+// path is only put into the "Folder:" box; "Select Folder" then picks it.
+bool NavigateFileDialogToFolder(HWND dialog, const FileDialogControls& controls, const std::wstring& folder) {
+    const HWND edit = GetFileDialogNameEdit(controls);
+    const HWND okButton = GetDlgItem(dialog, IDOK);
+    const bool folderPicker = !controls.hasFileTypeCombo;
+    if (edit == nullptr || okButton == nullptr) {
+        AppendHotkeyDebugLog(L"Dialog follow: no file name box or OK button found.");
+        return false;
+    }
+
+    const std::wstring original = GetRemoteWindowText(edit);
+    if (!SetRemoteWindowText(edit, folder)) {
+        // Typically an elevated dialog while DoRun runs unelevated (UIPI).
+        AppendHotkeyDebugLog(
+            L"Dialog follow: cannot write to the dialog, error " + std::to_wstring(GetLastError()) + L".");
+        return false;
+    }
+    if (GetRemoteWindowText(edit) != folder) {
+        AppendHotkeyDebugLog(L"Dialog follow: the file name box did not take the path; not navigating.");
+        SetRemoteWindowText(edit, original);
+        return false;
+    }
+
+    if (folderPicker) {
+        AppendHotkeyDebugLog(L"Dialog follow: folder picker, path put into the Folder box: " + folder);
+        return true;
+    }
+
+    // Sent rather than posted: once this returns, the dialog has consumed the
+    // path, so restoring the old name later cannot race with the OK command.
+    DWORD_PTR ignored = 0;
+    SendMessageTimeoutW(
+        dialog,
+        WM_COMMAND,
+        MAKEWPARAM(IDOK, BN_CLICKED),
+        reinterpret_cast<LPARAM>(okButton),
+        SMTO_ABORTIFHUNG,
+        kDialogFollowSendTimeoutMs,
+        &ignored);
+    AppendHotkeyDebugLog(L"Dialog follow: navigated to " + folder);
+
+    // Put the user's file name back (a Save dialog would otherwise lose it).
+    if (!original.empty() && original != folder) {
+        g_state.dialogFollowRestoreEdit = edit;
+        g_state.dialogFollowRestoreText = original;
+        SetTimer(g_state.hostWindow, kDialogFollowRestoreTimerId, kDialogFollowRestoreDelayMs, nullptr);
+    }
+    return true;
+}
+
+void RestoreFileDialogText() {
+    const HWND edit = g_state.dialogFollowRestoreEdit;
+    const std::wstring text = std::move(g_state.dialogFollowRestoreText);
+    g_state.dialogFollowRestoreEdit = nullptr;
+    g_state.dialogFollowRestoreText.clear();
+    if (edit != nullptr && IsWindow(edit) != FALSE) {
+        SetRemoteWindowText(edit, text);
+    }
+}
+
+void HandleForegroundChangeForDialogFollow(HWND window) {
+    if (!g_state.dialogFollowEnabled || window == nullptr || IsWindow(window) == FALSE) {
+        return;
+    }
+    HWND root = GetAncestor(window, GA_ROOT);
+    if (root == nullptr) {
+        root = window;
+    }
+    const std::wstring className = GetWindowClassNameString(root);
+    if (IsFileManagerWindowClass(className)) {
+        // Only a switch that starts from a file dialog counts.
+        if (g_state.dialogFollowSourceDialog != nullptr) {
+            g_state.dialogFollowFileManager = root;
+        }
+        return;
+    }
+    if (IsTransientShellWindowClass(className)) {
+        return;
+    }
+
+    // Any other window ends the sequence. A file dialog also starts a new one.
+    const HWND fileManager = g_state.dialogFollowFileManager;
+    const HWND sourceDialog = g_state.dialogFollowSourceDialog;
+    g_state.dialogFollowFileManager = nullptr;
+    g_state.dialogFollowSourceDialog = nullptr;
+    if (className != L"#32770") {
+        return;
+    }
+    const FileDialogControls controls = CollectFileDialogControls(root);
+    if (!IsFileDialog(controls)) {
+        return;
+    }
+    g_state.dialogFollowSourceDialog = root;
+    if (fileManager == nullptr || sourceDialog != root || IsWindow(fileManager) == FALSE) {
+        return;
+    }
+    const std::wstring folder = GetFileManagerFolder(fileManager);
+    if (folder.empty()) {
+        AppendHotkeyDebugLog(L"Dialog follow: no file system folder in the file manager.");
+        return;
+    }
+    NavigateFileDialogToFolder(root, controls, folder);
+}
+
+void CALLBACK DialogFollowWinEventProc(
+    HWINEVENTHOOK,
+    DWORD event,
+    HWND window,
+    LONG objectId,
+    LONG childId,
+    DWORD,
+    DWORD) {
+    if (event != EVENT_SYSTEM_FOREGROUND || window == nullptr || objectId != OBJID_WINDOW ||
+        childId != CHILDID_SELF || g_state.hostWindow == nullptr) {
+        return;
+    }
+    PostMessageW(g_state.hostWindow, kMessageForegroundChanged, reinterpret_cast<WPARAM>(window), 0);
+}
+
+void UninstallDialogFollowHook() {
+    if (g_state.dialogFollowHook != nullptr) {
+        UnhookWinEvent(g_state.dialogFollowHook);
+        g_state.dialogFollowHook = nullptr;
+    }
+    g_state.dialogFollowFileManager = nullptr;
+    g_state.dialogFollowSourceDialog = nullptr;
+}
+
+void ConfigureDialogFollowHook() {
+    UninstallDialogFollowHook();
+    if (!g_state.dialogFollowEnabled) {
+        return;
+    }
+    // Out-of-context: the callback runs on this thread's message loop, nothing
+    // is injected into other processes.
+    g_state.dialogFollowHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_FOREGROUND,
+        nullptr,
+        DialogFollowWinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (g_state.dialogFollowHook == nullptr) {
+        AppendHotkeyDebugLog(
+            L"Dialog follow: SetWinEventHook failed, error " + std::to_wstring(GetLastError()) + L".");
+    }
+}
+
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_HOTKEY) {
         if (wParam == ID_HOTKEY_LAUNCH) {
@@ -10255,6 +10797,15 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         if (lParam != 0) {
             GlobalDeleteAtom(static_cast<ATOM>(lParam));
         }
+        return 0;
+    }
+    if (message == kMessageForegroundChanged) {
+        HandleForegroundChangeForDialogFollow(reinterpret_cast<HWND>(wParam));
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kDialogFollowRestoreTimerId) {
+        KillTimer(window, kDialogFollowRestoreTimerId);
+        RestoreFileDialogText();
         return 0;
     }
     if (message == kMessageClipboardEditDone) {
@@ -10488,6 +11039,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     LoadCopyCommandHotkeyConfig();
     LoadClipboardConfig();
     LoadConfigReloadConfig();
+    LoadDialogFollowConfig();
     RefreshMonitoredConfigFiles();
 
     if (!InitializeWindows()) {
@@ -10506,6 +11058,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         RegisterClipboardHotkey();
         RegisterManagedHotkeys();
         ConfigureKeyboardHook();
+        ConfigureDialogFollowHook();
         ShowHotkeyRegistrationFailures();
         if (g_state.clipboardConfig.enabled) {
             LoadClipboardEntriesFromFile();
@@ -10537,6 +11090,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     StopClipboardPolling();
     UnregisterManagedHotkeys();
     UninstallKeyboardHook();
+    UninstallDialogFollowHook();
     CloseCronTaskProcessHandles();
     if (g_state.searchFont != nullptr) {
         DeleteObject(g_state.searchFont);

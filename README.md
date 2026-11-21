@@ -222,6 +222,38 @@ CONFIG_AUTO_RELOAD_SECONDS: 300
 
 Set it to `0` to turn the periodic reload off. The interval is re-read on every reload, so changing the value takes effect without restarting DoRun. A pending periodic reload is postponed for a moment while the launcher is open and the search box is being typed in.
 
+## File dialogs follow the file manager
+
+Like old Listary versions, DoRun moves a Windows open / save / select-folder
+dialog to the folder you were just looking at in a file manager:
+
+1. A file dialog is in front.
+2. Switch to an Explorer or Total Commander window (Alt+Tab, taskbar, click).
+3. Switch back to the same dialog. It jumps to the folder that window shows.
+
+Details:
+
+- Explorer uses the folder of the active tab. Total Commander uses the folder of
+  the active panel.
+- Open and Save dialogs navigate at once. The file name you typed in a Save
+  dialog is put back afterwards.
+- A select-folder dialog only gets the path in its **Folder** box, because
+  pressing OK there would select the folder and close the dialog. Click
+  **Select Folder** to accept it.
+- Nothing happens when the file manager shows a location that is not a real
+  directory, such as This PC, an archive, or FTP.
+- An elevated dialog cannot be changed while DoRun runs unelevated. Windows
+  blocks it (UIPI).
+
+Turn it off with:
+
+```yaml
+DIALOG_FOLLOW_FILE_MANAGER: false
+```
+
+With `HOTKEY_DEBUG_LOG: true`, each step is logged with a `Dialog follow:`
+prefix in `hotkey-debug.log`.
+
 ## Configuration files
 
 DoRun uses two main config files:
@@ -312,6 +344,7 @@ term_wrapper:"${TERMINAL}" ${CWD_FLAG} cmd /k "${CMD}"
 - `HOTKEY_DEBUG_LOG`
 - `COPY_COMMAND_HOTKEY`
 - `CONFIG_AUTO_RELOAD_SECONDS`
+- `DIALOG_FOLLOW_FILE_MANAGER`
 - `CLIPBOARD_HISTORY_ENABLED`
 - `CLIPBOARD_HOTKEY`
 - `CLIPBOARD_HISTORY_MAX_ROWS`
@@ -486,12 +519,16 @@ assistant are limited to the `build` segment, because a `minor`/`major` bump is
 what makes CI publish a GitHub Release — an accidental bump would make a
 work-in-progress build public.
 
-Segment bumping resets the lower segments:
+`build` is a running counter: every version bump increments it by 1, and it
+is never reset. A higher segment resets only the segments between it and
+`build`:
 
-- `major` → reset `minor`, `patch`, and `build` to `0`
-- `minor` → reset `patch` and `build` to `0`
-- `patch` → reset `build` to `0`
+- `major` → reset `minor` and `patch` to `0`, increment `build`
+- `minor` → reset `patch` to `0`, increment `build`
+- `patch` → increment `patch` and `build`
 - `build` only → increment `build`, leave the rest alone
+
+For example, a patch bump of `0.4.0.68` gives `0.4.1.69`.
 
 The full rules (tagging, release gating, artifact names) are in `AGENTS.md`.
 

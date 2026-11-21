@@ -22,6 +22,10 @@ COPY_COMMAND_HOTKEY: '^+c'
 # when the files change on disk, via `/reload`, or `DoRun.exe /reload`.
 CONFIG_AUTO_RELOAD_SECONDS: 0
 
+# A file open/save/folder dialog jumps to the folder of the Explorer or Total
+# Commander window you switch to and back from (old Listary behavior).
+DIALOG_FOLLOW_FILE_MANAGER: true
+
 # Ditto-like clipboard history: text, rich text (RTF), images, and files.
 # The popup hotkey uses the same modifier syntax as Command.conf hotkeys
 # (^ = Ctrl, ! = Alt, + = Shift, @ = Win) and is global while DoRun runs.
