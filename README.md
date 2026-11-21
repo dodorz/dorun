@@ -235,11 +235,11 @@ Details:
 
 - Explorer uses the folder of the active tab. Total Commander uses the folder of
   the active panel.
-- Open and Save dialogs navigate at once. The file name you typed in a Save
-  dialog is put back afterwards.
-- A select-folder dialog only gets the path in its **Folder** box, because
-  pressing OK there would select the folder and close the dialog. Click
-  **Select Folder** to accept it.
+- Open, Save, and select-folder dialogs navigate immediately via the dialog's
+  address bar, so any file name you typed in a Save dialog stays intact and a
+  select-folder dialog does not close prematurely. Legacy dialogs without an
+  address bar fall back to the file name box + OK button (restoring the typed
+  file name afterwards).
 - Nothing happens when the file manager shows a location that is not a real
   directory, such as This PC, an archive, or FTP.
 - An elevated dialog cannot be changed while DoRun runs unelevated. Windows

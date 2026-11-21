@@ -10480,11 +10480,9 @@ std::wstring GetFileManagerFolder(HWND fileManager) {
 }
 
 // Standard common-dialog control IDs (dlgs.h): cmb13 is the file name combo
-// box, edt1 the plain file name edit some dialogs use instead, and cmb1 the
-// "Save as type" / file type filter, which folder pickers do not have.
+// box, and edt1 is the plain file name edit some dialogs use instead.
 constexpr int kFileDialogFileNameComboId = 0x047c;
 constexpr int kFileDialogFileNameEditId = 0x0480;
-constexpr int kFileDialogFileTypeComboId = 0x0470;
 
 struct FileDialogControls {
     HWND dialog = nullptr;
@@ -10494,7 +10492,6 @@ struct FileDialogControls {
     // then any other visible Edit outside the address/search area.
     HWND comboEdit = nullptr;
     HWND otherEdit = nullptr;
-    bool hasFileTypeCombo = false;
     bool hasShellView = false;
 };
 
@@ -10526,8 +10523,6 @@ BOOL CALLBACK CollectFileDialogControl(HWND control, LPARAM lParam) {
     if (className == L"ComboBox" || className == L"ComboBoxEx32") {
         if (id == kFileDialogFileNameComboId && controls->fileNameCombo == nullptr) {
             controls->fileNameCombo = control;
-        } else if (id == kFileDialogFileTypeComboId) {
-            controls->hasFileTypeCombo = true;
         }
     } else if (className == L"Edit") {
         if (id == kFileDialogFileNameEditId && controls->fileNameEdit == nullptr) {
@@ -10568,19 +10563,207 @@ bool IsFileDialog(const FileDialogControls& controls) {
     return controls.hasShellView && GetFileDialogNameEdit(controls) != nullptr;
 }
 
-// Moves an open/save dialog to `folder` the way a user would: the path goes into
-// the file name box and the dialog's OK command runs, which navigates instead of
-// accepting when the text names a folder. The box is read back first so a
-// failed write can never let OK act on the user's original file name.
+// Moves an open/save/folder dialog to `folder`.
 //
-// A folder picker would *accept* the typed folder on OK and close, so there the
-// path is only put into the "Folder:" box; "Select Folder" then picks it.
+// In modern IFileDialog (Vista+), the file-type filter is a DirectUI control
+// rather than a Win32 ComboBox with id cmb1, so there is no reliable Win32
+// distinction between open/save dialogs and folder pickers — and for both,
+// modern dialogs expose a breadcrumb address bar whose hidden Edit navigates
+// the shell view directly without touching the file name box or pressing OK.
+//
+// Strategy:
+//  1. Prefer the dialog's own address bar (inside "Breadcrumb Parent" /
+//     "Address Band Root"): click/activate its toolbar (or send Alt+D) so its
+//     Edit becomes available, write `folder`, and send Return to that Edit.
+//     This navigates open, save, AND folder-picker dialogs without losing the
+//     typed file name and without accidentally closing a folder picker.
+//  2. Fall back to the classic common-dialog method (file name box + OK button)
+//     for legacy GetOpenFileName/GetSaveFileName dialogs that have no address
+//     bar. For those, Notify the parent with EN_CHANGE / CBN_EDITCHANGE and
+//     press the OK button (WM_COMMAND + BM_CLICK / Return) so the dialog commits
+//     the navigation instead of leaving the path sitting in the edit box.
+struct AddressBarControls {
+    HWND breadcrumbParent = nullptr;
+    HWND addressToolbar = nullptr;
+    HWND addressEdit = nullptr;
+    HWND addressCombo = nullptr;
+};
+
+BOOL CALLBACK CollectAddressBarControl(HWND control, LPARAM lParam) {
+    auto* bar = reinterpret_cast<AddressBarControls*>(lParam);
+    const std::wstring className = GetWindowClassNameString(control);
+    if (className == L"Breadcrumb Parent" && bar->breadcrumbParent == nullptr) {
+        bar->breadcrumbParent = control;
+    } else if (className == L"ToolbarWindow32" && bar->addressToolbar == nullptr) {
+        if (GetWindowClassNameString(GetParent(control)) == L"Breadcrumb Parent") {
+            bar->addressToolbar = control;
+        }
+    } else if (className == L"ComboBox" && bar->addressCombo == nullptr) {
+        for (HWND p = GetParent(control); p != nullptr; p = GetParent(p)) {
+            const std::wstring parentClass = GetWindowClassNameString(p);
+            if (parentClass == L"Address Band Root") {
+                bar->addressCombo = control;
+                break;
+            }
+            if (parentClass == L"#32770") {
+                break;
+            }
+        }
+    } else if (className == L"Edit" && bar->addressEdit == nullptr) {
+        for (HWND p = GetParent(control); p != nullptr; p = GetParent(p)) {
+            const std::wstring parentClass = GetWindowClassNameString(p);
+            if (parentClass == L"Address Band Root") {
+                bar->addressEdit = control;
+                break;
+            }
+            if (parentClass == L"#32770") {
+                break;
+            }
+        }
+    }
+    return TRUE;
+}
+
+AddressBarControls FindFileDialogAddressBar(HWND dialog) {
+    AddressBarControls bar {};
+    EnumChildWindows(dialog, CollectAddressBarControl, reinterpret_cast<LPARAM>(&bar));
+    return bar;
+}
+
+void SendReturnKeyToWindow(HWND target) {
+    DWORD_PTR ignored = 0;
+    const LPARAM downLParam = 1 | (MapVirtualKeyW(VK_RETURN, MAPVK_VK_TO_VSC) << 16);
+    const LPARAM upLParam = downLParam | (1 << 30) | (1 << 31);
+    SendMessageTimeoutW(target, WM_KEYDOWN, VK_RETURN, downLParam, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &ignored);
+    SendMessageTimeoutW(target, WM_CHAR, VK_RETURN, downLParam, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &ignored);
+    SendMessageTimeoutW(target, WM_KEYUP, VK_RETURN, upLParam, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &ignored);
+}
+
+void SendAltDToForegroundDialog() {
+    INPUT inputs[4] {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_MENU;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'D';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'D';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_MENU;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    for (INPUT& input : inputs) {
+        input.ki.dwExtraInfo = kInjectedHotkeyExtraInfo;
+    }
+    SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT));
+}
+
+void SendReturnToForegroundWindow() {
+    INPUT inputs[2] {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_RETURN;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_RETURN;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    for (INPUT& input : inputs) {
+        input.ki.dwExtraInfo = kInjectedHotkeyExtraInfo;
+    }
+    SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT));
+}
+
+bool TryNavigateViaAddressBar(HWND dialog, const std::wstring& folder) {
+    AddressBarControls bar = FindFileDialogAddressBar(dialog);
+    if (bar.breadcrumbParent == nullptr && bar.addressEdit == nullptr) {
+        return false;
+    }
+
+    // Activate the address bar edit mode by clicking the empty right side of
+    // the breadcrumb toolbar (the same gesture a user does to type a path).
+    // That puts the address bar into edit mode synchronously inside the dialog
+    // without synthesizing global hotkeys.
+    if (bar.addressToolbar != nullptr) {
+        RECT rect {};
+        if (GetClientRect(bar.addressToolbar, &rect) != FALSE && rect.right > 4 && rect.bottom > 2) {
+            const LPARAM point = MAKELPARAM(rect.right - 2, rect.bottom / 2);
+            DWORD_PTR ignored = 0;
+            SendMessageTimeoutW(
+                bar.addressToolbar, WM_LBUTTONDOWN, MK_LBUTTON, point, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &ignored);
+            SendMessageTimeoutW(
+                bar.addressToolbar, WM_LBUTTONUP, 0, point, SMTO_ABORTIFHUNG, kDialogFollowSendTimeoutMs, &ignored);
+        }
+    }
+
+    // Re-scan in case the Edit was created lazily when edit mode opened.
+    bar = FindFileDialogAddressBar(dialog);
+    if (bar.addressEdit == nullptr || IsWindowVisible(bar.addressEdit) == FALSE) {
+        // Fallback: Alt+D focuses and reveals the address bar edit in all
+        // Vista+ IFileDialog builds, even when the toolbar click did not hit
+        // empty space (e.g. a very long breadcrumb path).
+        if (GetForegroundWindow() == dialog) {
+            SendAltDToForegroundDialog();
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                Sleep(20);
+                bar = FindFileDialogAddressBar(dialog);
+                if (bar.addressEdit != nullptr && IsWindowVisible(bar.addressEdit) != FALSE) {
+                    break;
+                }
+            }
+        }
+    }
+    if (bar.addressEdit == nullptr || IsWindowVisible(bar.addressEdit) == FALSE) {
+        return false;
+    }
+
+    if (!SetRemoteWindowText(bar.addressEdit, folder)) {
+        AppendHotkeyDebugLog(
+            L"Dialog follow: cannot write to address bar edit, error " + std::to_wstring(GetLastError()) + L".");
+        return false;
+    }
+    if (GetRemoteWindowText(bar.addressEdit) != folder) {
+        AppendHotkeyDebugLog(L"Dialog follow: address bar edit did not take the path.");
+        return false;
+    }
+
+    // Notify parent ComboBox/toolbar that the edit text changed, then press
+    // Enter on the address bar edit to trigger navigation.
+    if (const HWND editParent = GetParent(bar.addressEdit)) {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            editParent,
+            WM_COMMAND,
+            MAKEWPARAM(GetDlgCtrlID(bar.addressEdit), EN_CHANGE),
+            reinterpret_cast<LPARAM>(bar.addressEdit),
+            SMTO_ABORTIFHUNG,
+            kDialogFollowSendTimeoutMs,
+            &ignored);
+    }
+    SendReturnKeyToWindow(bar.addressEdit);
+    // If the address bar edit is still visible (meaning the synthetic WM_KEYDOWN
+    // did not satisfy a translator/dialog loop that expects real input), send a
+    // real Return keystroke while the address edit holds focus.
+    Sleep(20);
+    if (IsWindow(bar.addressEdit) != FALSE && IsWindowVisible(bar.addressEdit) != FALSE &&
+        GetForegroundWindow() == dialog) {
+        SendReturnToForegroundWindow();
+    }
+    AppendHotkeyDebugLog(L"Dialog follow: navigated via address bar to " + folder);
+    return true;
+}
+
 bool NavigateFileDialogToFolder(HWND dialog, const FileDialogControls& controls, const std::wstring& folder) {
+    // 1. Modern IFileDialog (open, save, and folder picker): navigate via the
+    //    breadcrumb address bar so the view jumps immediately, the typed file
+    //    name is untouched, and folder pickers do not auto-close.
+    if (TryNavigateViaAddressBar(dialog, folder)) {
+        return true;
+    }
+
+    // 2. Fallback for legacy GetOpenFileName / GetSaveFileName dialogs that
+    //    have no breadcrumb address bar: write the path into the file name
+    //    edit box and trigger navigation via the OK button.
     const HWND edit = GetFileDialogNameEdit(controls);
     const HWND okButton = GetDlgItem(dialog, IDOK);
-    const bool folderPicker = !controls.hasFileTypeCombo;
-    if (edit == nullptr || okButton == nullptr) {
-        AppendHotkeyDebugLog(L"Dialog follow: no file name box or OK button found.");
+    if (edit == nullptr) {
+        AppendHotkeyDebugLog(L"Dialog follow: no file name box found.");
         return false;
     }
 
@@ -10597,23 +10780,34 @@ bool NavigateFileDialogToFolder(HWND dialog, const FileDialogControls& controls,
         return false;
     }
 
-    if (folderPicker) {
-        AppendHotkeyDebugLog(L"Dialog follow: folder picker, path put into the Folder box: " + folder);
-        return true;
-    }
-
-    // Sent rather than posted: once this returns, the dialog has consumed the
-    // path, so restoring the old name later cannot race with the OK command.
+    // Notify the edit's parent (ComboBox / dialog) that the text changed, then
+    // click OK so the dialog commits the directory change.
+    const HWND editParent = GetParent(edit);
     DWORD_PTR ignored = 0;
-    SendMessageTimeoutW(
-        dialog,
-        WM_COMMAND,
-        MAKEWPARAM(IDOK, BN_CLICKED),
-        reinterpret_cast<LPARAM>(okButton),
-        SMTO_ABORTIFHUNG,
-        kDialogFollowSendTimeoutMs,
-        &ignored);
-    AppendHotkeyDebugLog(L"Dialog follow: navigated to " + folder);
+    if (editParent != nullptr) {
+        const int editId = GetDlgCtrlID(edit);
+        SendMessageTimeoutW(
+            editParent,
+            WM_COMMAND,
+            MAKEWPARAM(editId, EN_CHANGE),
+            reinterpret_cast<LPARAM>(edit),
+            SMTO_ABORTIFHUNG,
+            kDialogFollowSendTimeoutMs,
+            &ignored);
+    }
+    if (okButton != nullptr) {
+        SendMessageTimeoutW(
+            dialog,
+            WM_COMMAND,
+            MAKEWPARAM(IDOK, BN_CLICKED),
+            reinterpret_cast<LPARAM>(okButton),
+            SMTO_ABORTIFHUNG,
+            kDialogFollowSendTimeoutMs,
+            &ignored);
+    } else {
+        SendReturnKeyToWindow(edit);
+    }
+    AppendHotkeyDebugLog(L"Dialog follow: navigated via file name box to " + folder);
 
     // Put the user's file name back (a Save dialog would otherwise lose it).
     if (!original.empty() && original != folder) {
